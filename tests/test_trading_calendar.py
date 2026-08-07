@@ -2,7 +2,11 @@ import datetime as dt
 
 import pytest
 
-from app.ingestion.trading_calendar import StaleDataError, TradingCalendar, verify_source_date_matches
+from app.ingestion.trading_calendar import (
+    StaleDataError,
+    TradingCalendar,
+    verify_source_date_matches,
+)
 
 
 def test_weekend_is_not_trading_day():

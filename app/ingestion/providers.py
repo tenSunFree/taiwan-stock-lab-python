@@ -54,17 +54,25 @@ class MultiSourceProvider:
     to get data flowing end to end.
     """
 
-    def __init__(self, primary: MarketDataProvider, fallback: MarketDataProvider | None = None):
+    def __init__(
+        self, primary: MarketDataProvider, fallback: MarketDataProvider | None = None
+    ):
         self.primary = primary
         self.fallback = fallback
 
     async def fetch_daily_prices(self, trading_date: dt.date) -> list[DailyPrice]:
-        primary_rows = {row.stock_id: row for row in await self.primary.fetch_daily_prices(trading_date)}
+        primary_rows = {
+            row.stock_id: row
+            for row in await self.primary.fetch_daily_prices(trading_date)
+        }
 
         if self.fallback is None:
             return list(primary_rows.values())
 
-        fallback_rows = {row.stock_id: row for row in await self.fallback.fetch_daily_prices(trading_date)}
+        fallback_rows = {
+            row.stock_id: row
+            for row in await self.fallback.fetch_daily_prices(trading_date)
+        }
 
         merged: list[DailyPrice] = []
         for stock_id, row in primary_rows.items():

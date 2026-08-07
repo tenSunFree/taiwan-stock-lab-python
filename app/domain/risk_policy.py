@@ -27,14 +27,18 @@ class RiskPolicyConfig:
     """
 
     maximum_consecutive_limit_up_days: int = 3
-    excessive_return_5d: float = 0.35  # 5-day cumulative return above this is flagged as elevated risk
+    excessive_return_5d: float = (
+        0.35  # 5-day cumulative return above this is flagged as elevated risk
+    )
     minimum_data_completeness: float = 0.80
 
     # whether the following statuses are allowed into the candidate set
     # (True = allowed but flagged/penalized, False = hard exclusion)
     allow_attention_stock: bool = True
     allow_ky_stock: bool = True
-    allow_one_price_limit_up: bool = True  # opened and locked at limit-up with no chance to buy in
+    allow_one_price_limit_up: bool = (
+        True  # opened and locked at limit-up with no chance to buy in
+    )
 
 
 @dataclass(frozen=True)
@@ -64,13 +68,25 @@ class RiskPolicy:
         # --- Hard exclusion (strategy-level, distinct from the
         # instrument-type exclusion done in CandidateBuilder) ---
         if is_disposition:
-            return RiskAssessment(stock_id, True, "disposition stock, excluded by strategy policy")
+            return RiskAssessment(
+                stock_id, True, "disposition stock, excluded by strategy policy"
+            )
         if is_managed:
-            return RiskAssessment(stock_id, True, "full-cash-delivery / managed stock, excluded by strategy policy")
+            return RiskAssessment(
+                stock_id,
+                True,
+                "full-cash-delivery / managed stock, excluded by strategy policy",
+            )
         if not self.config.allow_attention_stock and is_attention:
-            return RiskAssessment(stock_id, True, "attention stock, excluded by strategy policy")
+            return RiskAssessment(
+                stock_id, True, "attention stock, excluded by strategy policy"
+            )
         if not self.config.allow_ky_stock and is_ky:
-            return RiskAssessment(stock_id, True, "KY (foreign-registered) stock, excluded by strategy policy")
+            return RiskAssessment(
+                stock_id,
+                True,
+                "KY (foreign-registered) stock, excluded by strategy policy",
+            )
 
         # --- Soft risk flags (kept but recorded, used to penalize the
         # risk-quality factor at the scoring stage) ---

@@ -74,7 +74,9 @@ class MarketDataClient:
     source_name: str = "unknown"
     schema_version: str = "v1"
 
-    def __init__(self, repository: RawPayloadRepository, http_client: httpx.Client | None = None):
+    def __init__(
+        self, repository: RawPayloadRepository, http_client: httpx.Client | None = None
+    ):
         self.repository = repository
         self.http_client = http_client or httpx.Client(timeout=30.0)
 
@@ -118,7 +120,9 @@ class FinMindClient(MarketDataClient):
         self.api_token = api_token
         self.base_url = "https://api.finmindtrade.com/api/v4/data"
 
-    def fetch_daily_price(self, *, ingestion_run_id: str, target_date: dt.date) -> RawSourcePayload:
+    def fetch_daily_price(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
         params = {
             "dataset": "TaiwanStockPrice",
             "start_date": target_date.isoformat(),

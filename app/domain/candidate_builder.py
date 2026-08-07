@@ -34,7 +34,9 @@ class CandidateBuilder:
         self.minimum_turnover = minimum_turnover
         self.maximum_candidates = maximum_candidates
 
-    def build(self, stocks: list[StockMaster], prices: list[DailyPrice]) -> list[Candidate]:
+    def build(
+        self, stocks: list[StockMaster], prices: list[DailyPrice]
+    ) -> list[Candidate]:
         stock_map = {stock.stock_id: stock for stock in stocks}
         candidates: list[Candidate] = []
 

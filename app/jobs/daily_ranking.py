@@ -100,11 +100,14 @@ def run() -> int:
     # and that both listed and OTC data have both arrived — to be
     # completed in a later Phase 1 iteration.
     reported_dates = {
-        row.get("date") for row in payload.raw_payload.get("data", []) if isinstance(row, dict)
+        row.get("date")
+        for row in payload.raw_payload.get("data", [])
+        if isinstance(row, dict)
     }
     if reported_dates and target_date.isoformat() not in reported_dates:
         logger.warning(
-            "WAITING_FOR_DATA: FinMind has not returned data for %s yet, may need a retry", target_date
+            "WAITING_FOR_DATA: FinMind has not returned data for %s yet, may need a retry",
+            target_date,
         )
         return 2  # lets the GitHub Actions workflow decide whether to retry based on exit code
 

@@ -38,8 +38,18 @@ def test_builder_keeps_only_common_stock_limit_up():
         make_stock("0050", security_type=SecurityType.ETF),
     ]
     prices = [
-        make_price("1101", close=Decimal("44.65"), ref=Decimal("40.60"), turnover=Decimal("100000000")),
-        make_price("0050", close=Decimal("44.65"), ref=Decimal("40.60"), turnover=Decimal("999999999")),
+        make_price(
+            "1101",
+            close=Decimal("44.65"),
+            ref=Decimal("40.60"),
+            turnover=Decimal("100000000"),
+        ),
+        make_price(
+            "0050",
+            close=Decimal("44.65"),
+            ref=Decimal("40.60"),
+            turnover=Decimal("999999999"),
+        ),
     ]
 
     builder = CandidateBuilder(minimum_turnover=Decimal("50000000"))
@@ -51,7 +61,12 @@ def test_builder_keeps_only_common_stock_limit_up():
 def test_builder_excludes_below_minimum_turnover():
     stocks = [make_stock("1101")]
     prices = [
-        make_price("1101", close=Decimal("44.65"), ref=Decimal("40.60"), turnover=Decimal("100")),
+        make_price(
+            "1101",
+            close=Decimal("44.65"),
+            ref=Decimal("40.60"),
+            turnover=Decimal("100"),
+        ),
     ]
     builder = CandidateBuilder(minimum_turnover=Decimal("50000000"))
     assert builder.build(stocks, prices) == []
@@ -78,7 +93,12 @@ def test_builder_sorts_by_turnover_desc_and_caps_at_max():
 def test_builder_excludes_non_limit_up_stock():
     stocks = [make_stock("1101")]
     prices = [
-        make_price("1101", close=Decimal("44.60"), ref=Decimal("40.60"), turnover=Decimal("100000000")),
+        make_price(
+            "1101",
+            close=Decimal("44.60"),
+            ref=Decimal("40.60"),
+            turnover=Decimal("100000000"),
+        ),
     ]
     builder = CandidateBuilder(minimum_turnover=Decimal("50000000"))
     assert builder.build(stocks, prices) == []

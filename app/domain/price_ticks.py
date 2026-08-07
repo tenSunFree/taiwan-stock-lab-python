@@ -27,7 +27,11 @@ _TICK_TABLE: list[tuple[Decimal, Decimal, Decimal]] = [
     (Decimal("0"), Decimal("10"), Decimal("0.01")),
     (Decimal("10"), Decimal("50"), Decimal("0.05")),
     (Decimal("50"), Decimal("100"), Decimal("0.10")),
-    (Decimal("100"), Decimal("500"), Decimal("0.50")),  # fixed: was wrongly split into two bands
+    (
+        Decimal("100"),
+        Decimal("500"),
+        Decimal("0.50"),
+    ),  # fixed: was wrongly split into two bands
     (Decimal("500"), Decimal("1000"), Decimal("1.00")),
     (Decimal("1000"), Decimal("999999999"), Decimal("5.00")),
 ]

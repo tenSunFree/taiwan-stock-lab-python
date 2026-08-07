@@ -38,9 +38,9 @@ class StockMaster:
     security_type: SecurityType
     industry: str | None = None
     is_active: bool = True
-    is_attention: bool = False       # under "attention" watch status
-    is_disposition: bool = False     # under disposition/restricted trading
-    is_managed: bool = False         # full-cash-delivery / managed stock
+    is_attention: bool = False  # under "attention" watch status
+    is_disposition: bool = False  # under disposition/restricted trading
+    is_managed: bool = False  # full-cash-delivery / managed stock
 
 
 @dataclass(frozen=True)
@@ -65,5 +65,5 @@ class DailyPrice:
     volume: int | None
     turnover: Decimal | None
     limit_up_price: Decimal | None = None  # source-provided limit-up price, if any
-    has_price_limit_today: bool = True     # False = special day with no daily price limit
+    has_price_limit_today: bool = True  # False = special day with no daily price limit
     data_quality_ok: bool = True
