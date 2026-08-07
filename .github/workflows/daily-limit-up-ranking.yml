@@ -1,0 +1,50 @@
+name: daily-limit-up-ranking
+
+on:
+  schedule:
+    # UTC 08:17 / 08:47 / 09:17 = Taiwan time 16:17 / 16:47 / 17:17
+    - cron: "17 8 * * 1-5"
+    - cron: "47 8 * * 1-5"
+    - cron: "17 9 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      trading_date:
+        description: "Manually specify the target trading date (YYYY-MM-DD); leave empty to use today"
+        required: false
+
+# Prevents the three scheduled runs (16:17/16:47/17:17) or a manual
+# trigger from overlapping with each other. A new run under the same
+# concurrency group does not cancel an older one, it just waits — the
+# job still needs its own "already completed / already pushed today"
+# check internally; this concurrency setting only solves "running at
+# the same time," not "duplicate push after a successful rerun."
+concurrency:
+  group: daily-limit-up-ranking-${{ github.event.inputs.trading_date || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  ranking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -x --tb=short
+
+      - name: Run Phase 1 ingestion job
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          TARGET_TRADING_DATE: ${{ github.event.inputs.trading_date }}
+        run: python -m app.jobs.daily_ranking

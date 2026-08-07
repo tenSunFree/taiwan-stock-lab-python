@@ -1,0 +1,27 @@
+strategy_version: rule-v1.0.0
+
+candidate:
+  maximum_count: 50
+  minimum_turnover: 50000000  # TWD
+
+risk_policy:
+  maximum_consecutive_limit_up_days: 3
+  excessive_return_5d: 0.35
+  minimum_data_completeness: 0.80
+  allow_attention_stock: true
+  allow_ky_stock: true
+  allow_one_price_limit_up: true
+
+weights:
+  liquidity: 0.25
+  volume_price: 0.20
+  momentum: 0.15
+  institutional: 0.15
+  fundamental: 0.15
+  risk_quality: 0.10
+
+# All thresholds and weights above are only strategy-v1 initial
+# assumptions and must be tuned via Phase 5 performance tracking and
+# out-of-sample backtesting. When tuning, create a new
+# strategy_version (e.g. rule-v1.1.0) instead of overwriting this one,
+# otherwise historical ranking results lose their reference baseline.
