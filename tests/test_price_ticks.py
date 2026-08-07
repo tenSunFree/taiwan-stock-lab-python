@@ -56,11 +56,11 @@ def _walk_up_limit_price(reference_price: Decimal) -> Decimal:
 @pytest.mark.parametrize(
     "reference_price",
     [
-        Decimal("48"),      # limit-up crosses the 50 boundary (48*1.1=52.8)
-        Decimal("9.5"),     # crosses the 10 boundary
-        Decimal("95"),      # crosses the 100 boundary
-        Decimal("454.5"),   # crosses the 500 boundary
-        Decimal("909"),     # crosses the 1000 boundary
+        Decimal("48"),  # limit-up crosses the 50 boundary (48*1.1=52.8)
+        Decimal("9.5"),  # crosses the 10 boundary
+        Decimal("95"),  # crosses the 100 boundary
+        Decimal("454.5"),  # crosses the 500 boundary
+        Decimal("909"),  # crosses the 1000 boundary
     ],
 )
 def test_limit_up_price_matches_walk_up_across_tick_boundaries(reference_price):
@@ -71,7 +71,9 @@ def test_limit_up_price_matches_walk_up_across_tick_boundaries(reference_price):
     equivalent under this tick table, because every band boundary is
     an integer multiple of both the tick size before and after it).
     """
-    assert calculate_limit_up_price(reference_price) == _walk_up_limit_price(reference_price)
+    assert calculate_limit_up_price(reference_price) == _walk_up_limit_price(
+        reference_price
+    )
 
 
 def test_evaluate_limit_up_true_case():

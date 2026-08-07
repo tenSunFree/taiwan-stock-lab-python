@@ -5,4 +5,4 @@ alembic>=1.13
 psycopg[binary]>=3.1
 pandas>=2.2
 pytest>=8.0
-pyyaml>=6.0
+pyyaml>=6.0tenacity>=9.0

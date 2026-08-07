@@ -2,7 +2,15 @@ from app.domain.features import StockFeatures
 from app.domain.scoring import FACTOR_WEIGHTS, score_candidates, select_top_five
 
 
-def make_features(stock_id, turnover=100_000_000, vol_ratio=1.5, ret5=0.05, inst=0.02, rev=0.10, risk=0.9):
+def make_features(
+    stock_id,
+    turnover=100_000_000,
+    vol_ratio=1.5,
+    ret5=0.05,
+    inst=0.02,
+    rev=0.10,
+    risk=0.9,
+):
     return StockFeatures(
         stock_id=stock_id,
         turnover=turnover,
@@ -27,7 +35,9 @@ def test_higher_turnover_gets_higher_liquidity_score():
         make_features("C", turnover=100_000_000),
     ]
     scored = {s.stock_id: s for s in score_candidates(features)}
-    assert scored["A"].factor_scores["liquidity"] > scored["B"].factor_scores["liquidity"]
+    assert (
+        scored["A"].factor_scores["liquidity"] > scored["B"].factor_scores["liquidity"]
+    )
 
 
 def test_missing_factor_reduces_completeness_not_filled_as_50():
@@ -56,7 +66,9 @@ def test_select_top_five_excludes_low_completeness():
     scored = score_candidates(features)
 
     # manually push one stock's completeness down to simulate severely incomplete data
-    low_completeness = scored[0].__class__(
+    low_completeness = scored[
+        0
+    ].__class__(
         stock_id="LOWQ",
         total_score=99.0,  # score is high, but data completeness is too low to enter the Top 5
         data_completeness=0.5,
@@ -68,14 +80,18 @@ def test_select_top_five_excludes_low_completeness():
     turnover_map = {s.stock_id: 100_000_000.0 for s in features}
     turnover_map["LOWQ"] = 999_999_999.0
 
-    top5 = select_top_five(scored_with_low, turnover_map, minimum_data_completeness=0.80)
+    top5 = select_top_five(
+        scored_with_low, turnover_map, minimum_data_completeness=0.80
+    )
 
     assert "LOWQ" not in [s.stock_id for s in top5]
     assert len(top5) == 5
 
 
 def test_select_top_five_returns_at_most_five():
-    features = [make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(10)]
+    features = [
+        make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(10)
+    ]
     scored = score_candidates(features)
     turnover_map = {f.stock_id: f.turnover for f in features}
     top5 = select_top_five(scored, turnover_map)

@@ -76,7 +76,9 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
     factor_scores["institutional"] = percentile_score(
         df["institutional_net_buy_ratio_5d"], higher_is_better=True
     )
-    factor_scores["fundamental"] = percentile_score(df["revenue_yoy"], higher_is_better=True)
+    factor_scores["fundamental"] = percentile_score(
+        df["revenue_yoy"], higher_is_better=True
+    )
     factor_scores["risk_quality"] = percentile_score(
         df["risk_quality_raw"], higher_is_better=True
     )

@@ -91,13 +91,23 @@ def evaluate_limit_up(
     this is informational only and never affects selection.
     """
     if security_type != "COMMON_STOCK":
-        return LimitUpResult(False, False, None, LimitUpSource.UNAVAILABLE, "not a common stock, rule does not apply")
+        return LimitUpResult(
+            False,
+            False,
+            None,
+            LimitUpSource.UNAVAILABLE,
+            "not a common stock, rule does not apply",
+        )
 
     if not data_quality_ok:
-        return LimitUpResult(False, False, None, LimitUpSource.UNAVAILABLE, "data quality check failed")
+        return LimitUpResult(
+            False, False, None, LimitUpSource.UNAVAILABLE, "data quality check failed"
+        )
 
     if close_price is None:
-        return LimitUpResult(False, False, None, LimitUpSource.UNAVAILABLE, "missing close price")
+        return LimitUpResult(
+            False, False, None, LimitUpSource.UNAVAILABLE, "missing close price"
+        )
 
     limit_up_price, source = resolve_limit_up_price(
         source_limit_up_price=source_limit_up_price,
@@ -107,10 +117,18 @@ def evaluate_limit_up(
 
     if limit_up_price is None:
         return LimitUpResult(
-            False, False, None, source, "no valid limit-up price today (e.g. no price limit period)"
+            False,
+            False,
+            None,
+            source,
+            "no valid limit-up price today (e.g. no price limit period)",
         )
 
     is_close_up = close_price == limit_up_price
     has_touched = (high_price is not None) and (high_price == limit_up_price)
-    reason = "close price equals limit-up price" if is_close_up else "close price below limit-up price"
+    reason = (
+        "close price equals limit-up price"
+        if is_close_up
+        else "close price below limit-up price"
+    )
     return LimitUpResult(is_close_up, has_touched, limit_up_price, source, reason)
