@@ -106,3 +106,26 @@ def test_mark_success_updates_status_and_clears_error(session):
     assert reservation.delivery.status == "SUCCESS"
     assert reservation.delivery.error_message is None
     assert reservation.delivery.sent_at is not None
+
+def test_reserve_raises_on_content_conflict_with_same_key(session):
+    from app.db.delivery_repository import DeliveryContentConflict
+
+    repo = DeliveryRepository(session)
+    repo.reserve(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
+        message="original content",
+    )
+
+    import pytest
+
+    with pytest.raises(DeliveryContentConflict):
+        repo.reserve(
+            trading_date=TRADING_DATE,
+            strategy_version="rule-v1.0.0",
+            target_id="U123",
+            message_version="text-v1",  # same version, different content — this is the bug case
+            message="different content entirely",
+        )

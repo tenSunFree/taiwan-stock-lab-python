@@ -7,6 +7,7 @@
 [![Scheduling](https://img.shields.io/badge/Scheduling-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](#git-workflow--cicd)
 [![Roadmap](https://img.shields.io/badge/Roadmap-LINE%20Delivery%20Next-06C755?logo=line&logoColor=white)](#roadmap)
 [![Testing](https://img.shields.io/badge/Testing-pytest-0A9EDC?logo=pytest&logoColor=white)](#testing)
+[![CodeRabbit Reviews](https://img.shields.io/badge/Code%20Review-CodeRabbit-FF6B35)](https://coderabbit.ai)
 [![style: strategy-versioned](https://img.shields.io/badge/config-strategy--versioned-B22C89.svg)](#configuration)
 
 ---
@@ -283,6 +284,9 @@ API client + idempotency) are planned for Phase 4 — see
   schedule (16:17 / 16:47 / 17:17 Taiwan time) with a `concurrency`
   group to prevent overlapping runs, plus a `workflow_dispatch` input
   for manually backfilling a specific trading date
+- Automated AI-assisted code review via CodeRabbit on every Pull Request
+  to identify potential bugs, security concerns, maintainability issues,
+  and consistency violations before merging
 - Secrets (`FINMIND_TOKEN`, `DATABASE_URL`, LINE channel credentials)
   are injected via GitHub Actions secrets and never committed to the
   repository
