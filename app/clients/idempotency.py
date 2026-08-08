@@ -1,39 +1,36 @@
 """
-Delivery deduplication.
+Delivery idempotency helpers.
 
 Two intentionally separate idempotency mechanisms:
 
-DB idempotency key:
-    trading_date + strategy_version + target_id + message_version -> SHA-256
-    Used for a database UNIQUE INDEX to prevent the same delivery
-    content from being recorded twice. A correction to already-sent
-    content must use a new message_version, which produces a new
-    idempotency key — never reuse the old one for corrected content.
+1. Database business idempotency key
+   trading_date + strategy_version + hashed target + message_version
+   -> SHA-256.
+   Enforced via a UNIQUE constraint on MessageDelivery.idempotency_key
+   (see app/db/delivery_repository.py) — that DB-level atomicity is
+   what actually prevents duplicate rows, not any check-then-act logic
+   in Python. A correction to already-sent content must use a new
+   message_version, producing a new idempotency key; never reuse the
+   old one for corrected content.
 
-LINE X-Line-Retry-Key:
-    Every individual logical push attempt needs its own UUID, decided
-    once and reused for every retry of that same attempt (see
-    app/clients/line_client.py for why). This key's purpose is "retry
-    this one push attempt safely" — a different concept from the
-    business-level idempotency key above, and the two must never be
-    shared.
+2. LINE X-Line-Retry-Key
+   One UUID per logical LINE push attempt, generated once and reused
+   for every retry of that same attempt (see app/clients/line_client.py
+   for why). A different concept from the key above — the two must
+   never be shared.
 
-Correct usage:
-    1. One push attempt = one delivery_idempotency_key (SHA-256,
-       persisted to the DB) AND one line_retry_key (UUID, also
-       persisted to the DB before the first HTTP call — see
-       app/db/delivery_repository.py for the crash-recovery reasoning).
-    2. If that same push attempt needs to be retried (e.g. after a
-       timeout or a process crash before the DB was updated), reuse
-       the same UUID retry key for the resend. Only generate a new
-       UUID retry key when it's genuinely a new push attempt (a
-       different message_version).
+NOTE ON KEY FORMAT: create_delivery_idempotency_key() hashes the
+target ID before combining it into the key material. Changing the
+combination logic (delimiter, field order, or whether the target is
+pre-hashed) changes every resulting key value. That's harmless before
+any real delivery records exist, but once MessageDelivery rows exist
+in a real database, changing this function is a breaking migration,
+not a routine edit.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 
@@ -42,16 +39,17 @@ def sha256_text(value: str) -> str:
 
 
 def hash_target_id(target_id: str) -> str:
-    """Avoid storing the raw LINE user/group ID in the database when
-    it isn't otherwise needed — only the hash is required to detect
-    duplicate deliveries."""
+    """Avoid storing or hashing-in the raw LINE user/group ID directly
+    — only the hash is needed to detect duplicate deliveries."""
     return sha256_text(target_id)
 
 
 def create_message_hash(message: str) -> str:
-    """Hash of the actual rendered text, stored alongside the
-    idempotency key for debugging/audit — lets you confirm two
-    deliveries with the same key really did carry the same content."""
+    """Hash of the actual rendered text. Stored alongside the
+    idempotency key so DeliveryRepository can detect the case where
+    the same idempotency key was reserved but the message content
+    differs from what was reserved before — see
+    app/db/delivery_repository.py's DeliveryContentConflict."""
     return sha256_text(message)
 
 
@@ -63,8 +61,11 @@ def create_delivery_idempotency_key(
     message_version: str,
 ) -> str:
     """Business-level unique key for DB-level deduplication, distinct
-    from LINE's retry key."""
-    raw = f"{trading_date}:{strategy_version}:{target_id}:{message_version}"
+    from LINE's retry key. Hashes the target ID first so the raw
+    target never appears in the key material, consistent with
+    hash_target_id() being used everywhere else this value is stored."""
+    target_id_hash = hash_target_id(target_id)
+    raw = "|".join((trading_date, strategy_version, target_id_hash, message_version))
     return sha256_text(raw)
 
 
@@ -73,61 +74,3 @@ def create_line_retry_key() -> UUID:
     header. Reuse the same value across retries of a single push
     attempt; never regenerate it on every retry."""
     return uuid4()
-
-
-@dataclass(frozen=True)
-class DeliveryDecision:
-    should_send: bool
-    reason: str
-    idempotency_key: str
-
-
-class DeliveryGuard:
-    """
-    Pre-send idempotency check skeleton.
-
-    A production implementation should query the message_deliveries
-    table:
-        SELECT status FROM message_deliveries WHERE idempotency_key = ?
-    This class defines the interface and decision logic only; the
-    actual DB query is delegated to the repository implementation (see
-    the MessageDelivery table planned in app/db/models.py).
-    """
-
-    def __init__(self, existing_delivery_status_lookup) -> None:
-        """
-        existing_delivery_status_lookup: Callable[[str], str | None]
-        Looks up the existing delivery record's status
-        (SUCCESS / FAILED / None) by idempotency_key.
-        """
-        self._lookup = existing_delivery_status_lookup
-
-    def decide(
-        self,
-        *,
-        trading_date: str,
-        strategy_version: str,
-        target_id: str,
-        message_version: str,
-    ) -> DeliveryDecision:
-        key = create_delivery_idempotency_key(
-            trading_date=trading_date,
-            strategy_version=strategy_version,
-            target_id=target_id,
-            message_version=message_version,
-        )
-        existing_status = self._lookup(key)
-
-        if existing_status == "SUCCESS":
-            return DeliveryDecision(
-                False,
-                "already delivered successfully with this idempotency key, skipping",
-                key,
-            )
-
-        if existing_status == "FAILED":
-            return DeliveryDecision(
-                True, "previous delivery failed, retrying per retry policy", key
-            )
-
-        return DeliveryDecision(True, "first delivery attempt", key)

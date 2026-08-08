@@ -2,7 +2,6 @@ from app.domain.models import Market, SecurityType, StockMaster
 from app.domain.scoring import ScoredStock
 from app.reports.report_builder import build_report_stocks
 
-
 def test_build_report_stocks_maps_names_and_rank():
     scored = [
         ScoredStock(
@@ -40,7 +39,7 @@ def test_build_report_stocks_maps_names_and_rank():
     assert [v.rank for v in views] == [1, 2]
     assert views[0].stock_name == "Example Corp A"
     assert views[1].stock_name == "Example Corp B"
-    assert views[0].top_factor_names == ("liquidity", "fundamentals")
+    assert views[0].top_factor_names == ("流動性", "基本面")
 
 
 def test_build_report_stocks_falls_back_to_stock_id_when_name_missing():
