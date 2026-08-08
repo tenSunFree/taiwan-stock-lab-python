@@ -96,3 +96,10 @@ def test_top_factors_picks_highest_scores_only():
 def test_utf16_length_matches_line_counting_rule():
     assert utf16_length("abc") == 3
     assert utf16_length("台股") == 2
+    # supplementary-plane character (emoji) — encodes as a UTF-16
+    # surrogate pair (2 code units), but Python's len() would count
+    # it as 1 character. This is the case that actually distinguishes
+    # a correct UTF-16-based implementation from an incorrect one
+    # based on len(text).
+    assert len("😀") == 1  # sanity check: Python counts this as 1 code point
+    assert utf16_length("😀") == 2
