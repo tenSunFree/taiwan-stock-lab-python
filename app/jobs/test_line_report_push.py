@@ -16,7 +16,11 @@ import datetime as dt
 import os
 import sys
 
-from app.clients.line_client import LineMessagingClient, LineNonRetryableError, LinePushError
+from app.clients.line_client import (
+    LineMessagingClient,
+    LineNonRetryableError,
+    LinePushError,
+)
 from app.jobs.test_line_push import load_env_file
 from app.reports.text_renderer import ReportStockView, render_daily_report
 
@@ -27,7 +31,9 @@ def main() -> int:
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     target_id = os.environ.get("LINE_TARGET_ID")
     if not token or not target_id:
-        print("ERROR: LINE_CHANNEL_ACCESS_TOKEN / LINE_TARGET_ID not set", file=sys.stderr)
+        print(
+            "ERROR: LINE_CHANNEL_ACCESS_TOKEN / LINE_TARGET_ID not set", file=sys.stderr
+        )
         return 1
 
     stocks = [
@@ -71,7 +77,9 @@ def main() -> int:
         print(f"LINE push failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"success={result.success} status={result.status_code} request_id={result.request_id}")
+    print(
+        f"success={result.success} status={result.status_code} request_id={result.request_id}"
+    )
     return 0
 
 

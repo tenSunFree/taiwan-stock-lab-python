@@ -112,7 +112,9 @@ def _market_from_finmind_type(value: Any) -> Market | None:
     return None
 
 
-def _security_type_from_stock_info(*, stock_id: str, industry_category: Any, stock_name: Any) -> SecurityType:
+def _security_type_from_stock_info(
+    *, stock_id: str, industry_category: Any, stock_name: Any
+) -> SecurityType:
     """
     Fail-closed classification: prefer UNKNOWN over a false
     COMMON_STOCK positive. See module docstring.
@@ -126,7 +128,13 @@ def _security_type_from_stock_info(*, stock_id: str, industry_category: Any, sto
         return SecurityType.ETN
     if "權證" in category or "權證" in name:
         return SecurityType.WARRANT
-    if "存託憑證" in category or category == "DR" or "TDR" in category:
+    if (
+        "存託憑證" in category
+        or "存託憑證" in name
+        or category == "DR"
+        or "TDR" in category
+        or "TDR" in name
+    ):
         return SecurityType.DR
 
     # Only after known fund/structured-product categories are ruled
@@ -188,7 +196,10 @@ def _previous_close_map(previous_day_rows: list[dict[str, Any]]) -> dict[str, De
 
 
 def build_daily_prices(
-    *, target_date: dt.date, today_rows: list[dict[str, Any]], previous_day_rows: list[dict[str, Any]]
+    *,
+    target_date: dt.date,
+    today_rows: list[dict[str, Any]],
+    previous_day_rows: list[dict[str, Any]],
 ) -> list[DailyPrice]:
     """
     Convert TaiwanStockPrice rows into DailyPrice records.
@@ -225,7 +236,9 @@ def build_daily_prices(
             DailyPrice(
                 trading_date=target_date,
                 stock_id=stock_id,
-                reference_price=previous_close_by_stock.get(stock_id),  # PROVISIONAL, see docstring
+                reference_price=previous_close_by_stock.get(
+                    stock_id
+                ),  # PROVISIONAL, see docstring
                 open_price=open_price,
                 high_price=high_price,
                 low_price=low_price,

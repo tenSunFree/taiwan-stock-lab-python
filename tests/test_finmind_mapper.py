@@ -10,8 +10,18 @@ PREVIOUS_DATE = dt.date(2026, 8, 6)
 
 def test_build_stock_master_maps_market_from_type_field():
     rows = [
-        {"stock_id": "2330", "stock_name": "台積電", "type": "twse", "industry_category": "半導體業"},
-        {"stock_id": "6488", "stock_name": "環球晶", "type": "tpex", "industry_category": "半導體業"},
+        {
+            "stock_id": "2330",
+            "stock_name": "台積電",
+            "type": "twse",
+            "industry_category": "半導體業",
+        },
+        {
+            "stock_id": "6488",
+            "stock_name": "環球晶",
+            "type": "tpex",
+            "industry_category": "半導體業",
+        },
     ]
     result = build_stock_master(rows)
     assert result["2330"].market == Market.TWSE
@@ -20,19 +30,40 @@ def test_build_stock_master_maps_market_from_type_field():
 
 
 def test_build_stock_master_ignores_rows_outside_twse_tpex():
-    rows = [{"stock_id": "1234", "stock_name": "興櫃股", "type": "emerging", "industry_category": "其他"}]
+    rows = [
+        {
+            "stock_id": "1234",
+            "stock_name": "興櫃股",
+            "type": "emerging",
+            "industry_category": "其他",
+        }
+    ]
     result = build_stock_master(rows)
     assert "1234" not in result
 
 
 def test_etf_classified_from_industry_category():
-    rows = [{"stock_id": "0050", "stock_name": "元大台灣50", "type": "twse", "industry_category": "ETF"}]
+    rows = [
+        {
+            "stock_id": "0050",
+            "stock_name": "元大台灣50",
+            "type": "twse",
+            "industry_category": "ETF",
+        }
+    ]
     result = build_stock_master(rows)
     assert result["0050"].security_type == SecurityType.ETF
 
 
 def test_four_digit_common_stock_classified_correctly():
-    rows = [{"stock_id": "2330", "stock_name": "台積電", "type": "twse", "industry_category": "半導體業"}]
+    rows = [
+        {
+            "stock_id": "2330",
+            "stock_name": "台積電",
+            "type": "twse",
+            "industry_category": "半導體業",
+        }
+    ]
     result = build_stock_master(rows)
     assert result["2330"].security_type == SecurityType.COMMON_STOCK
 
@@ -42,9 +73,33 @@ def test_unclassifiable_instrument_fails_closed_to_unknown():
     4-digit numeric code must be UNKNOWN, never guessed as
     COMMON_STOCK — this is the fail-closed safety property
     CandidateBuilder depends on."""
-    rows = [{"stock_id": "2330P1", "stock_name": "台積電特別股", "type": "twse", "industry_category": "特別股"}]
+    rows = [
+        {
+            "stock_id": "2330P1",
+            "stock_name": "台積電特別股",
+            "type": "twse",
+            "industry_category": "特別股",
+        }
+    ]
     result = build_stock_master(rows)
     assert result["2330P1"].security_type == SecurityType.UNKNOWN
+
+
+def test_four_digit_dr_classified_from_name_even_with_generic_category():
+    """Regression test: a 4-digit TDR whose industry_category is
+    generic (not explicitly 'DR'/'存託憑證') but whose stock_name
+    contains the DR indicator must still be classified as DR, not
+    fall through to the numeric-code COMMON_STOCK heuristic."""
+    rows = [
+        {
+            "stock_id": "9105",
+            "stock_name": "台灣存託憑證 ABC",
+            "type": "twse",
+            "industry_category": "電子業",  # generic category, no DR hint here
+        }
+    ]
+    result = build_stock_master(rows)
+    assert result["9105"].security_type == SecurityType.DR
 
 
 def test_build_daily_prices_uses_previous_close_as_provisional_reference():
@@ -62,7 +117,11 @@ def test_build_daily_prices_uses_previous_close_as_provisional_reference():
     ]
     previous_day_rows = [{"date": "2026-08-06", "stock_id": "2330", "close": "590"}]
 
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=previous_day_rows)
+    result = build_daily_prices(
+        target_date=TARGET_DATE,
+        today_rows=today_rows,
+        previous_day_rows=previous_day_rows,
+    )
     assert len(result) == 1
     assert result[0].reference_price == Decimal("590")
     assert result[0].close_price == Decimal("605")
@@ -82,7 +141,9 @@ def test_build_daily_prices_excludes_rows_with_wrong_date():
             "Trading_money": "6050000000",
         }
     ]
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[])
+    result = build_daily_prices(
+        target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
+    )
     assert result == []
 
 
@@ -101,7 +162,9 @@ def test_zero_price_is_treated_as_missing():
             "Trading_money": "0",
         }
     ]
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[])
+    result = build_daily_prices(
+        target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
+    )
     assert result[0].close_price is None
     assert result[0].data_quality_ok is False
 
@@ -122,7 +185,9 @@ def test_zero_volume_and_turnover_are_not_silently_treated_as_missing_but_fail_q
             "Trading_money": "0",
         }
     ]
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[])
+    result = build_daily_prices(
+        target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
+    )
     assert result[0].volume == 0
     assert result[0].turnover == Decimal("0")
     assert result[0].data_quality_ok is False
@@ -141,7 +206,9 @@ def test_invalid_numeric_string_does_not_raise():
             "Trading_money": "N/A",
         }
     ]
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[])
+    result = build_daily_prices(
+        target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
+    )
     assert result[0].close_price is None
     assert result[0].data_quality_ok is False
 
@@ -159,5 +226,7 @@ def test_missing_previous_day_leaves_reference_price_none():
             "Trading_money": "6050000000",
         }
     ]
-    result = build_daily_prices(target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[])
+    result = build_daily_prices(
+        target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
+    )
     assert result[0].reference_price is None

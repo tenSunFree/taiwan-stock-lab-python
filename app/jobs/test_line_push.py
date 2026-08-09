@@ -17,7 +17,11 @@ from __future__ import annotations
 import os
 import sys
 
-from app.clients.line_client import LineMessagingClient, LineNonRetryableError, LinePushError
+from app.clients.line_client import (
+    LineMessagingClient,
+    LineNonRetryableError,
+    LinePushError,
+)
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -42,7 +46,9 @@ def main() -> int:
     target_id = os.environ.get("LINE_TARGET_ID")
 
     if not token:
-        print("ERROR: LINE_CHANNEL_ACCESS_TOKEN is not set (check .env)", file=sys.stderr)
+        print(
+            "ERROR: LINE_CHANNEL_ACCESS_TOKEN is not set (check .env)", file=sys.stderr
+        )
         return 1
     if not target_id:
         print("ERROR: LINE_TARGET_ID is not set (check .env)", file=sys.stderr)
@@ -64,13 +70,17 @@ def main() -> int:
     try:
         result = client.push_text(target_id=target_id, text=test_message)
     except LineNonRetryableError as exc:
-        print(f"LINE rejected the request (check token/target_id): {exc}", file=sys.stderr)
+        print(
+            f"LINE rejected the request (check token/target_id): {exc}", file=sys.stderr
+        )
         return 1
     except LinePushError as exc:
         print(f"LINE push failed after retries: {exc}", file=sys.stderr)
         return 1
 
-    print(f"success={result.success} status={result.status_code} request_id={result.request_id}")
+    print(
+        f"success={result.success} status={result.status_code} request_id={result.request_id}"
+    )
     print("Check your phone now.")
     return 0
 

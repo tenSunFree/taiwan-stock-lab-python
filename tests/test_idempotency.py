@@ -27,37 +27,58 @@ def test_idempotency_key_is_deterministic():
 
 def test_idempotency_key_changes_with_trading_date():
     first = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.0.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     second = create_delivery_idempotency_key(
-        trading_date="2026-08-08", strategy_version="rule-v1.0.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-08",
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     assert first != second
 
 
 def test_idempotency_key_changes_with_strategy_version():
     first = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.0.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     second = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.1.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.1.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     assert first != second
 
 
 def test_idempotency_key_changes_with_target():
     first = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.0.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     second = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.0.0", target_id="U456", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.0.0",
+        target_id="U456",
+        message_version="text-v1",
     )
     assert first != second
 
 
 def test_idempotency_key_changes_with_message_version():
     first = create_delivery_idempotency_key(
-        trading_date="2026-08-07", strategy_version="rule-v1.0.0", target_id="U123", message_version="text-v1"
+        trading_date="2026-08-07",
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
     )
     second = create_delivery_idempotency_key(
         trading_date="2026-08-07",
