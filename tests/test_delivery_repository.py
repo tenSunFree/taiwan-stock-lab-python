@@ -107,6 +107,7 @@ def test_mark_success_updates_status_and_clears_error(session):
     assert reservation.delivery.error_message is None
     assert reservation.delivery.sent_at is not None
 
+
 def test_reserve_raises_on_content_conflict_with_same_key(session):
     from app.db.delivery_repository import DeliveryContentConflict
 

@@ -2,6 +2,7 @@ from app.domain.models import Market, SecurityType, StockMaster
 from app.domain.scoring import ScoredStock
 from app.reports.report_builder import build_report_stocks
 
+
 def test_build_report_stocks_maps_names_and_rank():
     scored = [
         ScoredStock(
