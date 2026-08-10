@@ -42,6 +42,14 @@ def payload_hash(raw_payload: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _redact_token(params: dict[str, Any]) -> dict[str, Any]:
+    """Never persist the API token into raw_source_payloads — it's a
+    secret, not request metadata worth keeping in a snapshot that may
+    end up in backups, logs, or a database with broader read access
+    than the application itself."""
+    return {key: value for key, value in params.items() if key != "token"}
+
+
 @dataclass(frozen=True)
 class RawSourcePayload:
     ingestion_run_id: str
@@ -134,12 +142,57 @@ class FinMindClient(MarketDataClient):
             resp = self.http_client.get(self.base_url, params=params)
             resp.raise_for_status()
             data = resp.json()
-            return data, dt.datetime.now(dt.timezone.utc)
+            # No documented dataset-level "last updated" timestamp
+            # from FinMind — requested_at already records when we
+            # called the API; don't invent a source_updated_at value.
+            return data, None
 
         return self.fetch_and_snapshot(
             ingestion_run_id=ingestion_run_id,
             target_date=target_date,
-            request_parameters=params,
+            request_parameters=_redact_token(params),
+            fetch_fn=_fetch,
+        )
+
+    def fetch_stock_info(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch the TaiwanStockInfo reference dataset.
+
+        TaiwanStockInfo provides stock master metadata such as:
+            - stock_id
+            - stock_name
+            - industry_category
+            - type (market: twse / tpex / emerging)
+            - date (source update date)
+
+        Unlike TaiwanStockPrice, this dataset is not queried by a
+        start/end trading-date range.
+
+        target_date here is used only as ingestion bookkeeping — it
+        identifies which ranking/ingestion run this raw snapshot
+        belongs to. It must not be interpreted as the source
+        dataset's own update date; each TaiwanStockInfo row carries
+        its own `date` field in the response.
+        """
+        params = {
+            "dataset": "TaiwanStockInfo",
+            "token": self.api_token,
+        }
+
+        def _fetch():
+            response = self.http_client.get(self.base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            # See fetch_daily_price(): no dataset-level update
+            # timestamp is available from FinMind.
+            return data, None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=_redact_token(params),
             fetch_fn=_fetch,
         )
 
