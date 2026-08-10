@@ -143,6 +143,46 @@ class FinMindClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
+    def fetch_stock_info(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch the TaiwanStockInfo reference dataset.
+
+        TaiwanStockInfo provides stock master metadata such as:
+            - stock_id
+            - stock_name
+            - industry_category
+            - type (market: twse / tpex / emerging)
+            - date (source update date)
+
+        Unlike TaiwanStockPrice, this dataset is not queried by a
+        start/end trading-date range.
+
+        target_date here is used only as ingestion bookkeeping — it
+        identifies which ranking/ingestion run this raw snapshot
+        belongs to. It must not be interpreted as the source
+        dataset's own update date; each TaiwanStockInfo row carries
+        its own `date` field in the response.
+        """
+        params = {
+            "dataset": "TaiwanStockInfo",
+            "token": self.api_token,
+        }
+
+        def _fetch():
+            response = self.http_client.get(self.base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data, dt.datetime.now(dt.timezone.utc)
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
+            fetch_fn=_fetch,
+        )
+
     # Other datasets (institutional net buy/sell, margin/short balance,
     # monthly revenue, etc.) follow the same pattern, each mapped to
     # the corresponding FinMind dataset name — check FinMind's current
