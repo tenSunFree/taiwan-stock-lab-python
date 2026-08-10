@@ -108,3 +108,37 @@ def test_fetch_stock_info_raises_on_http_error():
     client, _ = make_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
         client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+
+def test_fetch_stock_info_never_persists_api_token():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    saved_params = repo.saved[0].request_parameters
+    assert "token" not in saved_params
+    assert "fake-token" not in saved_params.values()
+
+
+def test_fetch_stock_info_does_not_fabricate_source_updated_at():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repo.saved[0].source_updated_at is None
+
+
+def test_fetch_daily_price_never_persists_api_token():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    client.fetch_daily_price(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    saved_params = repo.saved[0].request_parameters
+    assert "token" not in saved_params
+    assert "fake-token" not in saved_params.values()
