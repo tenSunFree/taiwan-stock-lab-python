@@ -94,7 +94,7 @@ def fetch_previous_trading_day_price(
     finmind: FinMindClient,
     ingestion_run_id: str,
     target_date: dt.date,
-    maximum_lookback_days: int = 10,
+    maximum_lookback_days: int = 20,
 ) -> tuple[dt.date, RawSourcePayload]:
     """
     Find the immediately preceding date FinMind actually has
@@ -103,6 +103,15 @@ def fetch_previous_trading_day_price(
     wrong across weekends and holidays. TradingCalendar isn't
     production-grade yet, so using the source data directly is safer
     for this checkpoint.
+
+    maximum_lookback_days=20 (not 10): TWSE's Chinese New Year closure
+    has run as long as 11-12 calendar days in recent years (e.g. 2025:
+    closed 2025-01-23 through 2025-02-02, reopening 2025-02-03 — the
+    gap back to the prior trading day, 2025-01-22, is 12 calendar
+    days). A 10-day window would incorrectly raise on the first
+    trading day after any long holiday closure. 20 days leaves margin
+    for an even longer closure without assuming a specific holiday
+    calendar (which TradingCalendar doesn't have yet).
     """
     for days_back in range(1, maximum_lookback_days + 1):
         candidate_date = target_date - dt.timedelta(days=days_back)
