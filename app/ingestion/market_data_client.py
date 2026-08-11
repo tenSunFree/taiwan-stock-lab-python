@@ -128,6 +128,17 @@ class FinMindClient(MarketDataClient):
         self.api_token = api_token
         self.base_url = "https://api.finmindtrade.com/api/v4/data"
 
+    def _auth_headers(self) -> dict[str, str]:
+        """
+        FinMind's own documentation (finmind.github.io/login/) sends
+        the token as an Authorization: Bearer header, not a query
+        parameter. Besides matching the officially documented usage,
+        this also keeps the token out of request URLs — and therefore
+        out of httpx's default request-URL logging, browser history,
+        proxy logs, etc. — which query-string tokens are not.
+        """
+        return {"Authorization": f"Bearer {self.api_token}"}
+
     def fetch_daily_price(
         self, *, ingestion_run_id: str, target_date: dt.date
     ) -> RawSourcePayload:
@@ -135,11 +146,12 @@ class FinMindClient(MarketDataClient):
             "dataset": "TaiwanStockPrice",
             "start_date": target_date.isoformat(),
             "end_date": target_date.isoformat(),
-            "token": self.api_token,
         }
 
         def _fetch():
-            resp = self.http_client.get(self.base_url, params=params)
+            resp = self.http_client.get(
+                self.base_url, params=params, headers=self._auth_headers()
+            )
             resp.raise_for_status()
             data = resp.json()
             # No documented dataset-level "last updated" timestamp
@@ -150,7 +162,7 @@ class FinMindClient(MarketDataClient):
         return self.fetch_and_snapshot(
             ingestion_run_id=ingestion_run_id,
             target_date=target_date,
-            request_parameters=_redact_token(params),
+            request_parameters=params,  # no longer contains a secret — see _auth_headers()
             fetch_fn=_fetch,
         )
 
@@ -176,13 +188,12 @@ class FinMindClient(MarketDataClient):
         dataset's own update date; each TaiwanStockInfo row carries
         its own `date` field in the response.
         """
-        params = {
-            "dataset": "TaiwanStockInfo",
-            "token": self.api_token,
-        }
+        params = {"dataset": "TaiwanStockInfo"}
 
         def _fetch():
-            response = self.http_client.get(self.base_url, params=params)
+            response = self.http_client.get(
+                self.base_url, params=params, headers=self._auth_headers()
+            )
             response.raise_for_status()
             data = response.json()
             # See fetch_daily_price(): no dataset-level update
@@ -192,7 +203,7 @@ class FinMindClient(MarketDataClient):
         return self.fetch_and_snapshot(
             ingestion_run_id=ingestion_run_id,
             target_date=target_date,
-            request_parameters=_redact_token(params),
+            request_parameters=params,  # no longer contains a secret
             fetch_fn=_fetch,
         )
 

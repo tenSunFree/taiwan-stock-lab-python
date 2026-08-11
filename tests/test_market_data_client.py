@@ -38,7 +38,9 @@ def test_fetch_stock_info_sends_correct_dataset_param():
     client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
 
     assert captured_params["dataset"] == "TaiwanStockInfo"
-    assert captured_params["token"] == "fake-token"
+    # token is no longer sent as a query param — see
+    # test_fetch_stock_info_sends_bearer_authorization_header and
+    # test_fetch_stock_info_never_persists_api_token instead.
 
 
 def test_fetch_stock_info_does_not_send_date_range_params():
@@ -142,3 +144,39 @@ def test_fetch_daily_price_never_persists_api_token():
     saved_params = repo.saved[0].request_parameters
     assert "token" not in saved_params
     assert "fake-token" not in saved_params.values()
+
+
+def test_fetch_daily_price_sends_bearer_authorization_header():
+    captured_headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_daily_price(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured_headers.get("authorization") == "Bearer fake-token"
+
+
+def test_fetch_daily_price_params_never_contain_token_at_all():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    client.fetch_daily_price(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert "token" not in repo.saved[0].request_parameters
+
+
+def test_fetch_stock_info_sends_bearer_authorization_header():
+    captured_headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured_headers.get("authorization") == "Bearer fake-token"
