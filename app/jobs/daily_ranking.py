@@ -1,27 +1,43 @@
 """
 Daily scheduled job entry point.
 
-Checkpoint 2A: wires real FinMind data through to CandidateBuilder
+Checkpoint 2A: wires real market data through to CandidateBuilder
 only — deliberately stops before RiskPolicy/scoring/report so that if
 the candidate pool comes back empty or wrong, the debugging surface
 is limited to data ingestion and mapping, not the whole pipeline.
 
+Data sources (see architecture discussion: FinMind's free tier
+requires a per-stock data_id, making a whole-market daily scan
+impractical without a paid tier):
+
+    TWSE (TwseClient + twse_mapper)
+        Today's full TWSE-listed market OHLC/volume/turnover, via the
+        public STOCK_DAY_ALL open-data endpoint. reference_price is
+        derived from the day's own 漲跌價差 (price change) field, so
+        — unlike the FinMind-based approach this replaces — NO second
+        day's data needs to be fetched at all.
+
+    FinMind (FinMindClient.fetch_stock_info + finmind_mapper)
+        Stock master metadata (stock_name, market, security_type) via
+        TaiwanStockInfo. Still needed because TWSE's STOCK_DAY_ALL
+        doesn't classify instruments or give market (TWSE vs TPEx).
+
 KNOWN LIMITATIONS in this checkpoint:
 
-    - reference_price is approximated from the previous trading day's
-      close (see app/ingestion/finmind_mapper.py). Wrong on
-      ex-rights/ex-dividend days.
-    - "Previous trading day" is found by querying FinMind itself and
-      walking backward until a date with actual price rows is found —
-      this correctly skips weekends AND holidays without needing a
-      real holiday calendar, but does spend extra API calls doing so.
+    - TWSE's STOCK_DAY_ALL only returns the latest available trading
+      day, not an arbitrary historical date (see twse_mapper.py's
+      module docstring). Manually overriding TARGET_TRADING_DATE to a
+      past date will reliably hit WAITING_FOR_DATA below — that is
+      expected, not a bug, until a real historical TWSE data source is
+      wired in.
+    - TPEx (上櫃) stocks are not covered yet — only TWSE-listed (上市)
+      instruments. See Roadmap: Step 6 (TpexClient + tpex_mapper).
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
-      loaded from it — a config loader is a separate piece of work,
-      not bundled into this checkpoint.
+      loaded from it — a config loader is separate follow-up work.
 
 RiskPolicy, StockFeatures, scoring, and LINE delivery are NOT wired in
-yet — see Step 2B/2C/2D/2E in the project's working notes.
+yet.
 """
 
 from __future__ import annotations
@@ -33,13 +49,19 @@ import sys
 from decimal import Decimal
 
 from app.domain.candidate_builder import Candidate, CandidateBuilder
-from app.ingestion.finmind_mapper import build_daily_prices, build_stock_master
+from app.ingestion.finmind_mapper import build_stock_master
 from app.ingestion.market_data_client import (
     FinMindClient,
     RawSourcePayload,
+    TwseClient,
     new_ingestion_run_id,
 )
 from app.ingestion.trading_calendar import TradingCalendar
+from app.ingestion.twse_mapper import (
+    build_daily_prices,
+    parse_stock_day_all_csv,
+    roc_date_to_gregorian,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("daily_ranking")
@@ -78,60 +100,15 @@ def resolve_target_date() -> dt.date:
 
 
 def extract_data_rows(payload: RawSourcePayload) -> list[dict]:
-    """Defensively extract FinMind's raw `data` rows. The raw response
-    itself stays untouched in RawSourcePayload; this only extracts
-    rows for downstream mapping."""
+    """Defensively extract FinMind's raw `data` rows (JSON responses
+    only — TWSE's CSV responses are parsed via
+    twse_mapper.parse_stock_day_all_csv instead, not this function)."""
     if not isinstance(payload.raw_payload, dict):
         return []
     rows = payload.raw_payload.get("data")
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
-
-
-def fetch_previous_trading_day_price(
-    *,
-    finmind: FinMindClient,
-    ingestion_run_id: str,
-    target_date: dt.date,
-    maximum_lookback_days: int = 20,
-) -> tuple[dt.date, RawSourcePayload]:
-    """
-    Find the immediately preceding date FinMind actually has
-    TaiwanStockPrice rows for, by querying FinMind itself and walking
-    backward — not by assuming target_date - 1 day, which would be
-    wrong across weekends and holidays. TradingCalendar isn't
-    production-grade yet, so using the source data directly is safer
-    for this checkpoint.
-
-    maximum_lookback_days=20 (not 10): TWSE's Chinese New Year closure
-    has run as long as 11-12 calendar days in recent years (e.g. 2025:
-    closed 2025-01-23 through 2025-02-02, reopening 2025-02-03 — the
-    gap back to the prior trading day, 2025-01-22, is 12 calendar
-    days). A 10-day window would incorrectly raise on the first
-    trading day after any long holiday closure. 20 days leaves margin
-    for an even longer closure without assuming a specific holiday
-    calendar (which TradingCalendar doesn't have yet).
-    """
-    for days_back in range(1, maximum_lookback_days + 1):
-        candidate_date = target_date - dt.timedelta(days=days_back)
-        payload = finmind.fetch_daily_price(
-            ingestion_run_id=ingestion_run_id, target_date=candidate_date
-        )
-        rows = extract_data_rows(payload)
-
-        if any(row.get("date") == candidate_date.isoformat() for row in rows):
-            return candidate_date, payload
-
-        logger.info(
-            "No FinMind price data for previous-date candidate %s; looking further back",
-            candidate_date,
-        )
-
-    raise RuntimeError(
-        f"Could not find a previous trading day with FinMind price data "
-        f"within {maximum_lookback_days} calendar days before {target_date}"
-    )
 
 
 def log_candidates(candidates: list[Candidate]) -> None:
@@ -169,32 +146,36 @@ def run() -> int:
         return 1
 
     repo = InMemoryRawPayloadRepository()
+    twse = TwseClient(repo)
     finmind = FinMindClient(repo, api_token=api_token)
 
-    # --- Step 1: today's price data + readiness check ---
+    # --- Step 1: today's whole-market price data from TWSE ---
     try:
-        today_price_payload = finmind.fetch_daily_price(
+        twse_price_payload = twse.fetch_daily_price(
             ingestion_run_id=ingestion_run_id, target_date=target_date
         )
     except Exception:
-        logger.exception("FinMind fetch_daily_price failed")
+        logger.exception("TWSE fetch_daily_price failed")
         return 1
 
-    today_rows = extract_data_rows(today_price_payload)
-    reported_dates = {row.get("date") for row in today_rows}
+    twse_rows = parse_stock_day_all_csv(twse_price_payload.raw_payload)
 
-    # NOTE: no "reported_dates and ..." guard here — if today_rows is
-    # completely empty, reported_dates is an empty set, and we still
-    # need this to correctly report WAITING_FOR_DATA rather than
-    # silently proceeding with zero rows.
-    if target_date.isoformat() not in reported_dates:
+    # --- data-readiness check ---
+    # TWSE's STOCK_DAY_ALL only ever returns the latest available
+    # trading day (see module docstring). If none of the returned
+    # rows' own dates match target_date, either today's data isn't
+    # published yet, or target_date is a past date this endpoint
+    # can't serve — either way, do not proceed with mismatched data.
+    reported_dates = {roc_date_to_gregorian(row.get("日期", "")) for row in twse_rows}
+    if target_date not in reported_dates:
         logger.warning(
-            "WAITING_FOR_DATA: FinMind has not returned price data for %s yet",
+            "WAITING_FOR_DATA: TWSE has not returned price data for %s yet "
+            "(or target_date is a past date this endpoint cannot serve)",
             target_date,
         )
         return 2
 
-    # --- Step 2: stock master reference data ---
+    # --- Step 2: stock master reference data from FinMind ---
     try:
         stock_info_payload = finmind.fetch_stock_info(
             ingestion_run_id=ingestion_run_id, target_date=target_date
@@ -208,32 +189,16 @@ def run() -> int:
         logger.error("TaiwanStockInfo returned no usable rows")
         return 1
 
-    # --- Step 3: find the real previous trading day ---
-    try:
-        previous_date, previous_price_payload = fetch_previous_trading_day_price(
-            finmind=finmind, ingestion_run_id=ingestion_run_id, target_date=target_date
-        )
-    except Exception:
-        logger.exception("Could not resolve previous trading day")
-        return 1
-
-    previous_rows = extract_data_rows(previous_price_payload)
-    logger.info(
-        "resolved previous_trading_day=%s for target_date=%s",
-        previous_date,
-        target_date,
-    )
-
-    # --- Step 4: map to domain models ---
+    # --- Step 3: map to domain models ---
     stock_master = build_stock_master(stock_info_rows)
-    daily_prices = build_daily_prices(
-        target_date=target_date, today_rows=today_rows, previous_day_rows=previous_rows
-    )
+    daily_prices = build_daily_prices(target_date=target_date, rows=twse_rows)
     logger.info(
-        "mapped stock_master=%d daily_prices=%d", len(stock_master), len(daily_prices)
+        "mapped stock_master=%d daily_prices=%d (TWSE-listed only, TPEx not yet wired in)",
+        len(stock_master),
+        len(daily_prices),
     )
 
-    # --- Step 5: candidate pool ---
+    # --- Step 4: candidate pool ---
     candidate_builder = CandidateBuilder(
         minimum_turnover=MINIMUM_TURNOVER, maximum_candidates=MAXIMUM_CANDIDATES
     )
