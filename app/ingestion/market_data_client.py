@@ -203,9 +203,60 @@ class FinMindClient(MarketDataClient):
 
 
 class TwseClient(MarketDataClient):
+    """
+    TWSE full-market daily-price client.
+
+    Uses TWSE's public STOCK_DAY_ALL open-data CSV endpoint
+    (www.twse.com.tw/exchangeReport/...), not the separate
+    openapi.twse.com.tw/v1 Swagger JSON API — the two are different
+    systems, don't conflate them in future docs/code here.
+
+    Important:
+        This client is responsible only for fetching and snapshotting
+        the raw source response. CSV parsing and conversion into
+        DailyPrice domain models belong in app.ingestion.twse_mapper.
+    """
+
     source_name = "twse"
-    # TODO: implement against the current TWSE OpenAPI spec (listed
-    # daily closing quotes, limit-up/limit-down prices, etc.)
+
+    def __init__(self, repository: RawPayloadRepository, **kwargs) -> None:
+        super().__init__(repository, **kwargs)
+        self.stock_day_all_url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
+
+    def fetch_daily_price(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TWSE STOCK_DAY_ALL.
+
+        The endpoint returns the full TWSE-listed market's latest
+        available daily OHLC / volume / turnover data as CSV. No API
+        token required — unlike FinMindClient, this endpoint is
+        public with no authentication.
+
+        `target_date` is NOT sent to this endpoint. It is retained as
+        ingestion bookkeeping and will later be verified against each
+        row's own 日期 field by twse_mapper — so an old/stale TWSE
+        response cannot silently be treated as data for an arbitrary
+        requested historical date.
+        """
+        params = {"response": "open_data"}
+
+        def _fetch():
+            response = self.http_client.get(self.stock_day_all_url, params=params)
+            response.raise_for_status()
+            # Keep the source response untouched here. TWSE's
+            # open_data representation is CSV text rather than
+            # FinMind-style JSON — parsing happens only after the raw
+            # snapshot boundary, inside twse_mapper.py.
+            return response.text, None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
+            fetch_fn=_fetch,
+        )
 
 
 class TpexClient(MarketDataClient):
