@@ -271,9 +271,60 @@ class TwseClient(MarketDataClient):
 
 
 class TpexClient(MarketDataClient):
+    """
+    TPEx (Taipei Exchange / OTC market) full-market daily-price client.
+
+    Uses TPEx's public tpex_mainboard_daily_close_quotes open-data
+    JSON endpoint. No authentication required.
+
+    Important:
+        This client is responsible only for fetching and snapshotting
+        the raw source response. JSON parsing and conversion into
+        DailyPrice domain models belong in app.ingestion.tpex_mapper.
+    """
+
     source_name = "tpex"
-    # TODO: implement against the current TPEx OpenAPI spec (OTC daily
-    # closing quotes)
+
+    def __init__(self, repository: RawPayloadRepository, **kwargs) -> None:
+        super().__init__(repository, **kwargs)
+        self.daily_close_quotes_url = (
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+        )
+
+    def fetch_daily_price(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch tpex_mainboard_daily_close_quotes.
+
+        The endpoint returns the full TPEx-listed OTC market's latest
+        available daily OHLC / volume / turnover data as a JSON array,
+        with no authentication and no query parameters.
+
+        `target_date` is NOT sent to this endpoint. It is retained as
+        ingestion bookkeeping and will later be verified against each
+        row's own Date field by tpex_mapper — so an old/stale TPEx
+        response cannot silently be treated as data for an arbitrary
+        requested historical date. This endpoint has the same "latest
+        trading day only" limitation as TWSE's STOCK_DAY_ALL.
+        """
+
+        def _fetch():
+            response = self.http_client.get(self.daily_close_quotes_url)
+            response.raise_for_status()
+            # Unlike TWSE's CSV response, TPEx returns JSON directly —
+            # response.json() gives a list[dict] as-is. Parsing/row
+            # extraction still happens only in tpex_mapper.py, not
+            # here (same "save raw, parse later" rule as everywhere
+            # else).
+            return response.json(), None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters={},
+            fetch_fn=_fetch,
+        )
 
 
 class MopsClient(MarketDataClient):
