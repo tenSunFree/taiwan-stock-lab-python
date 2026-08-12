@@ -135,6 +135,16 @@ def run(
     twse_client: TwseClient | None = None,
     finmind_client: FinMindClient | None = None,
 ) -> int:
+    if (twse_client is not None or finmind_client is not None) and repository is None:
+        raise ValueError(
+            "repository must be provided whenever twse_client or "
+            "finmind_client is injected, otherwise raw-snapshot "
+            "bookkeeping (the 'raw snapshots' count in the completion "
+            "log) can silently under-count. Pass all three together "
+            "(as the test fixtures do), or none of them for production "
+            "behavior."
+        )
+
     target_date = resolve_target_date()
     calendar = TradingCalendar()  # production should use the DB-backed trading_calendar
 

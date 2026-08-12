@@ -1,6 +1,7 @@
 import datetime as dt
 
 import httpx
+import pytest
 
 from app.ingestion.market_data_client import FinMindClient, TwseClient
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
@@ -197,3 +198,25 @@ def test_run_returns_1_when_twse_fetch_raises(monkeypatch):
 
     assert result == 1
     assert repository.saved == []
+
+
+def test_run_raises_when_client_injected_without_repository(monkeypatch):
+    """
+    Regression test for the split-repository bug: injecting a client
+    without also injecting the repository it was built with would
+    silently under-count raw snapshots in the completion log. This
+    must fail loudly instead.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    other_repo = InMemoryRawPayloadRepository()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=TWSE_CSV_NON_LIMIT_UP)
+
+    twse_client = TwseClient(
+        other_repo, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(ValueError):
+        run(twse_client=twse_client)  # repository= deliberately omitted
