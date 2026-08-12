@@ -129,7 +129,12 @@ def log_candidates(candidates: list[Candidate]) -> None:
         )
 
 
-def run() -> int:
+def run(
+    *,
+    repository: InMemoryRawPayloadRepository | None = None,
+    twse_client: TwseClient | None = None,
+    finmind_client: FinMindClient | None = None,
+) -> int:
     target_date = resolve_target_date()
     calendar = TradingCalendar()  # production should use the DB-backed trading_calendar
 
@@ -140,44 +145,71 @@ def run() -> int:
     ingestion_run_id = new_ingestion_run_id()
     logger.info("ingestion_run_id=%s target_date=%s", ingestion_run_id, target_date)
 
-    api_token = os.environ.get("FINMIND_TOKEN", "")
-    if not api_token:
-        logger.error("FINMIND_TOKEN not set")
-        return 1
+    # One repository per ingestion run — production uses this same
+    # repository for both providers so every raw source snapshot
+    # belonging to the run is collected together.
+    repo = repository or InMemoryRawPayloadRepository()
 
-    repo = InMemoryRawPayloadRepository()
-    twse = TwseClient(repo)
-    finmind = FinMindClient(repo, api_token=api_token)
+    if twse_client is None:
+        twse_client = TwseClient(repo)
+
+    if finmind_client is None:
+        api_token = os.environ.get("FINMIND_TOKEN", "").strip()
+        if not api_token:
+            logger.error("FINMIND_TOKEN not set")
+            return 1
+        finmind_client = FinMindClient(repo, api_token=api_token)
 
     # --- Step 1: today's whole-market price data from TWSE ---
     try:
-        twse_price_payload = twse.fetch_daily_price(
+        twse_price_payload = twse_client.fetch_daily_price(
             ingestion_run_id=ingestion_run_id, target_date=target_date
         )
     except Exception:
         logger.exception("TWSE fetch_daily_price failed")
         return 1
 
+    if not isinstance(twse_price_payload.raw_payload, str):
+        logger.error(
+            "TWSE STOCK_DAY_ALL returned unexpected raw payload type: %s",
+            type(twse_price_payload.raw_payload).__name__,
+        )
+        return 1
+
     twse_rows = parse_stock_day_all_csv(twse_price_payload.raw_payload)
 
-    # --- data-readiness check ---
-    # TWSE's STOCK_DAY_ALL only ever returns the latest available
-    # trading day (see module docstring). If none of the returned
-    # rows' own dates match target_date, either today's data isn't
-    # published yet, or target_date is a past date this endpoint
-    # can't serve — either way, do not proceed with mismatched data.
-    reported_dates = {roc_date_to_gregorian(row.get("日期", "")) for row in twse_rows}
-    if target_date not in reported_dates:
+    if not twse_rows:
         logger.warning(
-            "WAITING_FOR_DATA: TWSE has not returned price data for %s yet "
-            "(or target_date is a past date this endpoint cannot serve)",
+            "WAITING_FOR_DATA: TWSE returned no usable STOCK_DAY_ALL rows for %s",
             target_date,
         )
         return 2
 
+    # STOCK_DAY_ALL only exposes the latest available trading day.
+    # Never allow that response to silently masquerade as an
+    # arbitrary TARGET_TRADING_DATE.
+    reported_dates = {roc_date_to_gregorian(row.get("日期", "")) for row in twse_rows}
+    reported_dates.discard(None)
+
+    if target_date not in reported_dates:
+        logger.warning(
+            "WAITING_FOR_DATA: TWSE has not returned price data for %s yet "
+            "(reported_dates=%s; target_date may also be a past date this "
+            "endpoint cannot serve)",
+            target_date,
+            sorted(reported_dates),
+        )
+        return 2
+
+    logger.info(
+        "TWSE source ready: rows=%d reported_dates=%s",
+        len(twse_rows),
+        sorted(reported_dates),
+    )
+
     # --- Step 2: stock master reference data from FinMind ---
     try:
-        stock_info_payload = finmind.fetch_stock_info(
+        stock_info_payload = finmind_client.fetch_stock_info(
             ingestion_run_id=ingestion_run_id, target_date=target_date
         )
     except Exception:
@@ -189,7 +221,9 @@ def run() -> int:
         logger.error("TaiwanStockInfo returned no usable rows")
         return 1
 
-    # --- Step 3: map to domain models ---
+    logger.info("FinMind stock info ready: rows=%d", len(stock_info_rows))
+
+    # --- Step 3: map source rows into domain models ---
     stock_master = build_stock_master(stock_info_rows)
     daily_prices = build_daily_prices(target_date=target_date, rows=twse_rows)
     logger.info(
@@ -197,6 +231,14 @@ def run() -> int:
         len(stock_master),
         len(daily_prices),
     )
+
+    if not stock_master:
+        logger.error("FinMind mapper produced no StockMaster records")
+        return 1
+
+    if not daily_prices:
+        logger.error("TWSE mapper produced no DailyPrice records")
+        return 1
 
     # --- Step 4: candidate pool ---
     candidate_builder = CandidateBuilder(
