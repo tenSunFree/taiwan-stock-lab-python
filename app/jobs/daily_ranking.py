@@ -43,10 +43,11 @@ KNOWN LIMITATIONS in this checkpoint:
     - reference_price on both markets remains provisional (see each
       mapper's module docstring for the exact caveats — ex-rights
       days, no-trade days, etc.).
-    - If TPEx fails to fetch or has no usable rows for target_date,
-      the entire run fails (return 1 or 2) rather than silently
-      falling back to TWSE-only candidates — an incomplete whole-
-      market scan should never be treated as a complete one.
+    - If TPEx fails to fetch, has no usable rows, or its mapper
+      filters out every row for target_date, the entire run fails
+      rather than silently falling back to TWSE-only candidates (and
+      vice versa) — an incomplete whole-market scan should never be
+      treated as a complete one.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
       loaded from it — a config loader is separate follow-up work.
@@ -149,6 +150,34 @@ def log_candidates(candidates: list[Candidate]) -> None:
         )
 
 
+def _validate_shared_repository(
+    *,
+    repository: InMemoryRawPayloadRepository,
+    twse_client: TwseClient | None,
+    tpex_client: TpexClient | None,
+    finmind_client: FinMindClient | None,
+) -> None:
+    """
+    A caller could pass repository=A but hand run() a client that was
+    actually built with a different repository (repository=B). The
+    "repository must be provided" guard alone doesn't catch that — it
+    only checks that *something* was passed, not that it's the same
+    object every injected client is writing snapshots to.
+    """
+    for name, client in (
+        ("twse_client", twse_client),
+        ("tpex_client", tpex_client),
+        ("finmind_client", finmind_client),
+    ):
+        if client is not None and client.repository is not repository:
+            raise ValueError(
+                f"{name} was constructed with a different repository than the "
+                f"one passed to run(). All injected clients must share the same "
+                f"repository instance, or raw-snapshot bookkeeping silently "
+                f"splits across repositories."
+            )
+
+
 def run(
     *,
     repository: InMemoryRawPayloadRepository | None = None,
@@ -165,6 +194,14 @@ def run(
             "'raw snapshots' count in the completion log) can silently under-count. "
             "Pass all injected clients together with repository, or none of them "
             "for production behavior."
+        )
+
+    if repository is not None:
+        _validate_shared_repository(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
         )
 
     target_date = resolve_target_date()
@@ -257,7 +294,7 @@ def run(
         )
         return 1
 
-    tpex_rows = tpex_price_payload.raw_payload
+    tpex_rows = [row for row in tpex_price_payload.raw_payload if isinstance(row, dict)]
 
     if not tpex_rows:
         logger.warning(
@@ -307,6 +344,25 @@ def run(
     stock_master = build_stock_master(stock_info_rows)
     twse_daily_prices = build_twse_daily_prices(target_date=target_date, rows=twse_rows)
     tpex_daily_prices = build_tpex_daily_prices(target_date=target_date, rows=tpex_rows)
+
+    if not twse_daily_prices:
+        logger.warning(
+            "WAITING_FOR_DATA: TWSE mapper produced zero DailyPrice records for %s "
+            "even though raw rows were present — treating as not-ready rather than "
+            "silently proceeding with a TPEx-only pool",
+            target_date,
+        )
+        return 2
+
+    if not tpex_daily_prices:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx mapper produced zero DailyPrice records for %s "
+            "even though raw rows were present — treating as not-ready rather than "
+            "silently proceeding with a TWSE-only pool",
+            target_date,
+        )
+        return 2
+
     daily_prices = twse_daily_prices + tpex_daily_prices
 
     logger.info(
@@ -319,10 +375,6 @@ def run(
 
     if not stock_master:
         logger.error("FinMind mapper produced no StockMaster records")
-        return 1
-
-    if not daily_prices:
-        logger.error("TWSE/TPEx mappers produced no DailyPrice records")
         return 1
 
     # --- Step 4: candidate pool (whole market: TWSE + TPEx) ---

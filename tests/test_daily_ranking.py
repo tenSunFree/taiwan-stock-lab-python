@@ -168,6 +168,32 @@ def test_run_raises_when_client_injected_without_repository(monkeypatch):
         run(twse_client=twse_client)  # repository= deliberately omitted
 
 
+def test_run_raises_when_injected_client_uses_different_repository(monkeypatch):
+    """
+    Regression test for the split-repository bug: a client built with
+    a different repository than the one passed to run() must be
+    rejected loudly, not silently split raw-snapshot bookkeeping.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository_a = InMemoryRawPayloadRepository()
+    repository_b = InMemoryRawPayloadRepository()
+
+    twse_client = make_twse_client(
+        repository_b, TWSE_CSV_NON_LIMIT_UP
+    )  # built with repository_b
+    tpex_client = make_tpex_client(repository_a, TPEX_JSON_NON_LIMIT_UP)
+    finmind_client = make_finmind_client(repository_a, FINMIND_STOCK_INFO_TSMC)
+
+    with pytest.raises(ValueError):
+        run(
+            repository=repository_a,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+
 def test_run_reports_waiting_for_data_when_twse_date_does_not_match(monkeypatch):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
@@ -218,6 +244,69 @@ def test_run_reports_waiting_for_data_when_tpex_date_does_not_match(monkeypatch)
     # NOT be called.
     assert len(repository.saved) == 2
     assert {p.source for p in repository.saved} == {"twse", "tpex"}
+
+
+def test_run_returns_1_when_tpex_row_is_not_a_dict(monkeypatch):
+    """
+    Regression test: TPEx's raw payload can pass the outer
+    isinstance(..., list) check while still containing non-dict
+    elements (e.g. ["error"] or [None]). Every row must be filtered
+    before .get() is called on it, or this crashes with an
+    uncaught exception instead of returning a clean status code.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client = make_twse_client(repository, TWSE_CSV_NON_LIMIT_UP)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not a dict", None])
+
+    tpex_client = TpexClient(
+        repository, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    finmind_client = make_finmind_client(repository, FINMIND_STOCK_INFO_TSMC)
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+
+    assert (
+        result == 2
+    )  # every row filtered out -> treated as WAITING_FOR_DATA, not a crash
+
+
+def test_run_reports_waiting_for_data_when_tpex_rows_are_all_filtered_out_by_mapper(
+    monkeypatch,
+):
+    """
+    Regression test: TPEx's readiness check (date match) can pass
+    while build_tpex_daily_prices() still filters out every row for
+    other reasons (e.g. missing SecuritiesCompanyCode) — this must
+    not silently fall through to a TWSE-only candidate pool.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client = make_twse_client(repository, TWSE_CSV_LIMIT_UP)
+
+    tpex_rows_missing_code = [
+        {**row, "SecuritiesCompanyCode": ""} for row in TPEX_JSON_NON_LIMIT_UP
+    ]
+    tpex_client = make_tpex_client(repository, tpex_rows_missing_code)
+    finmind_client = make_finmind_client(repository, FINMIND_STOCK_INFO_LIMIT_UP)
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+
+    assert result == 2
 
 
 def test_run_produces_zero_candidates_when_no_stock_is_limit_up(monkeypatch, caplog):
