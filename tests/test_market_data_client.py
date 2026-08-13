@@ -180,3 +180,72 @@ def test_fetch_stock_info_sends_bearer_authorization_header():
     client.fetch_stock_info(ingestion_run_id="run-1", target_date=TARGET_DATE)
 
     assert captured_headers.get("authorization") == "Bearer fake-token"
+
+
+def test_fetch_stock_price_history_sends_stock_id_and_date_range():
+    captured_params = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_params.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_price_history(
+        ingestion_run_id="run-1",
+        stock_id="2330",
+        start_date=dt.date(2026, 6, 1),
+        end_date=dt.date(2026, 8, 12),
+        target_date=dt.date(2026, 8, 13),
+    )
+
+    assert captured_params == {
+        "dataset": "TaiwanStockPrice",
+        "data_id": "2330",
+        "start_date": "2026-06-01",
+        "end_date": "2026-08-12",
+    }
+
+
+def test_fetch_stock_price_history_uses_bearer_header_not_url_token():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_price_history(
+        ingestion_run_id="run-1",
+        stock_id="2330",
+        start_date=dt.date(2026, 6, 1),
+        end_date=dt.date(2026, 8, 12),
+        target_date=dt.date(2026, 8, 13),
+    )
+
+    assert "token=" not in captured["url"]
+    assert captured["authorization"] == "Bearer fake-token"
+
+
+def test_fetch_stock_price_history_rejects_empty_stock_id():
+    client, _ = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        client.fetch_stock_price_history(
+            ingestion_run_id="run-1",
+            stock_id="",
+            start_date=dt.date(2026, 6, 1),
+            end_date=dt.date(2026, 8, 12),
+            target_date=dt.date(2026, 8, 13),
+        )
+
+
+def test_fetch_stock_price_history_rejects_inverted_date_range():
+    client, _ = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        client.fetch_stock_price_history(
+            ingestion_run_id="run-1",
+            stock_id="2330",
+            start_date=dt.date(2026, 8, 12),
+            end_date=dt.date(2026, 6, 1),
+            target_date=dt.date(2026, 8, 13),
+        )
