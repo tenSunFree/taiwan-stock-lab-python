@@ -1,11 +1,13 @@
 """
 Daily scheduled job entry point.
 
-Checkpoint 2A (extended): wires real market data from BOTH TWSE
-(listed) and TPEx (OTC) through to CandidateBuilder — deliberately
-stops before RiskPolicy/scoring/report so that if the candidate pool
-comes back empty or wrong, the debugging surface is limited to data
-ingestion and mapping, not the whole pipeline.
+Checkpoint 2A (extended) + Step 8A: wires real market data from BOTH
+TWSE (listed) and TPEx (OTC) through to CandidateBuilder, then
+enriches each candidate with trailing historical price features from
+FinMind. Deliberately stops after StockFeatures[] is built — no
+RiskPolicy, scoring, or LINE delivery yet — so a wrong or incomplete
+candidate pool / feature set can be diagnosed without the rest of the
+pipeline in the way.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
@@ -32,6 +34,15 @@ impractical without a paid tier):
         STOCK_DAY_ALL nor TPEx's daily close quotes classify
         instruments in a way this pipeline can rely on.
 
+    FinMind (FinMindClient.fetch_stock_price_history, Step 8A)
+        Per-candidate (at most MAXIMUM_CANDIDATES stocks) historical
+        TaiwanStockPrice, used only for trading sessions strictly
+        before target_date, to compute average_turnover_20d,
+        volume_ratio_20d, return_5d, return_20d. Today's own
+        close/volume/turnover come from the TWSE/TPEx candidate data,
+        never from FinMind — FinMind's aggregation can lag behind the
+        official exchange feeds on the same trading day.
+
 KNOWN LIMITATIONS in this checkpoint:
 
     - Both TWSE's STOCK_DAY_ALL and TPEx's daily close quotes only
@@ -48,12 +59,23 @@ KNOWN LIMITATIONS in this checkpoint:
       rather than silently falling back to TWSE-only candidates (and
       vice versa) — an incomplete whole-market scan should never be
       treated as a complete one.
+    - A single candidate's historical-price enrichment failing
+      (fetch, parse, or compute) does NOT fail the whole run — that
+      stock's technical factors simply stay None. This is
+      deliberately different from the TWSE/TPEx whole-market failure
+      policy above: one missing stock's history is ordinary
+      incompleteness: an entire market's data being unavailable is
+      not.
+    - institutional_net_buy_ratio_5d (Step 8B), revenue_yoy (Step
+      8C), and risk_quality_raw (Step 9) are still always None.
+      Combined with the 25%+20%+15%=60% factor weight this checkpoint
+      can supply, no candidate can reach the 80% minimum
+      data_completeness scoring.py requires for the Top 5 — that is
+      expected at this checkpoint, not a bug. RiskPolicy and scoring
+      are not wired in yet regardless.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
       loaded from it — a config loader is separate follow-up work.
-
-RiskPolicy, StockFeatures, scoring, and LINE delivery are NOT wired in
-yet.
 """
 
 from __future__ import annotations
@@ -65,7 +87,12 @@ import sys
 from decimal import Decimal
 
 from app.domain.candidate_builder import Candidate, CandidateBuilder
-from app.ingestion.finmind_mapper import build_stock_master
+from app.domain.feature_builder import build_price_features
+from app.domain.features import StockFeatures
+from app.ingestion.finmind_mapper import (
+    build_historical_price_points,
+    build_stock_master,
+)
 from app.ingestion.market_data_client import (
     FinMindClient,
     RawSourcePayload,
@@ -91,6 +118,11 @@ logger = logging.getLogger("daily_ranking")
 # hand for now — a real config loader is separate follow-up work.
 MINIMUM_TURNOVER = Decimal("50000000")
 MAXIMUM_CANDIDATES = 50
+
+# Retrieval buffer only — historical factors still use the trailing
+# 5/20 actual trading-day observations; 60 calendar days simply gives
+# FinMind enough room to cover weekends and market holidays.
+HISTORY_LOOKBACK_CALENDAR_DAYS = 60
 
 
 class InMemoryRawPayloadRepository:
@@ -148,6 +180,137 @@ def log_candidates(candidates: list[Candidate]) -> None:
             candidate.price.turnover,
             candidate.limit_up.limit_up_source.value,
         )
+
+
+def build_stock_features(
+    *,
+    candidates: list[Candidate],
+    target_date: dt.date,
+    finmind_client: FinMindClient,
+    ingestion_run_id: str,
+) -> list[StockFeatures]:
+    """
+    Enrich candidate stocks with trailing historical price features.
+
+    Today's close / volume / turnover always come from the already
+    validated TWSE / TPEx candidate data. FinMind is queried only for
+    sessions strictly before target_date.
+
+    Failure policy:
+        A failure affecting one candidate's historical enrichment
+        (fetch, parsing, or computation — the ENTIRE per-stock
+        pipeline) does NOT fail the whole ranking job. That stock is
+        retained with missing historical factors (None), letting
+        scoring reflect the gap through data_completeness rather than
+        crashing the batch.
+
+        Missing core candidate data (today's close/volume/turnover)
+        is different: CandidateBuilder should already have rejected
+        such a record, so seeing it here indicates an internal
+        invariant violation, not ordinary enrichment-data absence —
+        that raises immediately rather than being silently patched.
+    """
+    if not candidates:
+        logger.info("No candidates require historical-price enrichment")
+        return []
+
+    history_start_date = target_date - dt.timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
+    history_end_date = target_date - dt.timedelta(days=1)
+
+    features: list[StockFeatures] = []
+    success_count = 0
+    empty_count = 0
+    failure_count = 0
+
+    for candidate in candidates:
+        stock_id = candidate.stock.stock_id
+        today_close = candidate.price.close_price
+        today_volume = candidate.price.volume
+        today_turnover = candidate.price.turnover
+
+        if today_close is None or today_volume is None or today_turnover is None:
+            raise RuntimeError(
+                f"Candidate invariant violated for stock_id={stock_id}: "
+                f"close, volume, and turnover must all be present "
+                f"(CandidateBuilder should have excluded this record)"
+            )
+
+        average_turnover_20d = None
+        volume_ratio_20d = None
+        return_5d = None
+        return_20d = None
+
+        try:
+            history_payload = finmind_client.fetch_stock_price_history(
+                ingestion_run_id=ingestion_run_id,
+                stock_id=stock_id,
+                start_date=history_start_date,
+                end_date=history_end_date,
+                target_date=target_date,
+            )
+            history_rows = extract_data_rows(history_payload)
+
+            if not history_rows:
+                empty_count += 1
+                logger.warning(
+                    "FinMind history returned no usable rows for stock_id=%s; "
+                    "technical factors remain None",
+                    stock_id,
+                )
+            else:
+                history_points = build_historical_price_points(history_rows)
+                price_features = build_price_features(
+                    target_date=target_date,
+                    today_close=float(today_close),
+                    today_volume=float(today_volume),
+                    history=history_points,
+                )
+                average_turnover_20d = price_features.average_turnover_20d
+                volume_ratio_20d = price_features.volume_ratio_20d
+                return_5d = price_features.return_5d
+                return_20d = price_features.return_20d
+                success_count += 1
+
+        except Exception:
+            failure_count += 1
+            logger.exception(
+                "FinMind historical-price enrichment failed for stock_id=%s; "
+                "technical factors remain None",
+                stock_id,
+            )
+
+        stock_features = StockFeatures(
+            stock_id=stock_id,
+            turnover=float(today_turnover),
+            average_turnover_20d=average_turnover_20d,
+            volume_ratio_20d=volume_ratio_20d,
+            return_5d=return_5d,
+            return_20d=return_20d,
+            institutional_net_buy_ratio_5d=None,  # Step 8B
+            revenue_yoy=None,  # Step 8C
+            risk_quality_raw=None,  # Step 9
+        )
+        features.append(stock_features)
+
+        logger.info(
+            "features stock_id=%s turnover=%s avg_turnover_20d=%s "
+            "volume_ratio_20d=%s return_5d=%s return_20d=%s",
+            stock_id,
+            stock_features.turnover,
+            stock_features.average_turnover_20d,
+            stock_features.volume_ratio_20d,
+            stock_features.return_5d,
+            stock_features.return_20d,
+        )
+
+    logger.info(
+        "Historical-price enrichment complete: candidates=%d success=%d empty=%d failed=%d",
+        len(candidates),
+        success_count,
+        empty_count,
+        failure_count,
+    )
+    return features
 
 
 def _validate_shared_repository(
@@ -384,13 +547,23 @@ def run(
     candidates = candidate_builder.build(list(stock_master.values()), daily_prices)
     log_candidates(candidates)
 
+    # --- Step 8A: per-candidate historical-price enrichment ---
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=target_date,
+        finmind_client=finmind_client,
+        ingestion_run_id=ingestion_run_id,
+    )
+    logger.info("Built StockFeatures for %d candidates", len(features))
+
     logger.info(
-        "Provisional Phase 2A complete: %d raw snapshots, %d mapped stocks, "
-        "%d prices, %d candidates",
+        "Provisional Phase 2A + Step 8A complete: %d raw snapshots, %d mapped stocks, "
+        "%d prices, %d candidates, %d features built",
         len(repo.saved),
         len(stock_master),
         len(daily_prices),
         len(candidates),
+        len(features),
     )
     return 0
 
