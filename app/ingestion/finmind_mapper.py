@@ -59,6 +59,8 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.domain.feature_builder import HistoricalPricePoint
+
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 
 
@@ -250,4 +252,46 @@ def build_daily_prices(
                 data_quality_ok=data_quality_ok,
             )
         )
+    return result
+
+
+def build_historical_price_points(
+    rows: list[dict[str, Any]],
+) -> list[HistoricalPricePoint]:
+    """
+    Convert FinMind TaiwanStockPrice per-stock history rows (fetched
+    via FinMindClient.fetch_stock_price_history, which includes
+    data_id) into provider-independent HistoricalPricePoint records
+    for app.domain.feature_builder.
+
+    Rows missing close/volume/turnover, or with an unparsable date,
+    are dropped entirely — a row that's only partially usable is not
+    usable at all for this purpose (unlike build_daily_prices(),
+    which keeps partial rows and lets data_quality_ok reflect that).
+    """
+    result: list[HistoricalPricePoint] = []
+    for row in rows:
+        date_text = str(row.get("date") or "").strip()
+        try:
+            trading_date = dt.date.fromisoformat(date_text)
+        except ValueError:
+            continue
+
+        close = _to_decimal(row.get("close"), zero_is_missing=True)
+        volume = _to_int(row.get("Trading_Volume"), zero_is_missing=False)
+        turnover = _to_decimal(row.get("Trading_money"), zero_is_missing=False)
+
+        if close is None or volume is None or turnover is None:
+            continue
+
+        result.append(
+            HistoricalPricePoint(
+                trading_date=trading_date,
+                close=float(close),
+                volume=float(volume),
+                turnover=float(turnover),
+            )
+        )
+
+    result.sort(key=lambda point: point.trading_date)
     return result

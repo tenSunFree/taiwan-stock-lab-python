@@ -230,3 +230,45 @@ def test_missing_previous_day_leaves_reference_price_none():
         target_date=TARGET_DATE, today_rows=today_rows, previous_day_rows=[]
     )
     assert result[0].reference_price is None
+
+
+def test_build_historical_price_points_maps_finmind_price_rows():
+    from app.ingestion.finmind_mapper import build_historical_price_points
+
+    rows = [
+        {
+            "date": "2026-08-11",
+            "stock_id": "2330",
+            "close": 1180.0,
+            "Trading_Volume": 1000000,
+            "Trading_money": 1180000000,
+        },
+        {
+            "date": "2026-08-12",
+            "stock_id": "2330",
+            "close": 1200.0,
+            "Trading_Volume": 1500000,
+            "Trading_money": 1800000000,
+        },
+    ]
+    points = build_historical_price_points(rows)
+    assert len(points) == 2
+    assert points[0].trading_date == dt.date(2026, 8, 11)
+    assert points[0].close == 1180.0
+    assert points[0].volume == 1000000.0
+    assert points[0].turnover == 1180000000.0
+
+
+def test_build_historical_price_points_drops_rows_missing_required_fields():
+    from app.ingestion.finmind_mapper import build_historical_price_points
+
+    rows = [
+        {
+            "date": "2026-08-11",
+            "stock_id": "2330",
+            "close": None,
+            "Trading_Volume": 1000000,
+            "Trading_money": 1180000000,
+        }
+    ]
+    assert build_historical_price_points(rows) == []
