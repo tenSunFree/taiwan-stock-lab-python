@@ -369,7 +369,10 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
-    assert len(repository.saved) == 3
+    # 3 base snapshots (twse + tpex + finmind stock_info) + 1 per-candidate
+    # FinMind history snapshot (this test has exactly 1 candidate) = 4.
+    assert len(repository.saved) == 4
+    assert "Built StockFeatures for 1 candidates" in caplog.text
 
 
 def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
