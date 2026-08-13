@@ -1,37 +1,53 @@
 """
 Daily scheduled job entry point.
 
-Checkpoint 2A: wires real market data through to CandidateBuilder
-only — deliberately stops before RiskPolicy/scoring/report so that if
-the candidate pool comes back empty or wrong, the debugging surface
-is limited to data ingestion and mapping, not the whole pipeline.
+Checkpoint 2A (extended): wires real market data from BOTH TWSE
+(listed) and TPEx (OTC) through to CandidateBuilder — deliberately
+stops before RiskPolicy/scoring/report so that if the candidate pool
+comes back empty or wrong, the debugging surface is limited to data
+ingestion and mapping, not the whole pipeline.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
 impractical without a paid tier):
 
     TWSE (TwseClient + twse_mapper)
-        Today's full TWSE-listed market OHLC/volume/turnover, via the
-        public STOCK_DAY_ALL open-data endpoint. reference_price is
-        derived from the day's own 漲跌價差 (price change) field, so
-        — unlike the FinMind-based approach this replaces — NO second
-        day's data needs to be fetched at all.
+        Today's full TWSE-listed (上市) market OHLC/volume/turnover,
+        via the public STOCK_DAY_ALL open-data endpoint.
+        reference_price is derived from the day's own 漲跌價差 (price
+        change) field — no second day's data needs to be fetched.
+
+    TPEx (TpexClient + tpex_mapper)
+        Today's full TPEx-listed (上櫃) OTC market OHLC/volume/
+        turnover, via the public tpex_mainboard_daily_close_quotes
+        endpoint. reference_price is derived from Close - Change, the
+        same provisional-fallback approach as TWSE.
+        NextReferencePrice/NextLimitUp/NextLimitDown describe the
+        NEXT trading session and are intentionally not used here —
+        see tpex_mapper.py's module docstring.
 
     FinMind (FinMindClient.fetch_stock_info + finmind_mapper)
         Stock master metadata (stock_name, market, security_type) via
-        TaiwanStockInfo. Still needed because TWSE's STOCK_DAY_ALL
-        doesn't classify instruments or give market (TWSE vs TPEx).
+        TaiwanStockInfo. Still needed because neither TWSE's
+        STOCK_DAY_ALL nor TPEx's daily close quotes classify
+        instruments in a way this pipeline can rely on.
 
 KNOWN LIMITATIONS in this checkpoint:
 
-    - TWSE's STOCK_DAY_ALL only returns the latest available trading
-      day, not an arbitrary historical date (see twse_mapper.py's
-      module docstring). Manually overriding TARGET_TRADING_DATE to a
+    - Both TWSE's STOCK_DAY_ALL and TPEx's daily close quotes only
+      return the latest available trading day, not an arbitrary
+      historical date. Manually overriding TARGET_TRADING_DATE to a
       past date will reliably hit WAITING_FOR_DATA below — that is
-      expected, not a bug, until a real historical TWSE data source is
+      expected, not a bug, until real historical data sources are
       wired in.
-    - TPEx (上櫃) stocks are not covered yet — only TWSE-listed (上市)
-      instruments. See Roadmap: Step 6 (TpexClient + tpex_mapper).
+    - reference_price on both markets remains provisional (see each
+      mapper's module docstring for the exact caveats — ex-rights
+      days, no-trade days, etc.).
+    - If TPEx fails to fetch, has no usable rows, or its mapper
+      filters out every row for target_date, the entire run fails
+      rather than silently falling back to TWSE-only candidates (and
+      vice versa) — an incomplete whole-market scan should never be
+      treated as a complete one.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
       loaded from it — a config loader is separate follow-up work.
@@ -53,14 +69,19 @@ from app.ingestion.finmind_mapper import build_stock_master
 from app.ingestion.market_data_client import (
     FinMindClient,
     RawSourcePayload,
+    TpexClient,
     TwseClient,
     new_ingestion_run_id,
 )
+from app.ingestion.tpex_mapper import build_daily_prices as build_tpex_daily_prices
+from app.ingestion.tpex_mapper import (
+    roc_date_to_gregorian as tpex_roc_date_to_gregorian,
+)
 from app.ingestion.trading_calendar import TradingCalendar
+from app.ingestion.twse_mapper import build_daily_prices as build_twse_daily_prices
+from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.ingestion.twse_mapper import (
-    build_daily_prices,
-    parse_stock_day_all_csv,
-    roc_date_to_gregorian,
+    roc_date_to_gregorian as twse_roc_date_to_gregorian,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -101,8 +122,8 @@ def resolve_target_date() -> dt.date:
 
 def extract_data_rows(payload: RawSourcePayload) -> list[dict]:
     """Defensively extract FinMind's raw `data` rows (JSON responses
-    only — TWSE's CSV responses are parsed via
-    twse_mapper.parse_stock_day_all_csv instead, not this function)."""
+    only — TWSE's CSV and TPEx's JSON-array responses are parsed via
+    their own mappers instead, not this function)."""
     if not isinstance(payload.raw_payload, dict):
         return []
     rows = payload.raw_payload.get("data")
@@ -129,20 +150,58 @@ def log_candidates(candidates: list[Candidate]) -> None:
         )
 
 
+def _validate_shared_repository(
+    *,
+    repository: InMemoryRawPayloadRepository,
+    twse_client: TwseClient | None,
+    tpex_client: TpexClient | None,
+    finmind_client: FinMindClient | None,
+) -> None:
+    """
+    A caller could pass repository=A but hand run() a client that was
+    actually built with a different repository (repository=B). The
+    "repository must be provided" guard alone doesn't catch that — it
+    only checks that *something* was passed, not that it's the same
+    object every injected client is writing snapshots to.
+    """
+    for name, client in (
+        ("twse_client", twse_client),
+        ("tpex_client", tpex_client),
+        ("finmind_client", finmind_client),
+    ):
+        if client is not None and client.repository is not repository:
+            raise ValueError(
+                f"{name} was constructed with a different repository than the "
+                f"one passed to run(). All injected clients must share the same "
+                f"repository instance, or raw-snapshot bookkeeping silently "
+                f"splits across repositories."
+            )
+
+
 def run(
     *,
     repository: InMemoryRawPayloadRepository | None = None,
     twse_client: TwseClient | None = None,
+    tpex_client: TpexClient | None = None,
     finmind_client: FinMindClient | None = None,
 ) -> int:
-    if (twse_client is not None or finmind_client is not None) and repository is None:
+    if (
+        twse_client is not None or tpex_client is not None or finmind_client is not None
+    ) and repository is None:
         raise ValueError(
-            "repository must be provided whenever twse_client or "
-            "finmind_client is injected, otherwise raw-snapshot "
-            "bookkeeping (the 'raw snapshots' count in the completion "
-            "log) can silently under-count. Pass all three together "
-            "(as the test fixtures do), or none of them for production "
-            "behavior."
+            "repository must be provided whenever twse_client, tpex_client, or "
+            "finmind_client is injected, otherwise raw-snapshot bookkeeping (the "
+            "'raw snapshots' count in the completion log) can silently under-count. "
+            "Pass all injected clients together with repository, or none of them "
+            "for production behavior."
+        )
+
+    if repository is not None:
+        _validate_shared_repository(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
         )
 
     target_date = resolve_target_date()
@@ -156,12 +215,15 @@ def run(
     logger.info("ingestion_run_id=%s target_date=%s", ingestion_run_id, target_date)
 
     # One repository per ingestion run — production uses this same
-    # repository for both providers so every raw source snapshot
+    # repository for all three providers so every raw source snapshot
     # belonging to the run is collected together.
     repo = repository or InMemoryRawPayloadRepository()
 
     if twse_client is None:
         twse_client = TwseClient(repo)
+
+    if tpex_client is None:
+        tpex_client = TpexClient(repo)
 
     if finmind_client is None:
         api_token = os.environ.get("FINMIND_TOKEN", "").strip()
@@ -170,7 +232,7 @@ def run(
             return 1
         finmind_client = FinMindClient(repo, api_token=api_token)
 
-    # --- Step 1: today's whole-market price data from TWSE ---
+    # --- Step 1a: today's whole-market price data from TWSE ---
     try:
         twse_price_payload = twse_client.fetch_daily_price(
             ingestion_run_id=ingestion_run_id, target_date=target_date
@@ -195,26 +257,71 @@ def run(
         )
         return 2
 
-    # STOCK_DAY_ALL only exposes the latest available trading day.
-    # Never allow that response to silently masquerade as an
-    # arbitrary TARGET_TRADING_DATE.
-    reported_dates = {roc_date_to_gregorian(row.get("日期", "")) for row in twse_rows}
-    reported_dates.discard(None)
+    twse_reported_dates = {
+        twse_roc_date_to_gregorian(row.get("日期", "")) for row in twse_rows
+    }
+    twse_reported_dates.discard(None)
 
-    if target_date not in reported_dates:
+    if target_date not in twse_reported_dates:
         logger.warning(
             "WAITING_FOR_DATA: TWSE has not returned price data for %s yet "
             "(reported_dates=%s; target_date may also be a past date this "
             "endpoint cannot serve)",
             target_date,
-            sorted(reported_dates),
+            sorted(twse_reported_dates),
         )
         return 2
 
     logger.info(
         "TWSE source ready: rows=%d reported_dates=%s",
         len(twse_rows),
-        sorted(reported_dates),
+        sorted(twse_reported_dates),
+    )
+
+    # --- Step 1b: today's whole-market price data from TPEx ---
+    try:
+        tpex_price_payload = tpex_client.fetch_daily_price(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+    except Exception:
+        logger.exception("TPEx fetch_daily_price failed")
+        return 1
+
+    if not isinstance(tpex_price_payload.raw_payload, list):
+        logger.error(
+            "TPEx daily close quotes returned unexpected raw payload type: %s",
+            type(tpex_price_payload.raw_payload).__name__,
+        )
+        return 1
+
+    tpex_rows = [row for row in tpex_price_payload.raw_payload if isinstance(row, dict)]
+
+    if not tpex_rows:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx returned no usable daily close quote rows for %s",
+            target_date,
+        )
+        return 2
+
+    tpex_reported_dates = {
+        tpex_roc_date_to_gregorian(row.get("Date", "")) for row in tpex_rows
+    }
+    tpex_reported_dates.discard(None)
+
+    if target_date not in tpex_reported_dates:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx has not returned price data for %s yet "
+            "(reported_dates=%s; target_date may also be a past date this "
+            "endpoint cannot serve)",
+            target_date,
+            sorted(tpex_reported_dates),
+        )
+        return 2
+
+    logger.info(
+        "TPEx source ready: rows=%d reported_dates=%s",
+        len(tpex_rows),
+        sorted(tpex_reported_dates),
     )
 
     # --- Step 2: stock master reference data from FinMind ---
@@ -235,22 +342,42 @@ def run(
 
     # --- Step 3: map source rows into domain models ---
     stock_master = build_stock_master(stock_info_rows)
-    daily_prices = build_daily_prices(target_date=target_date, rows=twse_rows)
+    twse_daily_prices = build_twse_daily_prices(target_date=target_date, rows=twse_rows)
+    tpex_daily_prices = build_tpex_daily_prices(target_date=target_date, rows=tpex_rows)
+
+    if not twse_daily_prices:
+        logger.warning(
+            "WAITING_FOR_DATA: TWSE mapper produced zero DailyPrice records for %s "
+            "even though raw rows were present — treating as not-ready rather than "
+            "silently proceeding with a TPEx-only pool",
+            target_date,
+        )
+        return 2
+
+    if not tpex_daily_prices:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx mapper produced zero DailyPrice records for %s "
+            "even though raw rows were present — treating as not-ready rather than "
+            "silently proceeding with a TWSE-only pool",
+            target_date,
+        )
+        return 2
+
+    daily_prices = twse_daily_prices + tpex_daily_prices
+
     logger.info(
-        "mapped stock_master=%d daily_prices=%d (TWSE-listed only, TPEx not yet wired in)",
+        "mapped stock_master=%d daily_prices=%d (twse=%d, tpex=%d)",
         len(stock_master),
         len(daily_prices),
+        len(twse_daily_prices),
+        len(tpex_daily_prices),
     )
 
     if not stock_master:
         logger.error("FinMind mapper produced no StockMaster records")
         return 1
 
-    if not daily_prices:
-        logger.error("TWSE mapper produced no DailyPrice records")
-        return 1
-
-    # --- Step 4: candidate pool ---
+    # --- Step 4: candidate pool (whole market: TWSE + TPEx) ---
     candidate_builder = CandidateBuilder(
         minimum_turnover=MINIMUM_TURNOVER, maximum_candidates=MAXIMUM_CANDIDATES
     )
