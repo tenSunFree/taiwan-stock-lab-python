@@ -28,7 +28,7 @@ class StockFeatures:
     # institutional / ownership flow
     institutional_net_buy_ratio_5d: (
         float | None
-    )  # 5-day net institutional buy amount / 5-day turnover
+    )  # trailing 5-session institutional net-buy shares / total trading volume shares
 
     # fundamentals
     revenue_yoy: float | None  # latest monthly revenue YoY growth

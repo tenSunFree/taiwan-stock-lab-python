@@ -255,10 +255,55 @@ class FinMindClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
-    # Other datasets (institutional net buy/sell, margin/short balance,
-    # monthly revenue, etc.) follow the same pattern, each mapped to
-    # the corresponding FinMind dataset name — check FinMind's current
-    # docs before implementing.
+    def fetch_stock_institutional_investors(
+        self,
+        *,
+        ingestion_run_id: str,
+        stock_id: str,
+        start_date: dt.date,
+        end_date: dt.date,
+        target_date: dt.date,
+    ) -> RawSourcePayload:
+        """
+        Fetch TaiwanStockInstitutionalInvestorsBuySell for one stock.
+
+        NOTE: FinMind's institutional data updates around 20:00 on
+        trading days, well after this project's scheduled run time —
+        target_date's own row will never be present during a normal
+        run. See app.domain.institutional_flow_builder's module
+        docstring.
+        """
+        stock_id = stock_id.strip()
+        if not stock_id:
+            raise ValueError("stock_id must not be empty")
+        if start_date > end_date:
+            raise ValueError("start_date must not be after end_date")
+
+        params = {
+            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+            "data_id": stock_id,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        }
+
+        def _fetch():
+            response = self.http_client.get(
+                self.base_url, params=params, headers=self._auth_headers()
+            )
+            response.raise_for_status()
+            return response.json(), None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
+            fetch_fn=_fetch,
+        )
+
+    # Other datasets (margin/short balance, monthly revenue, etc.)
+    # follow the same pattern, each mapped to the corresponding
+    # FinMind dataset name — check FinMind's current docs before
+    # implementing.
 
 
 class TwseClient(MarketDataClient):

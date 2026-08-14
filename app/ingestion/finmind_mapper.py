@@ -63,6 +63,8 @@ from app.domain.feature_builder import HistoricalPricePoint
 
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 
+from app.domain.institutional_flow_builder import InstitutionalFlowPoint
+
 
 def _to_decimal(value: Any, *, zero_is_missing: bool = False) -> Decimal | None:
     """
@@ -295,3 +297,59 @@ def build_historical_price_points(
 
     result.sort(key=lambda point: point.trading_date)
     return result
+
+
+def build_institutional_flow_points(
+    rows: list[dict[str, Any]], *, expected_stock_id: str
+) -> list[InstitutionalFlowPoint]:
+    """
+    Aggregate FinMind TaiwanStockInstitutionalInvestorsBuySell rows
+    into one institutional net-share value per trading date.
+
+    FinMind returns one row per institutional-investor category per
+    day. This adapter is deliberately FAIL-CLOSED per day: if any row
+    belonging to a date has invalid buy/sell data, that entire date
+    is discarded rather than producing a plausible-looking but
+    incomplete daily institutional total (matches this project's
+    "None over a fabricated number" philosophy — see
+    app.domain.feature_builder's strict-window semantics).
+
+    expected_stock_id prevents accidentally aggregating rows from a
+    different security together, as defense in depth even though the
+    per-stock API query (data_id=stock_id) should already guarantee
+    single-stock rows.
+    """
+    expected_stock_id = expected_stock_id.strip()
+    if not expected_stock_id:
+        raise ValueError("expected_stock_id must not be empty")
+
+    net_shares_by_date: dict[dt.date, int] = {}
+    invalid_dates: set[dt.date] = set()
+
+    for row in rows:
+        row_stock_id = str(row.get("stock_id") or "").strip()
+        if row_stock_id != expected_stock_id:
+            continue
+
+        date_text = str(row.get("date") or "").strip()
+        try:
+            trading_date = dt.date.fromisoformat(date_text)
+        except ValueError:
+            continue
+
+        buy = _to_int(row.get("buy"), zero_is_missing=False)
+        sell = _to_int(row.get("sell"), zero_is_missing=False)
+
+        if buy is None or sell is None:
+            invalid_dates.add(trading_date)
+            continue
+
+        net_shares_by_date[trading_date] = (
+            net_shares_by_date.get(trading_date, 0) + buy - sell
+        )
+
+    return [
+        InstitutionalFlowPoint(trading_date=trading_date, net_shares=net_shares)
+        for trading_date, net_shares in sorted(net_shares_by_date.items())
+        if trading_date not in invalid_dates
+    ]
