@@ -1,8 +1,11 @@
 import datetime as dt
+import pytest
 from decimal import Decimal
 
 from app.domain.models import Market, SecurityType
 from app.ingestion.finmind_mapper import build_daily_prices, build_stock_master
+
+from app.ingestion.finmind_mapper import build_institutional_flow_points
 
 TARGET_DATE = dt.date(2026, 8, 7)
 PREVIOUS_DATE = dt.date(2026, 8, 6)
@@ -272,3 +275,47 @@ def test_build_historical_price_points_drops_rows_missing_required_fields():
         }
     ]
     assert build_historical_price_points(rows) == []
+
+
+def test_build_institutional_flow_points_sums_categories_by_date():
+    rows = [
+        {"date": "2026-08-11", "stock_id": "2330", "buy": 1000, "sell": 200},
+        {"date": "2026-08-11", "stock_id": "2330", "buy": 300, "sell": 100},
+        {"date": "2026-08-12", "stock_id": "2330", "buy": 50, "sell": 500},
+    ]
+    points = build_institutional_flow_points(rows, expected_stock_id="2330")
+    by_date = {p.trading_date: p.net_shares for p in points}
+    assert by_date[dt.date(2026, 8, 11)] == 1000  # (1000-200)+(300-100)
+    assert by_date[dt.date(2026, 8, 12)] == -450
+
+
+def test_build_institutional_flow_points_discards_partial_invalid_day():
+    rows = [
+        {"date": "2026-08-11", "stock_id": "2330", "buy": 1000, "sell": 200},
+        {"date": "2026-08-11", "stock_id": "2330", "buy": "bad", "sell": 100},
+        {"date": "2026-08-12", "stock_id": "2330", "buy": 500, "sell": 100},
+    ]
+    points = build_institutional_flow_points(rows, expected_stock_id="2330")
+    assert len(points) == 1
+    assert points[0].trading_date == dt.date(2026, 8, 12)
+    assert points[0].net_shares == 400
+
+
+def test_build_institutional_flow_points_skips_bad_date():
+    rows = [{"date": "not-a-date", "stock_id": "2330", "buy": 100, "sell": 50}]
+    assert build_institutional_flow_points(rows, expected_stock_id="2330") == []
+
+
+def test_build_institutional_flow_points_ignores_other_stock_rows():
+    rows = [
+        {"date": "2026-08-11", "stock_id": "9999", "buy": 100000, "sell": 0},
+        {"date": "2026-08-11", "stock_id": "2330", "buy": 100, "sell": 50},
+    ]
+    points = build_institutional_flow_points(rows, expected_stock_id="2330")
+    assert len(points) == 1
+    assert points[0].net_shares == 50
+
+
+def test_build_institutional_flow_points_rejects_empty_expected_stock_id():
+    with pytest.raises(ValueError, match="expected_stock_id must not be empty"):
+        build_institutional_flow_points([], expected_stock_id="   ")

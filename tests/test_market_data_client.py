@@ -249,3 +249,77 @@ def test_fetch_stock_price_history_rejects_inverted_date_range():
             end_date=dt.date(2026, 6, 1),
             target_date=dt.date(2026, 8, 13),
         )
+
+
+def test_fetch_stock_institutional_investors_sends_correct_params():
+    captured_params = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_params.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_institutional_investors(
+        ingestion_run_id="run-1",
+        stock_id="2330",
+        start_date=dt.date(2026, 6, 1),
+        end_date=dt.date(2026, 8, 12),
+        target_date=dt.date(2026, 8, 13),
+    )
+
+    assert captured_params == {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": "2330",
+        "start_date": "2026-06-01",
+        "end_date": "2026-08-12",
+    }
+
+
+def test_fetch_stock_institutional_investors_uses_bearer_header():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_institutional_investors(
+        ingestion_run_id="run-1",
+        stock_id="2330",
+        start_date=dt.date(2026, 6, 1),
+        end_date=dt.date(2026, 8, 12),
+        target_date=dt.date(2026, 8, 13),
+    )
+
+    assert "token=" not in captured["url"]
+    assert captured["authorization"] == "Bearer fake-token"
+
+
+def test_fetch_stock_institutional_investors_rejects_inverted_date_range():
+    client, repo = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        client.fetch_stock_institutional_investors(
+            ingestion_run_id="run-1",
+            stock_id="2330",
+            start_date=dt.date(2026, 8, 12),
+            end_date=dt.date(2026, 6, 1),
+            target_date=dt.date(2026, 8, 13),
+        )
+    assert repo.saved == []
+
+
+def test_fetch_stock_institutional_investors_http_error_does_not_save():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "server error"})
+
+    client, repo = make_client(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_stock_institutional_investors(
+            ingestion_run_id="run-1",
+            stock_id="2330",
+            start_date=dt.date(2026, 6, 1),
+            end_date=dt.date(2026, 8, 12),
+            target_date=dt.date(2026, 8, 13),
+        )
+    assert repo.saved == []

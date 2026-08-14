@@ -6,6 +6,8 @@ import pytest
 from app.ingestion.market_data_client import FinMindClient, TpexClient, TwseClient
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
 
+from app.ingestion.market_data_client import RawSourcePayload
+
 TARGET_DATE = dt.date(2026, 8, 7)
 
 # --- TWSE fixtures ---
@@ -450,3 +452,204 @@ def test_run_returns_1_when_tpex_fetch_raises(monkeypatch):
     # snapshot should be present.
     assert len(repository.saved) == 1
     assert repository.saved[0].source == "twse"
+
+
+class FakeHistoryFinMindClient:
+    """
+    Lightweight duck-typed fake for build_stock_features()'s
+    finmind_client parameter — deliberately NOT built on top of
+    httpx.MockTransport, since this layer's contract is "does
+    build_stock_features() call fetch_stock_price_history() correctly
+    and handle its result/failure correctly", not "is the HTTP
+    request well-formed" (that's already covered by
+    tests/test_market_data_client.py).
+    """
+
+    def __init__(
+        self,
+        *,
+        rows_by_stock: dict[str, list[dict]],
+        failing_stock_ids: set[str] | None = None,
+    ) -> None:
+        self.rows_by_stock = rows_by_stock
+        self.failing_stock_ids = failing_stock_ids or set()
+        self.calls: list[str] = []
+
+    def fetch_stock_price_history(
+        self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
+    ):
+        self.calls.append(stock_id)
+        if stock_id in self.failing_stock_ids:
+            raise RuntimeError(f"simulated history failure: {stock_id}")
+
+        return RawSourcePayload(
+            ingestion_run_id=ingestion_run_id,
+            source="finmind",
+            target_date=target_date,
+            requested_at=dt.datetime.now(dt.timezone.utc),
+            source_updated_at=None,
+            request_parameters={
+                "dataset": "TaiwanStockPrice",
+                "data_id": stock_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+            schema_version="v1",
+            payload_hash="test",
+            raw_payload={"data": self.rows_by_stock.get(stock_id, [])},
+            ingested_at=dt.datetime.now(dt.timezone.utc),
+        )
+
+
+def _make_candidate(
+    stock_id: str,
+    *,
+    close="44.65",
+    reference="40.60",
+    turnover="100000000",
+    volume=3_000_000,
+):
+    from decimal import Decimal
+
+    from app.domain.candidate_builder import Candidate
+    from app.domain.limit_up import LimitUpResult, LimitUpSource
+    from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
+
+    stock = StockMaster(
+        stock_id=stock_id,
+        stock_name=f"測試{stock_id}",
+        market=Market.TWSE,
+        security_type=SecurityType.COMMON_STOCK,
+    )
+    price = DailyPrice(
+        trading_date=TARGET_DATE,
+        stock_id=stock_id,
+        reference_price=Decimal(reference),
+        open_price=Decimal(reference),
+        high_price=Decimal(close),
+        low_price=Decimal(reference),
+        close_price=Decimal(close),
+        volume=volume,
+        turnover=Decimal(turnover),
+    )
+    limit_up = LimitUpResult(
+        is_close_limit_up=True,
+        has_touched_limit_up=True,
+        limit_up_price=Decimal(close),
+        limit_up_source=LimitUpSource.CALCULATED,
+        reason="test fixture",
+    )
+    return Candidate(stock=stock, price=price, limit_up=limit_up)
+
+
+def _make_history_rows(
+    count: int = 20,
+    *,
+    start=dt.date(2026, 6, 1),
+    close="100",
+    volume="1000000",
+    turnover="100000000",
+):
+    return [
+        {
+            "date": (start + dt.timedelta(days=i)).isoformat(),
+            "close": close,
+            "Trading_Volume": volume,
+            "Trading_money": turnover,
+        }
+        for i in range(count)
+    ]
+
+
+def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
+    from app.jobs.daily_ranking import build_stock_features
+
+    client = FakeHistoryFinMindClient(rows_by_stock={})
+    features = build_stock_features(
+        candidates=[],
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+    assert features == []
+    assert client.calls == []
+
+
+def test_build_stock_features_computes_real_technical_factors_on_success():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20, close="100", volume="1000000")}
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    assert feature.stock_id == "1101"
+    assert feature.turnover == 100000000.0
+    assert feature.average_turnover_20d == pytest.approx(100000000.0)
+    assert feature.volume_ratio_20d == pytest.approx(3.0)  # 3,000,000 / 1,000,000
+    assert feature.return_5d is not None
+    assert feature.return_20d is not None
+    assert client.calls == ["1101"]
+
+
+def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog):
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101"), _make_candidate("2330")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20)},
+        failing_stock_ids={"2330"},
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        features = build_stock_features(
+            candidates=candidates,
+            target_date=TARGET_DATE,
+            finmind_client=client,
+            ingestion_run_id="run-1",
+        )
+
+    assert len(features) == 2
+    by_stock = {f.stock_id: f for f in features}
+
+    assert by_stock["1101"].average_turnover_20d is not None
+    assert by_stock["1101"].return_5d is not None
+
+    assert by_stock["2330"].average_turnover_20d is None
+    assert by_stock["2330"].volume_ratio_20d is None
+    assert by_stock["2330"].return_5d is None
+    assert by_stock["2330"].return_20d is None
+    # turnover itself still comes from today's real TWSE/TPEx data,
+    # unaffected by the FinMind history failure
+    assert by_stock["2330"].turnover == 100000000.0
+
+    assert client.calls == ["1101", "2330"]
+    assert "failed for stock_id=2330" in caplog.text
+
+
+def test_build_stock_features_empty_history_rows_leaves_factors_none():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": []})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert features[0].average_turnover_20d is None
+    assert features[0].return_5d is None
