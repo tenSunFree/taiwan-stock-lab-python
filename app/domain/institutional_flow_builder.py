@@ -40,33 +40,63 @@ def build_institutional_net_buy_ratio(
     Calculate trailing institutional net-buy shares divided by total
     stock trading volume over the exact same trading sessions.
 
-    volume_by_date: total market volume (shares) for each trading
-    day, typically built from the same historical price series
-    already fetched in Step 8A (HistoricalPricePoint.volume) —
-    reused here rather than fetched again.
+    The required trailing sessions are defined by the historical-price
+    volume series, not by whichever institutional-flow rows happen to
+    be available.
+
+    If any required session lacks institutional data, the result is
+    None rather than silently substituting an older flow session.
     """
+
     if window <= 0:
         raise ValueError("window must be positive")
 
-    valid_points = sorted(
-        (point for point in flow_points if point.trading_date < target_date),
-        key=lambda point: point.trading_date,
+    flow_by_date: dict[
+        dt.date,
+        int,
+    ] = {}
+
+    for point in flow_points:
+        if point.trading_date >= target_date:
+            continue
+
+        # Mapper output should contain one aggregated point per date.
+        # Duplicates indicate an invalid domain input.
+        if point.trading_date in flow_by_date:
+            return None
+
+        flow_by_date[point.trading_date] = point.net_shares
+
+    eligible_volume_dates = sorted(
+        trading_date
+        for trading_date, volume in volume_by_date.items()
+        if (trading_date < target_date and volume > 0)
     )
 
-    if len(valid_points) < window:
+    if len(eligible_volume_dates) < window:
         return None
 
-    trailing = valid_points[-window:]
+    trailing_dates = eligible_volume_dates[-window:]
 
+    total_net_shares = 0
     total_volume = 0.0
-    for point in trailing:
-        volume = volume_by_date.get(point.trading_date)
+
+    for trading_date in trailing_dates:
+        net_shares = flow_by_date.get(trading_date)
+
+        volume = volume_by_date.get(trading_date)
+
+        if net_shares is None:
+            return None
+
         if volume is None or volume <= 0:
             return None
+
+        total_net_shares += net_shares
+
         total_volume += volume
 
     if total_volume <= 0:
         return None
 
-    total_net_shares = sum(point.net_shares for point in trailing)
     return float(total_net_shares) / total_volume

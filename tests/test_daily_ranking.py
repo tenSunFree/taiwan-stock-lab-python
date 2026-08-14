@@ -473,12 +473,20 @@ class FakeHistoryFinMindClient:
     ) -> None:
         self.rows_by_stock = rows_by_stock
         self.failing_stock_ids = failing_stock_ids or set()
-        self.calls: list[str] = []
+        self.calls: list[dict[str, object]] = []
 
     def fetch_stock_price_history(
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
-        self.calls.append(stock_id)
+        self.calls.append(
+            {
+                "stock_id": stock_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "target_date": target_date,
+            }
+        )
+
         if stock_id in self.failing_stock_ids:
             raise RuntimeError(f"simulated history failure: {stock_id}")
 
@@ -571,6 +579,7 @@ def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
         finmind_client=client,
         ingestion_run_id="run-1",
     )
+
     assert features == []
     assert client.calls == []
 
@@ -579,10 +588,22 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     from app.jobs.daily_ranking import build_stock_features
 
     candidates = [
-        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+        _make_candidate(
+            "1101",
+            close="44.65",
+            turnover="100000000",
+            volume=3_000_000,
+        )
     ]
+
     client = FakeHistoryFinMindClient(
-        rows_by_stock={"1101": _make_history_rows(20, close="100", volume="1000000")}
+        rows_by_stock={
+            "1101": _make_history_rows(
+                20,
+                close="100",
+                volume="1000000",
+            )
+        }
     )
 
     features = build_stock_features(
@@ -593,26 +614,52 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     )
 
     assert len(features) == 1
+
     feature = features[0]
+
     assert feature.stock_id == "1101"
     assert feature.turnover == 100000000.0
+
     assert feature.average_turnover_20d == pytest.approx(100000000.0)
-    assert feature.volume_ratio_20d == pytest.approx(3.0)  # 3,000,000 / 1,000,000
-    assert feature.return_5d is not None
-    assert feature.return_20d is not None
-    assert client.calls == ["1101"]
+
+    assert feature.volume_ratio_20d == pytest.approx(3.0)
+
+    # today_close=44.65 and every historical close in this fixture is
+    # 100, so both reference closes are exactly 100.
+    assert feature.return_5d == pytest.approx(44.65 / 100.0 - 1.0)
+
+    assert feature.return_20d == pytest.approx(44.65 / 100.0 - 1.0)
+
+    # build_stock_features() uses a 60-calendar-day retrieval buffer
+    # and deliberately excludes target_date itself from FinMind
+    # historical-price requests.
+    assert client.calls == [
+        {
+            "stock_id": "1101",
+            "start_date": TARGET_DATE - dt.timedelta(days=60),
+            "end_date": TARGET_DATE - dt.timedelta(days=1),
+            "target_date": TARGET_DATE,
+        }
+    ]
 
 
 def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog):
     from app.jobs.daily_ranking import build_stock_features
 
-    candidates = [_make_candidate("1101"), _make_candidate("2330")]
+    candidates = [
+        _make_candidate("1101"),
+        _make_candidate("2330"),
+    ]
+
     client = FakeHistoryFinMindClient(
         rows_by_stock={"1101": _make_history_rows(20)},
         failing_stock_ids={"2330"},
     )
 
-    with caplog.at_level("INFO", logger="daily_ranking"):
+    with caplog.at_level(
+        "INFO",
+        logger="daily_ranking",
+    ):
         features = build_stock_features(
             candidates=candidates,
             target_date=TARGET_DATE,
@@ -621,20 +668,42 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
         )
 
     assert len(features) == 2
-    by_stock = {f.stock_id: f for f in features}
+
+    by_stock = {feature.stock_id: feature for feature in features}
 
     assert by_stock["1101"].average_turnover_20d is not None
+
     assert by_stock["1101"].return_5d is not None
 
     assert by_stock["2330"].average_turnover_20d is None
+
     assert by_stock["2330"].volume_ratio_20d is None
+
     assert by_stock["2330"].return_5d is None
+
     assert by_stock["2330"].return_20d is None
+
     # turnover itself still comes from today's real TWSE/TPEx data,
-    # unaffected by the FinMind history failure
+    # unaffected by the FinMind history failure.
     assert by_stock["2330"].turnover == 100000000.0
 
-    assert client.calls == ["1101", "2330"]
+    # The failed request should still be recorded, because verifying
+    # which request was attempted is part of this fake's contract.
+    assert client.calls == [
+        {
+            "stock_id": "1101",
+            "start_date": TARGET_DATE - dt.timedelta(days=60),
+            "end_date": TARGET_DATE - dt.timedelta(days=1),
+            "target_date": TARGET_DATE,
+        },
+        {
+            "stock_id": "2330",
+            "start_date": TARGET_DATE - dt.timedelta(days=60),
+            "end_date": TARGET_DATE - dt.timedelta(days=1),
+            "target_date": TARGET_DATE,
+        },
+    ]
+
     assert "failed for stock_id=2330" in caplog.text
 
 
@@ -642,6 +711,7 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
     from app.jobs.daily_ranking import build_stock_features
 
     candidates = [_make_candidate("1101")]
+
     client = FakeHistoryFinMindClient(rows_by_stock={"1101": []})
 
     features = build_stock_features(
@@ -652,4 +722,5 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
     )
 
     assert features[0].average_turnover_20d is None
+
     assert features[0].return_5d is None

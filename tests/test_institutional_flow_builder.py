@@ -100,3 +100,68 @@ def test_rejects_non_positive_window():
         build_institutional_net_buy_ratio(
             target_date=TARGET_DATE, flow_points=[], volume_by_date={}, window=0
         )
+
+
+def test_missing_recent_flow_session_does_not_fall_back_to_older_flow():
+    price_dates = [
+        dt.date(2026, 8, 6),
+        dt.date(2026, 8, 7),
+        dt.date(2026, 8, 10),
+        dt.date(2026, 8, 11),
+        dt.date(2026, 8, 12),
+    ]
+
+    flow_points = [
+        # Older row that must NOT be used as a substitute.
+        InstitutionalFlowPoint(
+            trading_date=dt.date(
+                2026,
+                8,
+                5,
+            ),
+            net_shares=999_999,
+        ),
+        InstitutionalFlowPoint(
+            trading_date=dt.date(
+                2026,
+                8,
+                6,
+            ),
+            net_shares=1_000,
+        ),
+        InstitutionalFlowPoint(
+            trading_date=dt.date(
+                2026,
+                8,
+                7,
+            ),
+            net_shares=1_000,
+        ),
+        # 2026-08-10 intentionally missing.
+        InstitutionalFlowPoint(
+            trading_date=dt.date(
+                2026,
+                8,
+                11,
+            ),
+            net_shares=1_000,
+        ),
+        InstitutionalFlowPoint(
+            trading_date=dt.date(
+                2026,
+                8,
+                12,
+            ),
+            net_shares=1_000,
+        ),
+    ]
+
+    volume_by_date = {trading_date: 100_000.0 for trading_date in price_dates}
+
+    ratio = build_institutional_net_buy_ratio(
+        target_date=TARGET_DATE,
+        flow_points=flow_points,
+        volume_by_date=volume_by_date,
+    )
+
+    assert ratio is None
