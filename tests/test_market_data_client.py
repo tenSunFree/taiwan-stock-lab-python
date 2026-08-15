@@ -323,3 +323,90 @@ def test_fetch_stock_institutional_investors_http_error_does_not_save():
             target_date=dt.date(2026, 8, 13),
         )
     assert repo.saved == []
+
+
+def test_fetch_stock_monthly_revenue_sends_correct_params():
+    captured_params = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_params.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    client.fetch_stock_monthly_revenue(
+        ingestion_run_id="run-1",
+        stock_id="1101",
+        start_date=dt.date(2025, 3, 1),
+        end_date=dt.date(2026, 8, 14),
+        target_date=dt.date(2026, 8, 15),
+    )
+
+    assert captured_params == {
+        "dataset": "TaiwanStockMonthRevenue",
+        "data_id": "1101",
+        "start_date": "2025-03-01",
+        "end_date": "2026-08-14",
+    }
+    assert repo.saved[0].request_parameters == captured_params
+
+
+def test_fetch_stock_monthly_revenue_uses_bearer_header():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = make_client(handler)
+    client.fetch_stock_monthly_revenue(
+        ingestion_run_id="run-1",
+        stock_id="1101",
+        start_date=dt.date(2025, 3, 1),
+        end_date=dt.date(2026, 8, 14),
+        target_date=dt.date(2026, 8, 15),
+    )
+
+    assert "token=" not in captured["url"]
+    assert captured["authorization"] == "Bearer fake-token"
+
+
+def test_fetch_stock_monthly_revenue_rejects_empty_stock_id():
+    client, _ = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        client.fetch_stock_monthly_revenue(
+            ingestion_run_id="run-1",
+            stock_id="",
+            start_date=dt.date(2025, 3, 1),
+            end_date=dt.date(2026, 8, 14),
+            target_date=dt.date(2026, 8, 15),
+        )
+
+
+def test_fetch_stock_monthly_revenue_rejects_inverted_date_range():
+    client, repo = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        client.fetch_stock_monthly_revenue(
+            ingestion_run_id="run-1",
+            stock_id="1101",
+            start_date=dt.date(2026, 8, 15),
+            end_date=dt.date(2025, 1, 1),
+            target_date=dt.date(2026, 8, 15),
+        )
+    assert repo.saved == []
+
+
+def test_fetch_stock_monthly_revenue_http_error_does_not_save():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "server error"})
+
+    client, repo = make_client(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_stock_monthly_revenue(
+            ingestion_run_id="run-1",
+            stock_id="1101",
+            start_date=dt.date(2025, 3, 1),
+            end_date=dt.date(2026, 8, 14),
+            target_date=dt.date(2026, 8, 15),
+        )
+    assert repo.saved == []

@@ -300,6 +300,54 @@ class FinMindClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
+    def fetch_stock_monthly_revenue(
+        self,
+        *,
+        ingestion_run_id: str,
+        stock_id: str,
+        start_date: dt.date,
+        end_date: dt.date,
+        target_date: dt.date,
+    ) -> RawSourcePayload:
+        """
+        Fetch TaiwanStockMonthRevenue for one stock.
+
+        Taiwan-listed companies must disclose monthly revenue by the
+        10th of the following month, so target_date's own month is
+        typically NOT yet disclosed when this job runs. start_date/
+        end_date should span well over a year back so both the latest
+        disclosed month and the same month a year earlier are present
+        in the response — but the real look-ahead guard is
+        available_at (derived from create_time) in
+        app.domain.monthly_revenue_builder, not this query window.
+        """
+        stock_id = stock_id.strip()
+        if not stock_id:
+            raise ValueError("stock_id must not be empty")
+        if start_date > end_date:
+            raise ValueError("start_date must not be after end_date")
+
+        params = {
+            "dataset": "TaiwanStockMonthRevenue",
+            "data_id": stock_id,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        }
+
+        def _fetch():
+            response = self.http_client.get(
+                self.base_url, params=params, headers=self._auth_headers()
+            )
+            response.raise_for_status()
+            return response.json(), None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
+            fetch_fn=_fetch,
+        )
+
     # Other datasets (margin/short balance, monthly revenue, etc.)
     # follow the same pattern, each mapped to the corresponding
     # FinMind dataset name — check FinMind's current docs before
@@ -426,3 +474,51 @@ class MopsClient(MarketDataClient):
     # announcements — must record available_at (when the data actually
     # became available), not just the month it refers to, for use in
     # future backtesting (see the "event quality" factor).
+
+
+def fetch_stock_monthly_revenue(
+    self,
+    *,
+    ingestion_run_id: str,
+    stock_id: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    target_date: dt.date,
+) -> RawSourcePayload:
+    """
+    Fetch TaiwanStockMonthRevenue for one stock.
+
+    Taiwan-listed companies must disclose monthly revenue by the 10th
+    of the following month, so target_date's own month is typically
+    NOT yet disclosed when this job runs. start_date/end_date should
+    span well over a year back so both the latest disclosed month and
+    the same month a year earlier are present in the response — but
+    the real look-ahead guard is available_at in
+    app.domain.monthly_revenue_builder, not this query window.
+    """
+    stock_id = stock_id.strip()
+    if not stock_id:
+        raise ValueError("stock_id must not be empty")
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    params = {
+        "dataset": "TaiwanStockMonthRevenue",
+        "data_id": stock_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
+
+    def _fetch():
+        response = self.http_client.get(
+            self.base_url, params=params, headers=self._auth_headers()
+        )
+        response.raise_for_status()
+        return response.json(), None
+
+    return self.fetch_and_snapshot(
+        ingestion_run_id=ingestion_run_id,
+        target_date=target_date,
+        request_parameters=params,
+        fetch_fn=_fetch,
+    )

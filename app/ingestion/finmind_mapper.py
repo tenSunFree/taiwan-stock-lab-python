@@ -65,6 +65,8 @@ from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 
 from app.domain.institutional_flow_builder import InstitutionalFlowPoint
 
+from app.domain.monthly_revenue_builder import MonthlyRevenuePoint
+
 
 def _to_decimal(value: Any, *, zero_is_missing: bool = False) -> Decimal | None:
     """
@@ -353,3 +355,68 @@ def build_institutional_flow_points(
         for trading_date, net_shares in sorted(net_shares_by_date.items())
         if trading_date not in invalid_dates
     ]
+
+
+def build_monthly_revenue_points(
+    rows: list[dict[str, Any]], *, expected_stock_id: str
+) -> list[MonthlyRevenuePoint]:
+    """
+    Convert FinMind TaiwanStockMonthRevenue rows into
+    provider-independent MonthlyRevenuePoint records, carrying
+    available_at derived from create_time so build_revenue_yoy can
+    enforce no-look-ahead.
+
+    Rows with missing/invalid revenue_year, revenue_month, or revenue
+    are dropped entirely. A non-empty but malformed create_time is
+    treated the same way — dropped rather than silently falling back
+    to "availability unknown," since a value that fails to parse
+    might not be the timestamp it claims to be.
+    """
+    expected_stock_id = expected_stock_id.strip()
+    if not expected_stock_id:
+        raise ValueError("expected_stock_id must not be empty")
+
+    result: list[MonthlyRevenuePoint] = []
+
+    for row in rows:
+        row_stock_id = str(row.get("stock_id") or "").strip()
+        if row_stock_id != expected_stock_id:
+            continue
+
+        revenue_year = _to_int(row.get("revenue_year"), zero_is_missing=False)
+        revenue_month = _to_int(row.get("revenue_month"), zero_is_missing=False)
+        revenue = _to_int(row.get("revenue"), zero_is_missing=False)
+
+        if revenue_year is None or revenue_month is None or revenue is None:
+            continue
+        if revenue_year <= 0:
+            continue
+        if not (1 <= revenue_month <= 12):
+            continue
+        if revenue < 0:
+            continue
+
+        create_time_text = str(row.get("create_time") or "").strip()
+        available_at: dt.date | None = None
+
+        if create_time_text:
+            # FinMind's create_time is typically a full timestamp,
+            # e.g. "2026-08-10 09:15:00" — take just the date portion.
+            # date.fromisoformat() rejects the full string outright,
+            # which would otherwise silently drop every row that has
+            # a create_time at all.
+            try:
+                available_at = dt.date.fromisoformat(create_time_text[:10])
+            except ValueError:
+                continue  # not trustworthy enough to use — drop the row
+
+        result.append(
+            MonthlyRevenuePoint(
+                revenue_year=revenue_year,
+                revenue_month=revenue_month,
+                revenue=float(revenue),
+                available_at=available_at,
+            )
+        )
+
+    return sorted(result, key=lambda point: (point.revenue_year, point.revenue_month))
