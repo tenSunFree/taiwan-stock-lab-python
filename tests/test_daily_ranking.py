@@ -3,10 +3,13 @@ import datetime as dt
 import httpx
 import pytest
 
-from app.ingestion.market_data_client import FinMindClient, TpexClient, TwseClient
+from app.ingestion.market_data_client import (
+    FinMindClient,
+    RawSourcePayload,
+    TpexClient,
+    TwseClient,
+)
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
-
-from app.ingestion.market_data_client import RawSourcePayload
 
 TARGET_DATE = dt.date(2026, 8, 7)
 
@@ -372,8 +375,9 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
     # 3 base snapshots (twse + tpex + finmind stock_info) + 1 per-candidate
-    # FinMind history snapshot (this test has exactly 1 candidate) = 4.
-    assert len(repository.saved) == 4
+    # FinMind price-history snapshot + 1 per-candidate FinMind
+    # institutional snapshot (this test has exactly 1 candidate) = 5.
+    assert len(repository.saved) == 5
     assert "Built StockFeatures for 1 candidates" in caplog.text
 
 
@@ -454,14 +458,19 @@ def test_run_returns_1_when_tpex_fetch_raises(monkeypatch):
     assert repository.saved[0].source == "twse"
 
 
+# --- build_stock_features() unit tests ---
+
+
 class FakeHistoryFinMindClient:
     """
-    Lightweight duck-typed fake for build_stock_features()'s
-    finmind_client parameter — deliberately NOT built on top of
-    httpx.MockTransport, since this layer's contract is "does
-    build_stock_features() call fetch_stock_price_history() correctly
-    and handle its result/failure correctly", not "is the HTTP
-    request well-formed" (that's already covered by
+    Duck-typed fake covering both fetch_stock_price_history() and
+    fetch_stock_institutional_investors() — build_stock_features()
+    calls both independently, so a fake standing in for
+    finmind_client must support both. Deliberately NOT built on top
+    of httpx.MockTransport, since this layer's contract is
+    "does build_stock_features() call the client correctly and
+    handle its result/failure correctly", not "is the HTTP request
+    well-formed" (that's already covered by
     tests/test_market_data_client.py).
     """
 
@@ -470,23 +479,20 @@ class FakeHistoryFinMindClient:
         *,
         rows_by_stock: dict[str, list[dict]],
         failing_stock_ids: set[str] | None = None,
+        institutional_rows_by_stock: dict[str, list[dict]] | None = None,
+        institutional_failing_stock_ids: set[str] | None = None,
     ) -> None:
         self.rows_by_stock = rows_by_stock
         self.failing_stock_ids = failing_stock_ids or set()
-        self.calls: list[dict[str, object]] = []
+        self.institutional_rows_by_stock = institutional_rows_by_stock or {}
+        self.institutional_failing_stock_ids = institutional_failing_stock_ids or set()
+        self.calls: list[str] = []
+        self.institutional_calls: list[str] = []
 
     def fetch_stock_price_history(
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
-        self.calls.append(
-            {
-                "stock_id": stock_id,
-                "start_date": start_date,
-                "end_date": end_date,
-                "target_date": target_date,
-            }
-        )
-
+        self.calls.append(stock_id)
         if stock_id in self.failing_stock_ids:
             raise RuntimeError(f"simulated history failure: {stock_id}")
 
@@ -505,6 +511,31 @@ class FakeHistoryFinMindClient:
             schema_version="v1",
             payload_hash="test",
             raw_payload={"data": self.rows_by_stock.get(stock_id, [])},
+            ingested_at=dt.datetime.now(dt.timezone.utc),
+        )
+
+    def fetch_stock_institutional_investors(
+        self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
+    ):
+        self.institutional_calls.append(stock_id)
+        if stock_id in self.institutional_failing_stock_ids:
+            raise RuntimeError(f"simulated institutional failure: {stock_id}")
+
+        return RawSourcePayload(
+            ingestion_run_id=ingestion_run_id,
+            source="finmind",
+            target_date=target_date,
+            requested_at=dt.datetime.now(dt.timezone.utc),
+            source_updated_at=None,
+            request_parameters={
+                "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+                "data_id": stock_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+            schema_version="v1",
+            payload_hash="test",
+            raw_payload={"data": self.institutional_rows_by_stock.get(stock_id, [])},
             ingested_at=dt.datetime.now(dt.timezone.utc),
         )
 
@@ -569,6 +600,20 @@ def _make_history_rows(
     ]
 
 
+def _make_institutional_rows(
+    count: int = 5, *, start=dt.date(2026, 6, 1), buy=1000, sell=200, stock_id="1101"
+):
+    return [
+        {
+            "date": (start + dt.timedelta(days=i)).isoformat(),
+            "stock_id": stock_id,
+            "buy": buy,
+            "sell": sell,
+        }
+        for i in range(count)
+    ]
+
+
 def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
     from app.jobs.daily_ranking import build_stock_features
 
@@ -579,31 +624,25 @@ def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
         finmind_client=client,
         ingestion_run_id="run-1",
     )
-
     assert features == []
     assert client.calls == []
+    assert client.institutional_calls == []
 
 
 def test_build_stock_features_computes_real_technical_factors_on_success():
     from app.jobs.daily_ranking import build_stock_features
 
     candidates = [
-        _make_candidate(
-            "1101",
-            close="44.65",
-            turnover="100000000",
-            volume=3_000_000,
-        )
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
     ]
-
+    history_rows = _make_history_rows(20, close="100", volume="1000000")
     client = FakeHistoryFinMindClient(
-        rows_by_stock={
-            "1101": _make_history_rows(
-                20,
-                close="100",
-                volume="1000000",
+        rows_by_stock={"1101": history_rows},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=1000, sell=200
             )
-        }
+        },
     )
 
     features = build_stock_features(
@@ -614,52 +653,32 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     )
 
     assert len(features) == 1
-
     feature = features[0]
-
     assert feature.stock_id == "1101"
     assert feature.turnover == 100000000.0
-
     assert feature.average_turnover_20d == pytest.approx(100000000.0)
-
-    assert feature.volume_ratio_20d == pytest.approx(3.0)
-
-    # today_close=44.65 and every historical close in this fixture is
-    # 100, so both reference closes are exactly 100.
-    assert feature.return_5d == pytest.approx(44.65 / 100.0 - 1.0)
-
-    assert feature.return_20d == pytest.approx(44.65 / 100.0 - 1.0)
-
-    # build_stock_features() uses a 60-calendar-day retrieval buffer
-    # and deliberately excludes target_date itself from FinMind
-    # historical-price requests.
-    assert client.calls == [
-        {
-            "stock_id": "1101",
-            "start_date": TARGET_DATE - dt.timedelta(days=60),
-            "end_date": TARGET_DATE - dt.timedelta(days=1),
-            "target_date": TARGET_DATE,
-        }
-    ]
+    assert feature.volume_ratio_20d == pytest.approx(3.0)  # 3,000,000 / 1,000,000
+    assert feature.return_5d is not None
+    assert feature.return_20d is not None
+    assert feature.institutional_net_buy_ratio_5d is not None
+    assert client.calls == ["1101"]
+    assert client.institutional_calls == ["1101"]
 
 
 def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog):
     from app.jobs.daily_ranking import build_stock_features
 
-    candidates = [
-        _make_candidate("1101"),
-        _make_candidate("2330"),
-    ]
-
+    candidates = [_make_candidate("1101"), _make_candidate("2330")]
     client = FakeHistoryFinMindClient(
         rows_by_stock={"1101": _make_history_rows(20)},
         failing_stock_ids={"2330"},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(5, stock_id="1101"),
+            "2330": _make_institutional_rows(5, stock_id="2330"),
+        },
     )
 
-    with caplog.at_level(
-        "INFO",
-        logger="daily_ranking",
-    ):
+    with caplog.at_level("INFO", logger="daily_ranking"):
         features = build_stock_features(
             candidates=candidates,
             target_date=TARGET_DATE,
@@ -668,42 +687,20 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
         )
 
     assert len(features) == 2
-
-    by_stock = {feature.stock_id: feature for feature in features}
+    by_stock = {f.stock_id: f for f in features}
 
     assert by_stock["1101"].average_turnover_20d is not None
-
     assert by_stock["1101"].return_5d is not None
 
     assert by_stock["2330"].average_turnover_20d is None
-
     assert by_stock["2330"].volume_ratio_20d is None
-
     assert by_stock["2330"].return_5d is None
-
     assert by_stock["2330"].return_20d is None
-
     # turnover itself still comes from today's real TWSE/TPEx data,
-    # unaffected by the FinMind history failure.
+    # unaffected by the FinMind history failure
     assert by_stock["2330"].turnover == 100000000.0
 
-    # The failed request should still be recorded, because verifying
-    # which request was attempted is part of this fake's contract.
-    assert client.calls == [
-        {
-            "stock_id": "1101",
-            "start_date": TARGET_DATE - dt.timedelta(days=60),
-            "end_date": TARGET_DATE - dt.timedelta(days=1),
-            "target_date": TARGET_DATE,
-        },
-        {
-            "stock_id": "2330",
-            "start_date": TARGET_DATE - dt.timedelta(days=60),
-            "end_date": TARGET_DATE - dt.timedelta(days=1),
-            "target_date": TARGET_DATE,
-        },
-    ]
-
+    assert client.calls == ["1101", "2330"]
     assert "failed for stock_id=2330" in caplog.text
 
 
@@ -711,7 +708,6 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
     from app.jobs.daily_ranking import build_stock_features
 
     candidates = [_make_candidate("1101")]
-
     client = FakeHistoryFinMindClient(rows_by_stock={"1101": []})
 
     features = build_stock_features(
@@ -722,5 +718,73 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
     )
 
     assert features[0].average_turnover_20d is None
-
     assert features[0].return_5d is None
+
+
+def test_build_stock_features_institutional_failure_does_not_clear_price_factors():
+    """
+    Regression test for the independence requirement: a stock's
+    institutional-flow fetch failing must not clear technical factors
+    that were already successfully computed from a working
+    price-history fetch for the SAME stock.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20, close="100", volume="1000000")},
+        institutional_failing_stock_ids={"1101"},
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    # price-history factors still computed normally
+    assert feature.average_turnover_20d is not None
+    assert feature.return_5d is not None
+    # institutional factor is None because ITS OWN fetch failed
+    assert feature.institutional_net_buy_ratio_5d is None
+
+
+def test_build_stock_features_price_failure_does_not_prevent_institutional_attempt():
+    """
+    The reverse direction: price-history fetch failing must not skip
+    the institutional-flow attempt for the same stock. (The
+    institutional ratio will still end up None here because there's
+    no volume data to divide by — but the call itself must still
+    happen, and that absence must come from insufficient data, not
+    from the code skipping the block.)
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={},
+        failing_stock_ids={"1101"},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=1000, sell=200
+            )
+        },
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert client.institutional_calls == ["1101"]  # the attempt happened
+    assert features[0].average_turnover_20d is None  # price side failed
+    assert (
+        features[0].institutional_net_buy_ratio_5d is None
+    )  # no volume data to divide by

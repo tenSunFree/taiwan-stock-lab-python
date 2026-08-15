@@ -319,3 +319,70 @@ def test_build_institutional_flow_points_ignores_other_stock_rows():
 def test_build_institutional_flow_points_rejects_empty_expected_stock_id():
     with pytest.raises(ValueError, match="expected_stock_id must not be empty"):
         build_institutional_flow_points([], expected_stock_id="   ")
+
+
+def test_build_monthly_revenue_points_maps_full_timestamp_create_time():
+    from app.ingestion.finmind_mapper import build_monthly_revenue_points
+
+    rows = [
+        {
+            "stock_id": "1101",
+            "revenue_year": 2026,
+            "revenue_month": 7,
+            "revenue": 1200000000,
+            "create_time": "2026-08-10 09:15:00",  # 注意:帶時間，不是純日期
+        }
+    ]
+    points = build_monthly_revenue_points(rows, expected_stock_id="1101")
+    assert len(points) == 1
+    assert points[0].revenue_year == 2026
+    assert points[0].revenue_month == 7
+    assert points[0].revenue == 1200000000.0
+    assert points[0].available_at == dt.date(2026, 8, 10)
+
+
+def test_build_monthly_revenue_points_empty_create_time_leaves_available_at_none():
+    from app.ingestion.finmind_mapper import build_monthly_revenue_points
+
+    rows = [
+        {
+            "stock_id": "1101",
+            "revenue_year": 2020,
+            "revenue_month": 7,
+            "revenue": 900000000,
+            "create_time": "",
+        }
+    ]
+    points = build_monthly_revenue_points(rows, expected_stock_id="1101")
+    assert len(points) == 1
+    assert points[0].available_at is None
+
+
+def test_build_monthly_revenue_points_malformed_create_time_drops_row():
+    from app.ingestion.finmind_mapper import build_monthly_revenue_points
+
+    rows = [
+        {
+            "stock_id": "1101",
+            "revenue_year": 2026,
+            "revenue_month": 7,
+            "revenue": 1200000000,
+            "create_time": "not-a-date",
+        }
+    ]
+    assert build_monthly_revenue_points(rows, expected_stock_id="1101") == []
+
+
+def test_build_monthly_revenue_points_ignores_other_stock_rows():
+    from app.ingestion.finmind_mapper import build_monthly_revenue_points
+
+    rows = [
+        {
+            "stock_id": "2330",
+            "revenue_year": 2026,
+            "revenue_month": 7,
+            "revenue": 1,
+            "create_time": "2026-08-10",
+        },
+    ]
+    assert build_monthly_revenue_points(rows, expected_stock_id="1101") == []
