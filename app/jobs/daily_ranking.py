@@ -3,11 +3,11 @@ Daily scheduled job entry point.
 
 Wires real market data from BOTH TWSE (listed) and TPEx (OTC) through
 to CandidateBuilder, then enriches each candidate with trailing
-historical price features and institutional net-buy ratio from
-FinMind. Deliberately stops after StockFeatures[] is built — no
-RiskPolicy, scoring, or LINE delivery yet — so a wrong or incomplete
-candidate pool / feature set can be diagnosed without the rest of the
-pipeline in the way.
+historical price features, institutional net-buy ratio, and monthly
+revenue YoY from FinMind. Deliberately stops after StockFeatures[] is
+built — no RiskPolicy, scoring, or LINE delivery yet — so a wrong or
+incomplete candidate pool / feature set can be diagnosed without the
+rest of the pipeline in the way.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
@@ -52,6 +52,16 @@ impractical without a paid tier):
         updates ~20:00 on trading days — target_date's own row is
         never available when this job runs on its normal schedule.
 
+    FinMind (FinMindClient.fetch_stock_monthly_revenue)
+        Per-candidate TaiwanStockMonthRevenue history, used to compute
+        revenue_yoy from the newest revenue month known to have been
+        available as of target_date and the same month one year
+        earlier. create_time is carried into
+        MonthlyRevenuePoint.available_at so current-period revenue is
+        never accepted solely because its revenue month has already
+        ended — see app.domain.monthly_revenue_builder's module
+        docstring for the full look-ahead rationale.
+
 KNOWN LIMITATIONS in this checkpoint:
 
     - Both TWSE's STOCK_DAY_ALL and TPEx's daily close quotes only
@@ -68,27 +78,28 @@ KNOWN LIMITATIONS in this checkpoint:
       rather than silently falling back to TWSE-only candidates (and
       vice versa) — an incomplete whole-market scan should never be
       treated as a complete one.
-    - A single candidate's historical-price or institutional-flow
-      enrichment failing does NOT fail the whole run — that stock's
-      corresponding factors simply stay None. The two enrichment
-      types fail INDEPENDENTLY of each other (see build_stock_features()
-      docstring): a failure in one must never clear factors already
-      computed by the other for the same stock. This is deliberately
-      different from the TWSE/TPEx whole-market failure policy above:
-      one missing stock's history/flow is ordinary incompleteness; an
-      entire market's data being unavailable is not.
-    - revenue_yoy and risk_quality_raw are still always None. Combined
-      with the 25%+20%+15%+15%=75% factor weight this checkpoint can
-      now supply (liquidity + volume_price + momentum + institutional),
-      a candidate could in principle reach data_completeness close to
-      but still short of the 80% minimum scoring.py requires for the
-      Top 5 — RiskPolicy and scoring are not wired in yet regardless.
+    - A single candidate's historical-price, institutional-flow, or
+      monthly-revenue enrichment failing does NOT fail the whole run
+      — that stock's corresponding factor(s) simply stay None. All
+      three enrichment types fail INDEPENDENTLY of each other (see
+      build_stock_features() docstring): a failure in one must never
+      clear factors already computed by the others for the same
+      stock. This is deliberately different from the TWSE/TPEx
+      whole-market failure policy above: one missing stock's
+      history/flow/revenue is ordinary incompleteness; an entire
+      market's data being unavailable is not.
+    - risk_quality_raw is still always None. RiskPolicy and scoring
+      are not wired into this job yet.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
       loaded from it — a config loader is separate follow-up work.
 """
 
 from __future__ import annotations
+
+import truststore
+
+truststore.inject_into_ssl()
 
 import datetime as dt
 import logging
@@ -100,9 +111,11 @@ from app.domain.candidate_builder import Candidate, CandidateBuilder
 from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
+from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
     build_institutional_flow_points,
+    build_monthly_revenue_points,
     build_stock_master,
 )
 from app.ingestion.market_data_client import (
@@ -135,6 +148,13 @@ MAXIMUM_CANDIDATES = 50
 # 5/20 actual trading-day observations; 60 calendar days simply gives
 # FinMind enough room to cover weekends and market holidays.
 HISTORY_LOOKBACK_CALENDAR_DAYS = 60
+
+# Retrieval buffer only. ~18 months ensures the response normally
+# contains both the latest disclosed revenue month and the same
+# revenue month one year earlier — this window is NOT the look-ahead
+# guard. Actual availability is enforced by
+# MonthlyRevenuePoint.available_at inside build_revenue_yoy().
+REVENUE_LOOKBACK_CALENDAR_DAYS = 550
 
 
 class InMemoryRawPayloadRepository:
@@ -202,22 +222,23 @@ def build_stock_features(
     ingestion_run_id: str,
 ) -> list[StockFeatures]:
     """
-    Enrich candidate stocks with trailing historical price features
-    and institutional net-buy ratio.
+    Enrich candidate stocks with trailing historical price features,
+    institutional net-buy ratio, and monthly revenue YoY.
 
     Today's close / volume / turnover always come from the already
     validated TWSE / TPEx candidate data. FinMind is queried only for
-    sessions strictly before target_date, for both price history and
-    institutional flow.
+    sessions strictly before target_date, for price history,
+    institutional flow, and monthly revenue alike.
 
     Failure policy — deliberately INDEPENDENT per data source:
-        Price-history enrichment and institutional-flow enrichment
-        each have their OWN try/except block. A failure in one must
-        never clear factors already successfully computed by the
-        other — e.g. FinMind's institutional endpoint being briefly
-        unavailable must not wipe out average_turnover_20d/return_5d
-        that were already computed from a successful price-history
-        fetch for the same stock, and vice versa.
+        Price-history enrichment, institutional-flow enrichment, and
+        monthly-revenue enrichment each have their OWN try/except
+        block. A failure in one must never clear factors already
+        successfully computed by the others — e.g. FinMind's
+        institutional endpoint being briefly unavailable must not
+        wipe out average_turnover_20d/return_5d that were already
+        computed from a successful price-history fetch for the same
+        stock, and vice versa for revenue.
 
         Institutional net-buy ratio reuses the volume data already
         fetched for price-history enrichment (see
@@ -241,6 +262,9 @@ def build_stock_features(
     history_start_date = target_date - dt.timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
     history_end_date = target_date - dt.timedelta(days=1)
 
+    revenue_start_date = target_date - dt.timedelta(days=REVENUE_LOOKBACK_CALENDAR_DAYS)
+    revenue_end_date = target_date - dt.timedelta(days=1)
+
     features: list[StockFeatures] = []
     price_success_count = 0
     price_empty_count = 0
@@ -248,6 +272,9 @@ def build_stock_features(
     institutional_success_count = 0
     institutional_none_count = 0
     institutional_failure_count = 0
+    revenue_success_count = 0
+    revenue_none_count = 0
+    revenue_failure_count = 0
 
     for candidate in candidates:
         stock_id = candidate.stock.stock_id
@@ -354,6 +381,46 @@ def build_stock_features(
                 stock_id,
             )
 
+        # --- Independent block 3: monthly revenue YoY ---
+        revenue_yoy = None
+
+        try:
+            revenue_payload = finmind_client.fetch_stock_monthly_revenue(
+                ingestion_run_id=ingestion_run_id,
+                stock_id=stock_id,
+                start_date=revenue_start_date,
+                end_date=revenue_end_date,
+                target_date=target_date,
+            )
+            revenue_rows = extract_data_rows(revenue_payload)
+
+            if not revenue_rows:
+                revenue_none_count += 1
+                logger.warning(
+                    "FinMind monthly revenue returned no usable rows for "
+                    "stock_id=%s; revenue_yoy remains None",
+                    stock_id,
+                )
+            else:
+                revenue_points = build_monthly_revenue_points(
+                    revenue_rows, expected_stock_id=stock_id
+                )
+                revenue_yoy = build_revenue_yoy(
+                    target_date=target_date, points=revenue_points
+                )
+                if revenue_yoy is None:
+                    revenue_none_count += 1
+                else:
+                    revenue_success_count += 1
+
+        except Exception:
+            revenue_failure_count += 1
+            logger.exception(
+                "FinMind monthly-revenue enrichment failed for stock_id=%s; "
+                "revenue_yoy remains None",
+                stock_id,
+            )
+
         stock_features = StockFeatures(
             stock_id=stock_id,
             turnover=float(today_turnover),
@@ -362,7 +429,7 @@ def build_stock_features(
             return_5d=return_5d,
             return_20d=return_20d,
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
-            revenue_yoy=None,  # follow-up
+            revenue_yoy=revenue_yoy,
             risk_quality_raw=None,  # follow-up
         )
         features.append(stock_features)
@@ -370,7 +437,7 @@ def build_stock_features(
         logger.info(
             "features stock_id=%s turnover=%s avg_turnover_20d=%s "
             "volume_ratio_20d=%s return_5d=%s return_20d=%s "
-            "institutional_net_buy_ratio_5d=%s",
+            "institutional_net_buy_ratio_5d=%s revenue_yoy=%s",
             stock_id,
             stock_features.turnover,
             stock_features.average_turnover_20d,
@@ -378,6 +445,7 @@ def build_stock_features(
             stock_features.return_5d,
             stock_features.return_20d,
             stock_features.institutional_net_buy_ratio_5d,
+            stock_features.revenue_yoy,
         )
 
     logger.info(
@@ -393,6 +461,13 @@ def build_stock_features(
         institutional_success_count,
         institutional_none_count,
         institutional_failure_count,
+    )
+    logger.info(
+        "Monthly-revenue enrichment: candidates=%d success=%d none=%d failed=%d",
+        len(candidates),
+        revenue_success_count,
+        revenue_none_count,
+        revenue_failure_count,
     )
     return features
 
@@ -631,7 +706,7 @@ def run(
     candidates = candidate_builder.build(list(stock_master.values()), daily_prices)
     log_candidates(candidates)
 
-    # --- Step 5: per-candidate enrichment (price history + institutional flow) ---
+    # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue) ---
     features = build_stock_features(
         candidates=candidates,
         target_date=target_date,
