@@ -374,10 +374,10 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
-    # 3 base snapshots (twse + tpex + finmind stock_info) + 1 per-candidate
-    # FinMind price-history snapshot + 1 per-candidate FinMind
-    # institutional snapshot (this test has exactly 1 candidate) = 5.
-    assert len(repository.saved) == 5
+    # 3 base snapshots (twse + tpex + finmind stock_info) + 3 per-candidate
+    # FinMind enrichment snapshots (price history + institutional +
+    # monthly revenue; this test has exactly 1 candidate) = 6.
+    assert len(repository.saved) == 6
     assert "Built StockFeatures for 1 candidates" in caplog.text
 
 
@@ -463,15 +463,15 @@ def test_run_returns_1_when_tpex_fetch_raises(monkeypatch):
 
 class FakeHistoryFinMindClient:
     """
-    Duck-typed fake covering both fetch_stock_price_history() and
-    fetch_stock_institutional_investors() — build_stock_features()
-    calls both independently, so a fake standing in for
-    finmind_client must support both. Deliberately NOT built on top
-    of httpx.MockTransport, since this layer's contract is
-    "does build_stock_features() call the client correctly and
-    handle its result/failure correctly", not "is the HTTP request
-    well-formed" (that's already covered by
-    tests/test_market_data_client.py).
+    Duck-typed fake covering fetch_stock_price_history(),
+    fetch_stock_institutional_investors(), and
+    fetch_stock_monthly_revenue() — build_stock_features() calls all
+    three independently, so a fake standing in for finmind_client must
+    support all three. Deliberately NOT built on top of
+    httpx.MockTransport, since this layer's contract is "does
+    build_stock_features() call the client correctly and handle its
+    result/failure correctly", not "is the HTTP request well-formed"
+    (that's already covered by tests/test_market_data_client.py).
     """
 
     def __init__(
@@ -481,13 +481,18 @@ class FakeHistoryFinMindClient:
         failing_stock_ids: set[str] | None = None,
         institutional_rows_by_stock: dict[str, list[dict]] | None = None,
         institutional_failing_stock_ids: set[str] | None = None,
+        revenue_rows_by_stock: dict[str, list[dict]] | None = None,
+        revenue_failing_stock_ids: set[str] | None = None,
     ) -> None:
         self.rows_by_stock = rows_by_stock
         self.failing_stock_ids = failing_stock_ids or set()
         self.institutional_rows_by_stock = institutional_rows_by_stock or {}
         self.institutional_failing_stock_ids = institutional_failing_stock_ids or set()
+        self.revenue_rows_by_stock = revenue_rows_by_stock or {}
+        self.revenue_failing_stock_ids = revenue_failing_stock_ids or set()
         self.calls: list[str] = []
         self.institutional_calls: list[str] = []
+        self.revenue_calls: list[str] = []
 
     def fetch_stock_price_history(
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
@@ -536,6 +541,31 @@ class FakeHistoryFinMindClient:
             schema_version="v1",
             payload_hash="test",
             raw_payload={"data": self.institutional_rows_by_stock.get(stock_id, [])},
+            ingested_at=dt.datetime.now(dt.timezone.utc),
+        )
+
+    def fetch_stock_monthly_revenue(
+        self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
+    ):
+        self.revenue_calls.append(stock_id)
+        if stock_id in self.revenue_failing_stock_ids:
+            raise RuntimeError(f"simulated revenue failure: {stock_id}")
+
+        return RawSourcePayload(
+            ingestion_run_id=ingestion_run_id,
+            source="finmind",
+            target_date=target_date,
+            requested_at=dt.datetime.now(dt.timezone.utc),
+            source_updated_at=None,
+            request_parameters={
+                "dataset": "TaiwanStockMonthRevenue",
+                "data_id": stock_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+            schema_version="v1",
+            payload_hash="test",
+            raw_payload={"data": self.revenue_rows_by_stock.get(stock_id, [])},
             ingested_at=dt.datetime.now(dt.timezone.utc),
         )
 
@@ -614,6 +644,33 @@ def _make_institutional_rows(
     ]
 
 
+def _make_monthly_revenue_rows(
+    *,
+    stock_id: str = "1101",
+    current_year: int = 2026,
+    current_month: int = 7,
+    current_revenue: int = 1_300_000_000,
+    previous_revenue: int = 1_000_000_000,
+    create_time: str = "2026-08-05 09:00:00",  # 早於 TARGET_DATE(2026-08-07）
+):
+    return [
+        {
+            "stock_id": stock_id,
+            "revenue_year": current_year,
+            "revenue_month": current_month,
+            "revenue": current_revenue,
+            "create_time": create_time,
+        },
+        {
+            "stock_id": stock_id,
+            "revenue_year": current_year - 1,
+            "revenue_month": current_month,
+            "revenue": previous_revenue,
+            "create_time": "",  # 舊資料沒有 create_time，只能當分母用
+        },
+    ]
+
+
 def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
     from app.jobs.daily_ranking import build_stock_features
 
@@ -627,6 +684,7 @@ def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
     assert features == []
     assert client.calls == []
     assert client.institutional_calls == []
+    assert client.revenue_calls == []
 
 
 def test_build_stock_features_computes_real_technical_factors_on_success():
@@ -643,6 +701,7 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
                 5, start=dt.date(2026, 6, 16), buy=1000, sell=200
             )
         },
+        revenue_rows_by_stock={"1101": _make_monthly_revenue_rows(stock_id="1101")},
     )
 
     features = build_stock_features(
@@ -661,8 +720,11 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     assert feature.return_5d is not None
     assert feature.return_20d is not None
     assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.revenue_yoy is not None
+    assert feature.revenue_yoy == pytest.approx(0.30)  # 1,300,000,000/1,000,000,000-1
     assert client.calls == ["1101"]
     assert client.institutional_calls == ["1101"]
+    assert client.revenue_calls == ["1101"]
 
 
 def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog):
@@ -702,6 +764,7 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
 
     assert client.calls == ["1101", "2330"]
     assert "failed for stock_id=2330" in caplog.text
+    assert client.revenue_calls == ["1101", "2330"]
 
 
 def test_build_stock_features_empty_history_rows_leaves_factors_none():
@@ -784,7 +847,65 @@ def test_build_stock_features_price_failure_does_not_prevent_institutional_attem
     )
 
     assert client.institutional_calls == ["1101"]  # the attempt happened
+    assert client.revenue_calls == ["1101"]  # the revenue attempt also happened
     assert features[0].average_turnover_20d is None  # price side failed
     assert (
         features[0].institutional_net_buy_ratio_5d is None
     )  # no volume data to divide by
+
+
+def test_build_stock_features_revenue_failure_does_not_clear_other_factors():
+    """
+    Regression test for the independence requirement: a stock's
+    monthly-revenue fetch failing must not clear technical or
+    institutional factors already successfully computed for the SAME
+    stock.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20)},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=1000, sell=200
+            )
+        },
+        revenue_failing_stock_ids={"1101"},
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    assert feature.average_turnover_20d is not None
+    assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.revenue_yoy is None  # 只有 revenue 這個 block 失敗
+    assert client.calls == ["1101"]
+    assert client.institutional_calls == ["1101"]
+    assert client.revenue_calls == ["1101"]
+
+
+def test_build_stock_features_revenue_empty_rows_leaves_revenue_yoy_none():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20)},
+        revenue_rows_by_stock={"1101": []},
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+    )
+
+    assert features[0].revenue_yoy is None
+    assert client.revenue_calls == ["1101"]
