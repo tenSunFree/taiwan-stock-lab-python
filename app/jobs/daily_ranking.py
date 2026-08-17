@@ -4,10 +4,11 @@ Daily scheduled job entry point.
 Wires real market data from BOTH TWSE (listed) and TPEx (OTC) through
 to CandidateBuilder, then enriches each candidate with trailing
 historical price features, institutional net-buy ratio, and monthly
-revenue YoY from FinMind. Deliberately stops after StockFeatures[] is
-built — no RiskPolicy, scoring, or LINE delivery yet — so a wrong or
-incomplete candidate pool / feature set can be diagnosed without the
-rest of the pipeline in the way.
+revenue YoY from FinMind, then applies RiskPolicy and multi-factor
+scoring to select a research-only Top 5. Deliberately stops after
+Top 5 is logged — no report rendering or LINE delivery yet — so a
+wrong or incomplete candidate pool / feature set can be diagnosed
+without the rest of the pipeline in the way.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
@@ -120,9 +121,11 @@ from app.domain.candidate_builder import Candidate, CandidateBuilder
 from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
+from app.domain.models import StockMaster
 from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
+from app.domain.scoring import ScoredStock, score_candidates, select_top_five
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
     build_institutional_flow_points,
@@ -222,6 +225,35 @@ def log_candidates(candidates: list[Candidate]) -> None:
             candidate.limit_up.limit_up_price,
             candidate.price.turnover,
             candidate.limit_up.limit_up_source.value,
+        )
+
+
+def log_top_five(
+    top_five: list[ScoredStock], stock_master: dict[str, StockMaster]
+) -> None:
+    """
+    Manual-review checkpoint before report rendering / LINE delivery
+    exist. Logs the full factor_scores breakdown, not just the
+    aggregate total_score, so ranking order can be inspected and
+    explained ("why did #1 beat #2") rather than taken on faith.
+    """
+    if not top_five:
+        logger.info("=== Top 5 (人工檢視用) === 無符合資格股票")
+        return
+
+    logger.info("=== Top 5 (人工檢視用,尚未產生報告/推播) ===")
+    for rank, scored in enumerate(top_five, start=1):
+        stock = stock_master.get(scored.stock_id)
+        name = stock.stock_name if stock else scored.stock_id
+        logger.info(
+            "#%d %s(%s) score=%.2f completeness=%.0f%% risk_flags=%s factor_scores=%s",
+            rank,
+            name,
+            scored.stock_id,
+            scored.total_score,
+            scored.data_completeness * 100,
+            scored.risk_flags,
+            scored.factor_scores,
         )
 
 
@@ -810,25 +842,60 @@ def run(
     log_candidates(candidates)
 
     # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue + risk) ---
+    risk_policy = RiskPolicy()  # matches config/strategy-v1.yaml by hand for now
     features = build_stock_features(
         candidates=candidates,
         target_date=target_date,
         finmind_client=finmind_client,
         ingestion_run_id=ingestion_run_id,
-        # matches config/strategy-v1.yaml's risk_policy section by
-        # hand for now, same as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above
-        risk_policy=RiskPolicy(),
+        risk_policy=risk_policy,
     )
-    logger.info("Built StockFeatures for %d candidates", len(features))
+    logger.info(
+        "Built StockFeatures for %d of %d candidates after RiskPolicy",
+        len(features),
+        len(candidates),
+    )
+
+    # --- Step 6: multi-factor scoring + Top 5 (manual-review checkpoint) ---
+    # Deliberately stops here: no report rendering, no LINE delivery.
+    # See log_top_five()'s docstring for why the full factor breakdown
+    # is logged rather than just the final score.
+    scored = score_candidates(features)
+    logger.info("Scored %d StockFeatures", len(scored))
+
+    turnover_by_stock = {f.stock_id: f.turnover for f in features}
+    minimum_data_completeness = risk_policy.config.minimum_data_completeness
+
+    eligible_count = sum(
+        1 for stock in scored if stock.data_completeness >= minimum_data_completeness
+    )
+
+    top_five = select_top_five(
+        scored,
+        turnover_by_stock,
+        minimum_data_completeness=minimum_data_completeness,
+    )
+
+    logger.info(
+        "Scoring eligibility: scored=%d eligible=%d minimum_data_completeness=%.0f%%",
+        len(scored),
+        eligible_count,
+        minimum_data_completeness * 100,
+    )
+    log_top_five(top_five, stock_master)
 
     logger.info(
         "Provisional pipeline complete: %d raw snapshots, %d mapped stocks, "
-        "%d prices, %d candidates, %d features built",
+        "%d prices, %d candidates, %d features built, %d scored, %d eligible, "
+        "%d in Top 5",
         len(repo.saved),
         len(stock_master),
         len(daily_prices),
         len(candidates),
         len(features),
+        len(scored),
+        eligible_count,
+        len(top_five),
     )
     return 0
 

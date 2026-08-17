@@ -379,7 +379,7 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     # FinMind enrichment snapshots (price history + institutional +
     # monthly revenue; this test has exactly 1 candidate) = 6.
     assert len(repository.saved) == 6
-    assert "Built StockFeatures for 1 candidates" in caplog.text
+    assert "Built StockFeatures for 1 of 1 candidates after RiskPolicy" in caplog.text
 
 
 def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
