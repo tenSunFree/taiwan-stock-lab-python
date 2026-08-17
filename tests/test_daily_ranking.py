@@ -9,6 +9,7 @@ from app.ingestion.market_data_client import (
     TpexClient,
     TwseClient,
 )
+from app.domain.risk_policy import RiskPolicy
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
 
 TARGET_DATE = dt.date(2026, 8, 7)
@@ -577,6 +578,11 @@ def _make_candidate(
     reference="40.60",
     turnover="100000000",
     volume=3_000_000,
+    stock_name=None,
+    is_attention=None,
+    is_disposition=None,
+    is_managed=None,
+    one_price_limit_up=False,
 ):
     from decimal import Decimal
 
@@ -586,17 +592,20 @@ def _make_candidate(
 
     stock = StockMaster(
         stock_id=stock_id,
-        stock_name=f"測試{stock_id}",
+        stock_name=stock_name or f"測試{stock_id}",
         market=Market.TWSE,
         security_type=SecurityType.COMMON_STOCK,
+        is_attention=is_attention,
+        is_disposition=is_disposition,
+        is_managed=is_managed,
     )
     price = DailyPrice(
         trading_date=TARGET_DATE,
         stock_id=stock_id,
         reference_price=Decimal(reference),
-        open_price=Decimal(reference),
+        open_price=Decimal(close) if one_price_limit_up else Decimal(reference),
         high_price=Decimal(close),
-        low_price=Decimal(reference),
+        low_price=Decimal(close) if one_price_limit_up else Decimal(reference),
         close_price=Decimal(close),
         volume=volume,
         turnover=Decimal(turnover),
@@ -680,6 +689,7 @@ def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
     assert features == []
     assert client.calls == []
@@ -709,6 +719,7 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert len(features) == 1
@@ -746,6 +757,7 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
             target_date=TARGET_DATE,
             finmind_client=client,
             ingestion_run_id="run-1",
+            risk_policy=RiskPolicy(),
         )
 
     assert len(features) == 2
@@ -778,6 +790,7 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert features[0].average_turnover_20d is None
@@ -806,6 +819,7 @@ def test_build_stock_features_institutional_failure_does_not_clear_price_factors
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert len(features) == 1
@@ -844,6 +858,7 @@ def test_build_stock_features_price_failure_does_not_prevent_institutional_attem
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert client.institutional_calls == ["1101"]  # the attempt happened
@@ -879,6 +894,7 @@ def test_build_stock_features_revenue_failure_does_not_clear_other_factors():
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert len(features) == 1
@@ -905,7 +921,172 @@ def test_build_stock_features_revenue_empty_rows_leaves_revenue_yoy_none():
         target_date=TARGET_DATE,
         finmind_client=client,
         ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
     )
 
     assert features[0].revenue_yoy is None
     assert client.revenue_calls == ["1101"]
+
+
+# --- Risk assessment (Step 2) ---
+
+
+def test_build_stock_features_disposition_stock_is_excluded_from_features():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101", is_disposition=True)]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert features == []
+
+
+def test_build_stock_features_ky_stock_flagged_with_known_clean_status():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [
+        _make_candidate(
+            "1101",
+            stock_name="測試-KY",
+            is_attention=False,
+            is_disposition=False,
+            is_managed=False,
+        )
+    ]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    assert "KY_STOCK" in features[0].risk_flags
+    # attention/disposition/managed are all known False here, but
+    # consecutive_limit_up_days is always None -> still incomplete
+    assert features[0].risk_quality_raw is None
+
+
+def test_build_stock_features_one_price_limit_up_flagged():
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101", one_price_limit_up=True)]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    assert "ONE_PRICE_LIMIT_UP" in features[0].risk_flags
+
+
+def test_build_stock_features_unknown_status_never_yields_full_risk_quality():
+    """
+    Core regression for Step 2: a stock with no risk flags raised must
+    NOT get risk_quality_raw=1.0 when its underlying status is unknown
+    (the default/realistic case right now for every stock, since
+    is_attention/is_disposition/is_managed have no wired-in data
+    source). "No flags" here means "we didn't check," not "confirmed
+    clean" — build_risk_quality_raw() must return None, not 1.0.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]  # attention/disposition/managed all None
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    assert features[0].risk_flags == ()
+    assert features[0].risk_quality_raw is None  # NOT 1.0
+
+
+def test_build_stock_features_risk_assessment_failure_excludes_defensively(caplog):
+    """
+    If RiskPolicy.assess() itself raises for some reason, the stock is
+    excluded defensively (same "fail closed, never score with unknown
+    risk" posture as a hard exclusion) rather than silently getting a
+    None/1.0 risk_quality_raw.
+    """
+    from unittest.mock import patch
+
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    with patch(
+        "app.jobs.daily_ranking.is_one_price_limit_up",
+        side_effect=RuntimeError("simulated risk-input failure"),
+    ):
+        with caplog.at_level("ERROR", logger="daily_ranking"):
+            features = build_stock_features(
+                candidates=candidates,
+                target_date=TARGET_DATE,
+                finmind_client=client,
+                ingestion_run_id="run-1",
+                risk_policy=RiskPolicy(),
+            )
+
+    assert features == []
+    assert "Risk assessment failed for stock_id=1101" in caplog.text
+
+
+def test_build_stock_features_risk_gap_warning_logged(caplog):
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    with caplog.at_level("WARNING", logger="daily_ranking"):
+        build_stock_features(
+            candidates=candidates,
+            target_date=TARGET_DATE,
+            finmind_client=client,
+            ingestion_run_id="run-1",
+            risk_policy=RiskPolicy(),
+        )
+
+    assert "RiskPolicy input gap" in caplog.text
+
+
+def test_build_stock_features_risk_gap_warning_logged_even_with_no_candidates(caplog):
+    """The warning must fire unconditionally, before the empty-candidates
+    early return, so the gap stays visible on every call regardless of
+    candidate count."""
+    from app.jobs.daily_ranking import build_stock_features
+
+    client = FakeHistoryFinMindClient(rows_by_stock={})
+
+    with caplog.at_level("WARNING", logger="daily_ranking"):
+        features = build_stock_features(
+            candidates=[],
+            target_date=TARGET_DATE,
+            finmind_client=client,
+            ingestion_run_id="run-1",
+            risk_policy=RiskPolicy(),
+        )
+
+    assert features == []
+    assert "RiskPolicy input gap" in caplog.text

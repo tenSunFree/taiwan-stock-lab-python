@@ -12,6 +12,17 @@ risk_policy:
   allow_ky_stock: true
   allow_one_price_limit_up: true
 
+  # Mirrors app.domain.risk_policy.RISK_FLAG_PENALTIES by hand for
+  # now (no config loader reads this section yet) — same status as
+  # candidate.minimum_turnover/maximum_count above. strategy-v1
+  # provisional assumptions, must be tuned via backtesting.
+  penalties:
+    attention_stock: 0.15
+    ky_stock: 0.10
+    one_price_limit_up: 0.20
+    excessive_consecutive_limit_up: 0.30
+    high_five_day_return: 0.25
+
 weights:
   liquidity: 0.25
   volume_price: 0.20

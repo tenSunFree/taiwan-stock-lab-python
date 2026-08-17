@@ -38,9 +38,10 @@ class StockMaster:
     security_type: SecurityType
     industry: str | None = None
     is_active: bool = True
-    is_attention: bool = False  # under "attention" watch status
-    is_disposition: bool = False  # under disposition/restricted trading
-    is_managed: bool = False  # full-cash-delivery / managed stock
+    is_attention: bool | None = None  # under "attention" watch status; None = unknown
+    # under disposition/restricted trading; None = unknown
+    is_disposition: bool | None = None
+    is_managed: bool | None = None  # full-cash-delivery / managed stock; None = unknown
 
 
 @dataclass(frozen=True)

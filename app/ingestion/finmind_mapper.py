@@ -178,11 +178,13 @@ def build_stock_master(stock_info_rows: list[dict[str, Any]]) -> dict[str, Stock
             ),
             industry=industry,
             is_active=True,
-            # TaiwanStockInfo has no risk-status fields; defaults stay
-            # False until a dedicated risk-status source is wired in.
-            is_attention=False,
-            is_disposition=False,
-            is_managed=False,
+            # TaiwanStockInfo has no risk-status fields. None means
+            # "unknown", NOT "confirmed clean" — a dedicated
+            # attention/disposition/managed data source is not wired
+            # in yet. Do not change this to False.
+            is_attention=None,
+            is_disposition=None,
+            is_managed=None,
         )
     return result
 
