@@ -88,8 +88,17 @@ KNOWN LIMITATIONS in this checkpoint:
       whole-market failure policy above: one missing stock's
       history/flow/revenue is ordinary incompleteness; an entire
       market's data being unavailable is not.
-    - risk_quality_raw is still always None. RiskPolicy and scoring
-      are not wired into this job yet.
+    - RiskPolicy's is_attention/is_disposition/is_managed inputs and
+      consecutive_limit_up_days are always None (unknown) — no
+      wired-in data source exists for the former, and no reliable
+      historical reference-price source exists for the latter (see
+      app.domain.risk_inputs's module docstring). Consequently
+      risk_quality_raw is always None too (see
+      app.domain.risk_policy.build_risk_quality_raw's docstring for
+      why "no flags raised" must not be scored as "confirmed clean"
+      when the underlying inputs were never checked). A warning is
+      logged on every build_stock_features() call to keep this gap
+      visible rather than silently assumed fixed.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
       loaded from it — a config loader is separate follow-up work.
@@ -112,6 +121,8 @@ from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
 from app.domain.monthly_revenue_builder import build_revenue_yoy
+from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
+from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
     build_institutional_flow_points,
@@ -220,10 +231,12 @@ def build_stock_features(
     target_date: dt.date,
     finmind_client: FinMindClient,
     ingestion_run_id: str,
+    risk_policy: RiskPolicy,
 ) -> list[StockFeatures]:
     """
     Enrich candidate stocks with trailing historical price features,
-    institutional net-buy ratio, and monthly revenue YoY.
+    institutional net-buy ratio, monthly revenue YoY, and a risk
+    assessment.
 
     Today's close / volume / turnover always come from the already
     validated TWSE / TPEx candidate data. FinMind is queried only for
@@ -254,7 +267,25 @@ def build_stock_features(
         such a record, so seeing it here indicates an internal
         invariant violation, not ordinary enrichment-data absence —
         that raises immediately rather than being silently patched.
+
+    Risk assessment (block 4) is deliberately NOT part of the same
+    fail-soft family as blocks 1-3 — see the inline comment at that
+    block for why. is_attention/is_disposition/is_managed and
+    consecutive_limit_up_days are tri-state (bool|None / int|None):
+    None means unknown, never treated as False. Currently every stock
+    hits this gap (see the warning logged below), so risk_quality_raw
+    is None for every stock unless that changes.
     """
+    logger.warning(
+        "RiskPolicy input gap: is_attention/is_disposition/is_managed have "
+        "no wired-in data source and are always None (unknown), not False; "
+        "consecutive_limit_up_days is always None (no reliable historical "
+        "reference-price source — see app.domain.risk_inputs's module "
+        "docstring for why this is not reconstructed from raw closes). "
+        "risk_quality_raw is None for every stock affected by this gap — "
+        "see build_risk_quality_raw()'s docstring."
+    )
+
     if not candidates:
         logger.info("No candidates require enrichment")
         return []
@@ -275,6 +306,11 @@ def build_stock_features(
     revenue_success_count = 0
     revenue_none_count = 0
     revenue_failure_count = 0
+    risk_excluded_count = 0
+    risk_flagged_count = 0
+    risk_clean_count = 0
+    risk_incomplete_count = 0
+    risk_assessment_failure_count = 0
 
     for candidate in candidates:
         stock_id = candidate.stock.stock_id
@@ -421,6 +457,58 @@ def build_stock_features(
                 stock_id,
             )
 
+        # --- Block 4: risk assessment (hard exclusion + soft flags) ---
+        # Deliberately NOT symmetric with blocks 1-3: those fail-soft
+        # (leave a factor None, keep the stock). Risk assessment can
+        # hard-exclude a stock entirely (disposition/managed status),
+        # which is a "should this candidate exist at all" decision,
+        # not a "this one factor is missing" decision.
+        try:
+            one_price = is_one_price_limit_up(
+                price=candidate.price, limit_up_price=candidate.limit_up.limit_up_price
+            )
+            assessment = risk_policy.assess(
+                stock_id=stock_id,
+                is_attention=candidate.stock.is_attention,
+                is_disposition=candidate.stock.is_disposition,
+                is_managed=candidate.stock.is_managed,
+                is_ky=is_ky_stock(candidate.stock.stock_name),
+                is_one_price_limit_up=one_price,
+                # No reliable historical reference-price/limit-up
+                # source is wired in yet — see app.domain.risk_inputs's
+                # module docstring for why this is not reconstructed
+                # from raw closes as a heuristic.
+                consecutive_limit_up_days=None,
+                return_5d=return_5d,
+            )
+        except Exception:
+            risk_assessment_failure_count += 1
+            logger.exception(
+                "Risk assessment failed for stock_id=%s; excluding defensively "
+                "rather than scoring with unknown risk",
+                stock_id,
+            )
+            continue
+
+        if assessment.is_excluded:
+            risk_excluded_count += 1
+            logger.info(
+                "stock_id=%s excluded by RiskPolicy: %s",
+                stock_id,
+                assessment.exclusion_reason,
+            )
+            continue  # this candidate never becomes a StockFeatures
+
+        risk_flags = assessment.risk_flags
+        risk_quality_raw = build_risk_quality_raw(assessment)
+
+        if assessment.missing_inputs:
+            risk_incomplete_count += 1
+        elif risk_flags:
+            risk_flagged_count += 1
+        else:
+            risk_clean_count += 1
+
         stock_features = StockFeatures(
             stock_id=stock_id,
             turnover=float(today_turnover),
@@ -430,14 +518,16 @@ def build_stock_features(
             return_20d=return_20d,
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             revenue_yoy=revenue_yoy,
-            risk_quality_raw=None,  # follow-up
+            risk_quality_raw=risk_quality_raw,
+            risk_flags=risk_flags,
         )
         features.append(stock_features)
 
         logger.info(
             "features stock_id=%s turnover=%s avg_turnover_20d=%s "
             "volume_ratio_20d=%s return_5d=%s return_20d=%s "
-            "institutional_net_buy_ratio_5d=%s revenue_yoy=%s",
+            "institutional_net_buy_ratio_5d=%s revenue_yoy=%s "
+            "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
             stock_features.turnover,
             stock_features.average_turnover_20d,
@@ -446,6 +536,9 @@ def build_stock_features(
             stock_features.return_20d,
             stock_features.institutional_net_buy_ratio_5d,
             stock_features.revenue_yoy,
+            stock_features.risk_quality_raw,
+            stock_features.risk_flags,
+            assessment.missing_inputs,
         )
 
     logger.info(
@@ -468,6 +561,16 @@ def build_stock_features(
         revenue_success_count,
         revenue_none_count,
         revenue_failure_count,
+    )
+    logger.info(
+        "Risk assessment: candidates=%d excluded=%d flagged=%d clean=%d "
+        "incomplete=%d assessment_failed=%d",
+        len(candidates),
+        risk_excluded_count,
+        risk_flagged_count,
+        risk_clean_count,
+        risk_incomplete_count,
+        risk_assessment_failure_count,
     )
     return features
 
@@ -706,12 +809,15 @@ def run(
     candidates = candidate_builder.build(list(stock_master.values()), daily_prices)
     log_candidates(candidates)
 
-    # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue) ---
+    # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue + risk) ---
     features = build_stock_features(
         candidates=candidates,
         target_date=target_date,
         finmind_client=finmind_client,
         ingestion_run_id=ingestion_run_id,
+        # matches config/strategy-v1.yaml's risk_policy section by
+        # hand for now, same as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above
+        risk_policy=RiskPolicy(),
     )
     logger.info("Built StockFeatures for %d candidates", len(features))
 
