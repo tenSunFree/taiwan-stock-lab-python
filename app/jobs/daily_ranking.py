@@ -8,9 +8,15 @@ revenue YoY from FinMind, then applies RiskPolicy and multi-factor
 scoring to select a research-only Top 5. When REPORT_DRY_RUN is
 enabled, the selected results are adapted into the existing report
 view model and rendered as LINE-compatible text, then printed to
-stdout for manual inspection. This checkpoint deliberately has no
-external delivery side effect: it does not call the LINE Messaging
-API and does not write delivery state to the database.
+stdout for manual inspection — no LINE call, no DB write. When
+LINE_LIVE_PUSH is enabled, the same rendered report is delivered
+through DeliveryService — reserving a DB row first, then pushing to
+LINE, with idempotency guaranteed by MessageDelivery's UNIQUE
+constraint (see app.db.delivery_repository's module docstring): a
+rerun for the same trading_date/strategy_version/target/message_version
+is safely skipped rather than sending a duplicate message. Report
+content must therefore be deterministic for the same inputs — see
+DATA_UPDATED_LABEL below.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
@@ -122,6 +128,10 @@ from decimal import Decimal
 from app.domain.candidate_builder import Candidate, CandidateBuilder
 from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
+from app.clients.line_client import LineMessagingClient
+from app.db.delivery_repository import DeliveryRepository
+from app.db.models import MessageDelivery
+from app.delivery.service import DeliveryService
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
 from app.domain.models import StockMaster
 from app.domain.monthly_revenue_builder import build_revenue_yoy
@@ -158,6 +168,8 @@ from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.ingestion.twse_mapper import (
     roc_date_to_gregorian as twse_roc_date_to_gregorian,
 )
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("daily_ranking")
@@ -170,6 +182,22 @@ MAXIMUM_CANDIDATES = 50
 # Matches config/strategy-v1.yaml's strategy_version by hand for now,
 # same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
 STRATEGY_VERSION = "rule-v1.0.0"
+
+# Change only when the rendered report FORMAT changes (not the
+# content within it) — see app.clients.idempotency's module docstring
+# for why reusing a message_version for genuinely different content
+# is a bug, not a valid rerun.
+MESSAGE_VERSION = "text-v1"
+
+# CRITICAL for delivery idempotency: the same
+# trading_date + strategy_version + target + message_version MUST
+# render byte-identical content, or DeliveryRepository.reserve()
+# correctly raises DeliveryContentConflict on a same-day rerun instead
+# of returning SKIPPED_ALREADY_SENT (see app/db/delivery_repository.py's
+# module docstring). A wall-clock timestamp (e.g. datetime.now()) must
+# NEVER appear in report content for this reason — use a fixed label
+# instead.
+DATA_UPDATED_LABEL = "收盤後"
 
 # Retrieval buffer only — historical factors still use the trailing
 # 5/20 actual trading-day observations; 60 calendar days simply gives
@@ -210,6 +238,20 @@ def env_flag(name: str) -> bool:
     (LINE_DRY_RUN, ENABLE_DELIVERY, etc.) all agree on what counts as
     "on"."""
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ensure_delivery_table(engine) -> None:
+    """Temporary bootstrap for local/manual delivery validation.
+
+    Alembic is listed as a dependency (see requirements.txt) but a
+    migration workflow (alembic.ini / migrations env) is not wired
+    into this repository yet. This checkfirst=True create() is a
+    no-op against a database where the table already exists — fine
+    for local SQLite smoke tests, but production schema changes
+    should go through a real migration once one exists, not through
+    application startup silently creating tables.
+    """
+    MessageDelivery.__table__.create(engine, checkfirst=True)
 
 
 def resolve_target_date() -> dt.date:
@@ -662,6 +704,8 @@ def run(
     twse_client: TwseClient | None = None,
     tpex_client: TpexClient | None = None,
     finmind_client: FinMindClient | None = None,
+    delivery_repository: DeliveryRepository | None = None,
+    line_client: LineMessagingClient | None = None,
 ) -> int:
     if (
         twse_client is not None or tpex_client is not None or finmind_client is not None
@@ -905,15 +949,19 @@ def run(
     )
     log_top_five(top_five, stock_master)
 
-    # --- Step 7: report dry-run ---
-    # Explicit opt-in only. No LINE call and no delivery DB write occurs here.
-    if env_flag("REPORT_DRY_RUN"):
+    # --- Step 7: report rendering (shared by dry-run preview and live push) ---
+    report_dry_run = env_flag("REPORT_DRY_RUN")
+    line_live_push = env_flag("LINE_LIVE_PUSH")
+    report_text: str | None = None
+
+    if report_dry_run or line_live_push:
         report_stocks = build_report_stocks(
             top_five=top_five, stock_master=stock_master
         )
-        data_updated_at = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime(
-            "%H:%M"
-        )
+
+        # IMPORTANT: must stay deterministic for same-day idempotent
+        # reruns — see DATA_UPDATED_LABEL's definition above.
+        data_updated_at = DATA_UPDATED_LABEL
 
         if report_stocks:
             report_text = render_daily_report(
@@ -932,6 +980,8 @@ def run(
                 strategy_version=STRATEGY_VERSION,
             )
 
+    if report_dry_run:
+        assert report_text is not None
         report_length = utf16_length(report_text)
 
         print()
@@ -944,6 +994,85 @@ def run(
         print(f"UTF-16 length: {report_length} / {MAX_LINE_TEXT_UTF16_UNITS}")
         print("=" * 72)
         print()
+
+    # --- Step 8: LINE live push (real side effect — opt-in only) ---
+    if line_live_push:
+        assert report_text is not None
+
+        target_id = os.environ.get("LINE_TARGET_ID", "").strip()
+        if not target_id:
+            logger.error("LINE_LIVE_PUSH is enabled but LINE_TARGET_ID is missing")
+            return 1
+
+        if line_client is None:
+            channel_access_token = os.environ.get(
+                "LINE_CHANNEL_ACCESS_TOKEN", ""
+            ).strip()
+            if not channel_access_token:
+                logger.error(
+                    "LINE_LIVE_PUSH is enabled but LINE_CHANNEL_ACCESS_TOKEN is missing"
+                )
+                return 1
+            line_client = LineMessagingClient(channel_access_token=channel_access_token)
+
+        try:
+            if delivery_repository is not None:
+                # Injected (e.g. by a test) — ownership of the
+                # session's lifecycle belongs to the caller, not to
+                # this function. Do not close it here.
+                delivery_service = DeliveryService(
+                    repository=delivery_repository, line_client=line_client
+                )
+                delivery_result = delivery_service.deliver(
+                    trading_date=target_date,
+                    strategy_version=STRATEGY_VERSION,
+                    target_id=target_id,
+                    message_version=MESSAGE_VERSION,
+                    message=report_text,
+                )
+            else:
+                database_url = os.environ.get("DATABASE_URL", "").strip()
+                if not database_url:
+                    logger.error(
+                        "LINE_LIVE_PUSH is enabled but DATABASE_URL is missing"
+                    )
+                    return 1
+
+                engine = create_engine(database_url)
+                try:
+                    ensure_delivery_table(engine)
+                    with Session(engine) as session:
+                        delivery_service = DeliveryService(
+                            repository=DeliveryRepository(session),
+                            line_client=line_client,
+                        )
+                        delivery_result = delivery_service.deliver(
+                            trading_date=target_date,
+                            strategy_version=STRATEGY_VERSION,
+                            target_id=target_id,
+                            message_version=MESSAGE_VERSION,
+                            message=report_text,
+                        )
+                finally:
+                    engine.dispose()
+        except Exception:
+            logger.exception(
+                "LINE_LIVE_PUSH failed trading_date=%s strategy_version=%s "
+                "message_version=%s",
+                target_date,
+                STRATEGY_VERSION,
+                MESSAGE_VERSION,
+            )
+            return 1
+
+        logger.info(
+            "LINE_LIVE_PUSH result=%s trading_date=%s strategy_version=%s "
+            "message_version=%s",
+            delivery_result,
+            target_date,
+            STRATEGY_VERSION,
+            MESSAGE_VERSION,
+        )
 
     logger.info(
         "Provisional pipeline complete: %d raw snapshots, %d mapped stocks, "
