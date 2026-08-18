@@ -84,17 +84,27 @@ def render_daily_report(
     *,
     trading_date: dt.date,
     data_updated_at: str,
-    total_limit_up_count: int,
-    qualified_count: int,
+    candidate_count: int,
+    eligible_count: int,
     strategy_version: str,
     ranked_stocks: list[ReportStockView],
 ) -> str:
+    """
+    candidate_count: how many stocks entered CandidateBuilder's pool
+        (already filtered by minimum_turnover and capped at
+        maximum_candidates — NOT a raw "every limit-up common stock
+        in the whole market today" count).
+    eligible_count: how many of those cleared the RiskPolicy hard
+        exclusions and the scoring completeness gate
+        (data_completeness >= minimum_data_completeness), i.e. how
+        many were actually eligible to be considered for the Top 5.
+    """
     lines = [
         f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
         "",
         f"資料更新：{data_updated_at}",
-        f"收盤漲停普通股：{total_limit_up_count} 檔",
-        f"通過必要條件：{qualified_count} 檔",
+        f"進入候選池：{candidate_count} 檔",
+        f"通過資料完整度門檻：{eligible_count} 檔",
         f"策略版本：{strategy_version}",
         "",
     ]
@@ -136,7 +146,7 @@ def render_no_qualified_stock_report(
     *,
     trading_date: dt.date,
     data_updated_at: str,
-    total_limit_up_count: int,
+    candidate_count: int,
     strategy_version: str,
 ) -> str:
     """Some days will have limit-up stocks but none passing the
@@ -147,7 +157,7 @@ def render_no_qualified_stock_report(
             f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
             "",
             f"資料更新：{data_updated_at}",
-            f"收盤漲停普通股：{total_limit_up_count} 檔",
+            f"進入候選池：{candidate_count} 檔",
             "今日無符合資料完整度門檻的候選股，暫無 Top 5 名單。",
             f"策略版本：{strategy_version}",
             "",

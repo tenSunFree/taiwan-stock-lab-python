@@ -16,8 +16,8 @@ def test_report_contains_disclaimer():
     report = render_daily_report(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
-        total_limit_up_count=18,
-        qualified_count=12,
+        candidate_count=18,
+        eligible_count=12,
         strategy_version="rule-v1.0.0",
         ranked_stocks=[],
     )
@@ -37,8 +37,8 @@ def test_report_never_contains_banned_phrases():
     report = render_daily_report(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
-        total_limit_up_count=18,
-        qualified_count=12,
+        candidate_count=18,
+        eligible_count=12,
         strategy_version="rule-v1.0.0",
         ranked_stocks=[stock],
     )
@@ -60,8 +60,8 @@ def test_report_includes_stock_info_and_risk_text():
     report = render_daily_report(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
-        total_limit_up_count=18,
-        qualified_count=12,
+        candidate_count=18,
+        eligible_count=12,
         strategy_version="rule-v1.0.0",
         ranked_stocks=[stock],
     )
@@ -71,15 +71,36 @@ def test_report_includes_stock_info_and_risk_text():
     assert "近 5 日累積漲幅偏高" in report
 
 
+def test_report_uses_candidate_and_completeness_labels():
+    """
+    Regression test for the count-semantics fix: candidate_count is
+    the CandidateBuilder pool size (already turnover-filtered and
+    capped at maximum_candidates), NOT a raw whole-market limit-up
+    count — and eligible_count is specifically "cleared the
+    completeness gate," not just "scored."
+    """
+    report = render_daily_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=18,
+        eligible_count=12,
+        strategy_version="rule-v1.0.0",
+        ranked_stocks=[],
+    )
+    assert "進入候選池：18 檔" in report
+    assert "通過資料完整度門檻：12 檔" in report
+
+
 def test_no_qualified_stock_report_still_sends_disclaimer():
     report = render_no_qualified_stock_report(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
-        total_limit_up_count=5,
+        candidate_count=5,
         strategy_version="rule-v1.0.0",
     )
     assert DISCLAIMER in report
     assert "今日無符合資料完整度門檻的候選股" in report
+    assert "進入候選池：5 檔" in report
 
 
 def test_top_factors_picks_highest_scores_only():

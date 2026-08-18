@@ -410,3 +410,68 @@ def test_fetch_stock_monthly_revenue_http_error_does_not_save():
             target_date=dt.date(2026, 8, 15),
         )
     assert repo.saved == []
+
+
+def test_fetch_and_snapshot_retries_on_read_timeout_then_succeeds(monkeypatch):
+    """
+    Regression test tied to the real incident: TWSE's DNS-round-robin
+    pool sometimes routes to an unhealthy node. A ReadTimeout on the
+    first attempt(s) must not fail the whole call if a later attempt
+    succeeds.
+    """
+    monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            raise httpx.ReadTimeout("simulated timeout", request=request)
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    result = client.fetch_stock_info(
+        ingestion_run_id="run-1", target_date=dt.date(2026, 8, 18)
+    )
+
+    assert call_count["n"] == 3
+    assert len(repo.saved) == 1
+
+
+def test_fetch_and_snapshot_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated timeout", request=request)
+
+    client, repo = make_client(handler)
+    with pytest.raises(httpx.ReadTimeout):
+        client.fetch_stock_info(
+            ingestion_run_id="run-1", target_date=dt.date(2026, 8, 18)
+        )
+
+    assert repo.saved == []
+
+
+def test_fetch_and_snapshot_does_not_retry_http_error_status(monkeypatch):
+    """
+    HTTPStatusError (4xx/5xx) is a different failure mode from a
+    timeout — the server explicitly responded with an error. This
+    must fail immediately on the first attempt, not be retried.
+    """
+    monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(500, json={"error": "server error"})
+
+    client, repo = make_client(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_stock_info(
+            ingestion_run_id="run-1", target_date=dt.date(2026, 8, 18)
+        )
+
+    assert call_count["n"] == 1  # no retry for HTTP error status
+    assert repo.saved == []
