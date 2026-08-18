@@ -5,10 +5,12 @@ Wires real market data from BOTH TWSE (listed) and TPEx (OTC) through
 to CandidateBuilder, then enriches each candidate with trailing
 historical price features, institutional net-buy ratio, and monthly
 revenue YoY from FinMind, then applies RiskPolicy and multi-factor
-scoring to select a research-only Top 5. Deliberately stops after
-Top 5 is logged — no report rendering or LINE delivery yet — so a
-wrong or incomplete candidate pool / feature set can be diagnosed
-without the rest of the pipeline in the way.
+scoring to select a research-only Top 5. When REPORT_DRY_RUN is
+enabled, the selected results are adapted into the existing report
+view model and rendered as LINE-compatible text, then printed to
+stdout for manual inspection. This checkpoint deliberately has no
+external delivery side effect: it does not call the LINE Messaging
+API and does not write delivery state to the database.
 
 Data sources (see architecture discussion: FinMind's free tier
 requires a per-stock data_id, making a whole-market daily scan
@@ -126,6 +128,13 @@ from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.domain.scoring import ScoredStock, score_candidates, select_top_five
+from app.reports.report_builder import build_report_stocks
+from app.reports.text_renderer import (
+    MAX_LINE_TEXT_UTF16_UNITS,
+    render_daily_report,
+    render_no_qualified_stock_report,
+    utf16_length,
+)
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
     build_institutional_flow_points,
@@ -158,6 +167,10 @@ logger = logging.getLogger("daily_ranking")
 MINIMUM_TURNOVER = Decimal("50000000")
 MAXIMUM_CANDIDATES = 50
 
+# Matches config/strategy-v1.yaml's strategy_version by hand for now,
+# same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
+STRATEGY_VERSION = "rule-v1.0.0"
+
 # Retrieval buffer only — historical factors still use the trailing
 # 5/20 actual trading-day observations; 60 calendar days simply gives
 # FinMind enough room to cover weekends and market holidays.
@@ -189,6 +202,14 @@ class InMemoryRawPayloadRepository:
             payload.target_date,
             payload.payload_hash[:8],
         )
+
+
+def env_flag(name: str) -> bool:
+    """Parse a boolean-ish environment variable. Centralizes truthy
+    parsing so REPORT_DRY_RUN and any future feature flags
+    (LINE_DRY_RUN, ENABLE_DELIVERY, etc.) all agree on what counts as
+    "on"."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def resolve_target_date() -> dt.date:
@@ -883,6 +904,46 @@ def run(
         minimum_data_completeness * 100,
     )
     log_top_five(top_five, stock_master)
+
+    # --- Step 7: report dry-run ---
+    # Explicit opt-in only. No LINE call and no delivery DB write occurs here.
+    if env_flag("REPORT_DRY_RUN"):
+        report_stocks = build_report_stocks(
+            top_five=top_five, stock_master=stock_master
+        )
+        data_updated_at = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime(
+            "%H:%M"
+        )
+
+        if report_stocks:
+            report_text = render_daily_report(
+                trading_date=target_date,
+                data_updated_at=data_updated_at,
+                candidate_count=len(candidates),
+                eligible_count=eligible_count,
+                strategy_version=STRATEGY_VERSION,
+                ranked_stocks=report_stocks,
+            )
+        else:
+            report_text = render_no_qualified_stock_report(
+                trading_date=target_date,
+                data_updated_at=data_updated_at,
+                candidate_count=len(candidates),
+                strategy_version=STRATEGY_VERSION,
+            )
+
+        report_length = utf16_length(report_text)
+
+        print()
+        print("=" * 72)
+        print("REPORT_DRY_RUN preview")
+        print("NOT sent to LINE / NOT written to delivery DB")
+        print("=" * 72)
+        print(report_text)
+        print("=" * 72)
+        print(f"UTF-16 length: {report_length} / {MAX_LINE_TEXT_UTF16_UNITS}")
+        print("=" * 72)
+        print()
 
     logger.info(
         "Provisional pipeline complete: %d raw snapshots, %d mapped stocks, "

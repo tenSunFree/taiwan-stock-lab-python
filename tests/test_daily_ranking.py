@@ -1090,3 +1090,143 @@ def test_build_stock_features_risk_gap_warning_logged_even_with_no_candidates(ca
 
     assert features == []
     assert "RiskPolicy input gap" in caplog.text
+
+
+def test_run_report_dry_run_off_by_default_prints_no_report(capsys, monkeypatch):
+    """
+    REPORT_DRY_RUN is opt-in. When unset, Step 4 must not print a
+    rendered report or create any delivery side effect.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.delenv("REPORT_DRY_RUN", raising=False)
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "REPORT_DRY_RUN preview" not in captured.out
+    assert "NOT sent to LINE" not in captured.out
+
+
+def test_run_report_dry_run_prints_no_qualified_report(capsys, monkeypatch, caplog):
+    """
+    With REPORT_DRY_RUN=true and a candidate that has no institutional/
+    revenue data (as these fixtures produce, since make_all_clients()
+    returns the same stock_info payload for every FinMind dataset),
+    the stock falls below the completeness threshold, so the
+    "no qualified stock" report path must be used — and it must still
+    be printed, not skipped.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    # Make the fixture assumption explicit: this test must genuinely
+    # exercise the zero-eligible path, not accidentally pass some
+    # other way if the fixture behavior ever changes.
+    assert "eligible=0" in caplog.text
+
+    captured = capsys.readouterr()
+    assert "REPORT_DRY_RUN preview" in captured.out
+    assert "NOT sent to LINE" in captured.out
+    assert "進入候選池：1 檔" in captured.out
+    assert "今日無符合資料完整度門檻的候選股" in captured.out
+    assert "本清單依公開市場資料及固定量化規則產生" in captured.out
+    assert "UTF-16 length:" in captured.out
+
+
+def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
+    """
+    Positive path: when score_candidates() produces a stock that
+    clears the completeness gate, the rendered report must actually
+    show its rank/name/score/factors — not just fall through to the
+    no-qualified path. Patches score_candidates() at the boundary
+    since FinMind price/institutional/revenue enrichment is already
+    covered by Steps 1-3's own tests; this test's job is only to
+    verify ScoredStock -> select_top_five -> report_builder ->
+    renderer -> stdout is wired correctly.
+    """
+    from unittest.mock import patch
+
+    from app.domain.scoring import ScoredStock
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    fake_scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=82.5,
+            data_completeness=0.90,
+            factor_scores={
+                "liquidity": 90.0,
+                "volume_price": 80.0,
+                "momentum": 75.0,
+                "institutional": 70.0,
+                "fundamental": 85.0,
+                "risk_quality": None,
+            },
+            risk_flags=(),
+        )
+    ]
+
+    with patch("app.jobs.daily_ranking.score_candidates", return_value=fake_scored):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "REPORT_DRY_RUN preview" in captured.out
+    assert "1. 測試水泥（1101）" in captured.out
+    assert "綜合分數：82.50" in captured.out
+    assert "資料完整度：90%" in captured.out
+    assert "主要優勢：" in captured.out
+    assert "・流動性" in captured.out
+    assert "・基本面" in captured.out

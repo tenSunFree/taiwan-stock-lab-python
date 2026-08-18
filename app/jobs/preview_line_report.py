@@ -11,6 +11,8 @@ import datetime as dt
 
 from app.reports.text_renderer import ReportStockView, render_daily_report
 
+TAIPEI_TZ = dt.timezone(dt.timedelta(hours=8))
+
 
 def main() -> None:
     stocks = [
@@ -34,11 +36,13 @@ def main() -> None:
         ),
     ]
 
+    now_taipei = dt.datetime.now(TAIPEI_TZ)
+
     report = render_daily_report(
-        trading_date=dt.date.today(),
-        data_updated_at=dt.datetime.now().strftime("%H:%M"),
-        total_limit_up_count=18,
-        qualified_count=12,
+        trading_date=now_taipei.date(),
+        data_updated_at=now_taipei.strftime("%H:%M"),
+        candidate_count=18,
+        eligible_count=12,
         strategy_version="rule-v1.0.0",
         ranked_stocks=stocks,
     )

@@ -23,11 +23,15 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+
+logger = logging.getLogger("market_data_client")
 
 
 def new_ingestion_run_id(now: dt.datetime | None = None) -> str:
@@ -100,9 +104,61 @@ class MarketDataClient:
         fetch_fn: () -> tuple[raw_payload: Any, source_updated_at: dt.datetime | None]
         Injected by each subclass (FinMindClient, etc.) to perform the
         actual API call.
+
+        Transient read/connect timeouts to TWSE/TPEx are a known,
+        recurring condition: their public endpoints are served by a
+        DNS round-robin pool of backend nodes, and it's common for a
+        subset of those nodes to be temporarily unhealthy while
+        others respond normally within milliseconds (confirmed by
+        testing all 8 www.twse.com.tw IPs directly — 6 timed out, 2
+        responded in ~0.06s). A retry gives the next attempt a chance
+        to land on a healthy node via DNS re-resolution, rather than
+        being permanently blocked by one bad node.
+
+        Deliberately scoped to ReadTimeout/ConnectTimeout only — an
+        HTTP error status (4xx/5xx, raised as HTTPStatusError by each
+        subclass's response.raise_for_status()) is a DIFFERENT
+        failure mode: the request reached the server and was
+        explicitly rejected. Retrying that blindly could hammer a
+        server that's already signaling a problem, so it is
+        intentionally NOT retried here.
         """
+        MAX_FETCH_ATTEMPTS = 3
+        RETRY_BACKOFF_BASE_SECONDS = 2.0
+
         requested_at = dt.datetime.now(dt.timezone.utc)
-        raw_payload, source_updated_at = fetch_fn()
+
+        raw_payload = None
+        source_updated_at = None
+        last_timeout_error: httpx.TimeoutException | None = None
+
+        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+            try:
+                raw_payload, source_updated_at = fetch_fn()
+                last_timeout_error = None
+                break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+                last_timeout_error = exc
+                if attempt == MAX_FETCH_ATTEMPTS:
+                    break
+                wait_seconds = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "source=%s attempt=%d/%d timed out (%s); retrying in %.0fs",
+                    self.source_name,
+                    attempt,
+                    MAX_FETCH_ATTEMPTS,
+                    type(exc).__name__,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+
+        if last_timeout_error is not None:
+            logger.error(
+                "source=%s all %d attempts timed out; giving up",
+                self.source_name,
+                MAX_FETCH_ATTEMPTS,
+            )
+            raise last_timeout_error
 
         payload = RawSourcePayload(
             ingestion_run_id=ingestion_run_id,
@@ -348,10 +404,9 @@ class FinMindClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
-    # Other datasets (margin/short balance, monthly revenue, etc.)
-    # follow the same pattern, each mapped to the corresponding
-    # FinMind dataset name — check FinMind's current docs before
-    # implementing.
+    # Other datasets (margin/short balance, etc.) follow the same
+    # pattern, each mapped to the corresponding FinMind dataset name —
+    # check FinMind's current docs before implementing.
 
 
 class TwseClient(MarketDataClient):
@@ -474,51 +529,3 @@ class MopsClient(MarketDataClient):
     # announcements — must record available_at (when the data actually
     # became available), not just the month it refers to, for use in
     # future backtesting (see the "event quality" factor).
-
-
-def fetch_stock_monthly_revenue(
-    self,
-    *,
-    ingestion_run_id: str,
-    stock_id: str,
-    start_date: dt.date,
-    end_date: dt.date,
-    target_date: dt.date,
-) -> RawSourcePayload:
-    """
-    Fetch TaiwanStockMonthRevenue for one stock.
-
-    Taiwan-listed companies must disclose monthly revenue by the 10th
-    of the following month, so target_date's own month is typically
-    NOT yet disclosed when this job runs. start_date/end_date should
-    span well over a year back so both the latest disclosed month and
-    the same month a year earlier are present in the response — but
-    the real look-ahead guard is available_at in
-    app.domain.monthly_revenue_builder, not this query window.
-    """
-    stock_id = stock_id.strip()
-    if not stock_id:
-        raise ValueError("stock_id must not be empty")
-    if start_date > end_date:
-        raise ValueError("start_date must not be after end_date")
-
-    params = {
-        "dataset": "TaiwanStockMonthRevenue",
-        "data_id": stock_id,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-    }
-
-    def _fetch():
-        response = self.http_client.get(
-            self.base_url, params=params, headers=self._auth_headers()
-        )
-        response.raise_for_status()
-        return response.json(), None
-
-    return self.fetch_and_snapshot(
-        ingestion_run_id=ingestion_run_id,
-        target_date=target_date,
-        request_parameters=params,
-        fetch_fn=_fetch,
-    )
