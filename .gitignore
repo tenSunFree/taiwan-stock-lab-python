@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SQLite local databases (Step 5 delivery smoke test, etc.)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
