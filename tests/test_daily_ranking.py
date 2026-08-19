@@ -1256,96 +1256,6 @@ def test_run_line_live_push_off_by_default_does_not_touch_delivery(monkeypatch):
     assert result == 0
 
 
-def test_run_line_live_push_requires_target_id(monkeypatch):
-    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
-    monkeypatch.setenv("LINE_LIVE_PUSH", "true")
-    monkeypatch.delenv("LINE_TARGET_ID", raising=False)
-
-    repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-    )
-
-    result = run(
-        repository=repository,
-        twse_client=twse_client,
-        tpex_client=tpex_client,
-        finmind_client=finmind_client,
-    )
-
-    assert result == 1
-
-
-def test_run_line_live_push_delivers_and_is_idempotent_on_rerun(monkeypatch, tmp_path):
-    """
-    End-to-end (with injected delivery_repository/line_client so no
-    real DB or LINE API is touched): first run delivers and marks
-    SUCCESS; an identical rerun for the same trading_date must be
-    skipped, not re-send. This only works because report content is
-    deterministic (DATA_UPDATED_LABEL, not a wall-clock timestamp) —
-    see the next test for a targeted regression on that specifically.
-    """
-    import httpx
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import Session
-
-    from app.clients.line_client import LineMessagingClient
-    from app.db.delivery_repository import DeliveryRepository
-    from app.db.models import MessageDelivery
-
-    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
-    monkeypatch.setenv("LINE_LIVE_PUSH", "true")
-    monkeypatch.setenv("LINE_TARGET_ID", "U-test-target")
-
-    db_path = tmp_path / "delivery_test.db"
-    engine = create_engine(f"sqlite:///{db_path}")
-    MessageDelivery.__table__.create(engine)
-
-    call_count = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_count["n"] += 1
-        return httpx.Response(200, headers={"x-line-request-id": "req-1"})
-
-    def make_run_kwargs():
-        repository = InMemoryRawPayloadRepository()
-        twse_client, tpex_client, finmind_client = make_all_clients(
-            repository=repository,
-            twse_csv=TWSE_CSV_LIMIT_UP,
-            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-            stock_info_data=_merged_stock_info(
-                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-            ),
-        )
-        session = Session(engine)
-        line_client = LineMessagingClient(
-            channel_access_token="fake-token",
-            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-            initial_backoff_seconds=0,
-        )
-        return dict(
-            repository=repository,
-            twse_client=twse_client,
-            tpex_client=tpex_client,
-            finmind_client=finmind_client,
-            delivery_repository=DeliveryRepository(session),
-            line_client=line_client,
-        )
-
-    first_result = run(**make_run_kwargs())
-    assert first_result == 0
-    assert call_count["n"] == 1
-
-    second_result = run(**make_run_kwargs())
-    assert second_result == 0
-    assert call_count["n"] == 1  # still 1, not 2 -- proves SKIPPED_ALREADY_SENT worked
-
-
 def test_run_report_text_is_deterministic_for_same_inputs(capsys, monkeypatch):
     """
     Direct regression test for the idempotency prerequisite: two
@@ -1384,3 +1294,129 @@ def test_run_report_text_is_deterministic_for_same_inputs(capsys, monkeypatch):
     second_output = run_once()
 
     assert first_output == second_output
+
+
+def test_run_line_delivery_mode_off_by_default_does_not_touch_delivery(monkeypatch):
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.delenv("LINE_DELIVERY_MODE", raising=False)
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+    assert result == 0
+
+
+def test_run_line_delivery_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("LINE_DELIVERY_MODE", "not-a-real-mode")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+    assert result == 1
+
+
+def test_run_line_delivery_mode_push_requires_target_id(monkeypatch):
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("LINE_DELIVERY_MODE", "push")
+    monkeypatch.delenv("LINE_TARGET_ID", raising=False)
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+    assert result == 1
+
+
+def test_run_line_delivery_mode_broadcast_does_not_require_target_id(
+    monkeypatch, tmp_path
+):
+    """broadcast mode must NOT fail just because LINE_TARGET_ID is unset."""
+    import httpx
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from app.clients.line_client import LineMessagingClient
+    from app.db.delivery_repository import DeliveryRepository
+    from app.db.models import MessageDelivery
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("LINE_DELIVERY_MODE", "broadcast")
+    monkeypatch.delenv("LINE_TARGET_ID", raising=False)
+
+    db_path = tmp_path / "delivery_broadcast_test.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    MessageDelivery.__table__.create(engine)
+
+    call_log = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, headers={"x-line-request-id": "req-1"})
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+    session = Session(engine)
+    line_client = LineMessagingClient(
+        channel_access_token="fake-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        initial_backoff_seconds=0,
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+        delivery_repository=DeliveryRepository(session),
+        line_client=line_client,
+    )
+
+    assert result == 0
+    assert len(call_log) == 1
+    assert call_log[0].endswith("/v2/bot/message/broadcast")

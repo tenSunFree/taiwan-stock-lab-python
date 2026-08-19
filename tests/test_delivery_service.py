@@ -140,3 +140,77 @@ def test_non_retryable_failure_marks_delivery_failed_and_raises(session):
             message_version="text-v1",
             message="today's report",
         )
+
+
+def test_first_broadcast_sends_and_marks_success(session):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"x-line-request-id": "req-broadcast-1"})
+
+    service = make_service(session, handler)
+    result = service.deliver_broadcast(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        message_version="text-v1",
+        message="today's report to everyone",
+    )
+    assert result == "SUCCESS"
+
+
+def test_broadcast_rerun_is_skipped_without_calling_line(session):
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, headers={"x-line-request-id": "req-broadcast-1"})
+
+    service = make_service(session, handler)
+    service.deliver_broadcast(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        message_version="text-v1",
+        message="today's report to everyone",
+    )
+    assert call_count["n"] == 1
+
+    second_result = service.deliver_broadcast(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        message_version="text-v1",
+        message="today's report to everyone",
+    )
+    assert second_result == "SKIPPED_ALREADY_SENT"
+    assert call_count["n"] == 1
+
+
+def test_broadcast_and_push_are_independent_deliveries(session):
+    """
+    A push to a specific target and a broadcast for the same
+    trading_date/strategy_version/message_version must be tracked as
+    two SEPARATE deliveries (different idempotency keys), since
+    BROADCAST_DELIVERY_SCOPE is distinct from any real target_id.
+    """
+    call_log = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, headers={"x-line-request-id": "req-x"})
+
+    service = make_service(session, handler)
+
+    push_result = service.deliver(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        target_id="U123",
+        message_version="text-v1",
+        message="same content",
+    )
+    broadcast_result = service.deliver_broadcast(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.0.0",
+        message_version="text-v1",
+        message="same content",
+    )
+
+    assert push_result == "SUCCESS"
+    assert broadcast_result == "SUCCESS"
+    assert len(call_log) == 2  # both actually called LINE, not skipped
