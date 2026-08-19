@@ -8,13 +8,17 @@ revenue YoY from FinMind, then applies RiskPolicy and multi-factor
 scoring to select a research-only Top 5. When REPORT_DRY_RUN is
 enabled, the selected results are adapted into the existing report
 view model and rendered as LINE-compatible text, then printed to
-stdout for manual inspection — no LINE call, no DB write. When
-LINE_LIVE_PUSH is enabled, the same rendered report is delivered
-through DeliveryService — reserving a DB row first, then pushing to
-LINE, with idempotency guaranteed by MessageDelivery's UNIQUE
-constraint (see app.db.delivery_repository's module docstring): a
-rerun for the same trading_date/strategy_version/target/message_version
-is safely skipped rather than sending a duplicate message. Report
+stdout for manual inspection — no LINE call, no DB write.
+LINE_DELIVERY_MODE controls real delivery through DeliveryService:
+"off" (default) does nothing; "push" sends to a single LINE_TARGET_ID
+(for testing a report-format change without notifying every
+subscriber); "broadcast" sends to every friend of this Official
+Account (the real daily delivery to family/subscribers). Both live
+modes reserve a DB row before calling LINE, with idempotency
+guaranteed by MessageDelivery's UNIQUE constraint (see
+app.db.delivery_repository's module docstring): a rerun for the same
+trading_date/strategy_version/delivery-scope/message_version is
+safely skipped rather than sending a duplicate message. Report
 content must therefore be deterministic for the same inputs — see
 DATA_UPDATED_LABEL below.
 
@@ -949,12 +953,21 @@ def run(
     )
     log_top_five(top_five, stock_master)
 
-    # --- Step 7: report rendering (shared by dry-run preview and live push) ---
+    # --- Step 7: report rendering (shared by dry-run preview and live delivery) ---
     report_dry_run = env_flag("REPORT_DRY_RUN")
-    line_live_push = env_flag("LINE_LIVE_PUSH")
+    line_delivery_mode = os.environ.get("LINE_DELIVERY_MODE", "off").strip().lower()
+
+    if line_delivery_mode not in {"off", "push", "broadcast"}:
+        logger.error(
+            "Invalid LINE_DELIVERY_MODE=%r; expected off, push, or broadcast",
+            line_delivery_mode,
+        )
+        return 1
+
+    line_live_delivery = line_delivery_mode != "off"
     report_text: str | None = None
 
-    if report_dry_run or line_live_push:
+    if report_dry_run or line_live_delivery:
         report_stocks = build_report_stocks(
             top_five=top_five, stock_master=stock_master
         )
@@ -995,14 +1008,22 @@ def run(
         print("=" * 72)
         print()
 
-    # --- Step 8: LINE live push (real side effect — opt-in only) ---
-    if line_live_push:
+    # --- Step 8: LINE live delivery (real side effect — opt-in only) ---
+    # off       -> no LINE call, no DB write (default)
+    # push      -> send to ONE target (LINE_TARGET_ID) — for testing a
+    #              report-format change without notifying every
+    #              subscriber
+    # broadcast -> send to ALL friends of this Official Account — the
+    #              real daily delivery to family/subscribers
+    if line_live_delivery:
         assert report_text is not None
 
-        target_id = os.environ.get("LINE_TARGET_ID", "").strip()
-        if not target_id:
-            logger.error("LINE_LIVE_PUSH is enabled but LINE_TARGET_ID is missing")
-            return 1
+        target_id: str | None = None
+        if line_delivery_mode == "push":
+            target_id = os.environ.get("LINE_TARGET_ID", "").strip()
+            if not target_id:
+                logger.error("LINE_DELIVERY_MODE=push requires LINE_TARGET_ID")
+                return 1
 
         if line_client is None:
             channel_access_token = os.environ.get(
@@ -1010,10 +1031,28 @@ def run(
             ).strip()
             if not channel_access_token:
                 logger.error(
-                    "LINE_LIVE_PUSH is enabled but LINE_CHANNEL_ACCESS_TOKEN is missing"
+                    "LINE_DELIVERY_MODE=%s is enabled but "
+                    "LINE_CHANNEL_ACCESS_TOKEN is missing",
+                    line_delivery_mode,
                 )
                 return 1
             line_client = LineMessagingClient(channel_access_token=channel_access_token)
+
+        def _run_delivery(service: DeliveryService) -> str:
+            if line_delivery_mode == "push":
+                return service.deliver(
+                    trading_date=target_date,
+                    strategy_version=STRATEGY_VERSION,
+                    target_id=target_id,
+                    message_version=MESSAGE_VERSION,
+                    message=report_text,
+                )
+            return service.deliver_broadcast(
+                trading_date=target_date,
+                strategy_version=STRATEGY_VERSION,
+                message_version=MESSAGE_VERSION,
+                message=report_text,
+            )
 
         try:
             if delivery_repository is not None:
@@ -1023,18 +1062,13 @@ def run(
                 delivery_service = DeliveryService(
                     repository=delivery_repository, line_client=line_client
                 )
-                delivery_result = delivery_service.deliver(
-                    trading_date=target_date,
-                    strategy_version=STRATEGY_VERSION,
-                    target_id=target_id,
-                    message_version=MESSAGE_VERSION,
-                    message=report_text,
-                )
+                delivery_result = _run_delivery(delivery_service)
             else:
                 database_url = os.environ.get("DATABASE_URL", "").strip()
                 if not database_url:
                     logger.error(
-                        "LINE_LIVE_PUSH is enabled but DATABASE_URL is missing"
+                        "LINE_DELIVERY_MODE=%s is enabled but DATABASE_URL is missing",
+                        line_delivery_mode,
                     )
                     return 1
 
@@ -1046,19 +1080,14 @@ def run(
                             repository=DeliveryRepository(session),
                             line_client=line_client,
                         )
-                        delivery_result = delivery_service.deliver(
-                            trading_date=target_date,
-                            strategy_version=STRATEGY_VERSION,
-                            target_id=target_id,
-                            message_version=MESSAGE_VERSION,
-                            message=report_text,
-                        )
+                        delivery_result = _run_delivery(delivery_service)
                 finally:
                     engine.dispose()
         except Exception:
             logger.exception(
-                "LINE_LIVE_PUSH failed trading_date=%s strategy_version=%s "
+                "LINE_DELIVERY_MODE=%s failed trading_date=%s strategy_version=%s "
                 "message_version=%s",
+                line_delivery_mode,
                 target_date,
                 STRATEGY_VERSION,
                 MESSAGE_VERSION,
@@ -1066,8 +1095,9 @@ def run(
             return 1
 
         logger.info(
-            "LINE_LIVE_PUSH result=%s trading_date=%s strategy_version=%s "
+            "LINE delivery mode=%s result=%s trading_date=%s strategy_version=%s "
             "message_version=%s",
+            line_delivery_mode,
             delivery_result,
             target_date,
             STRATEGY_VERSION,

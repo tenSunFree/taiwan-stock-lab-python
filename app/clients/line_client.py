@@ -1,12 +1,13 @@
 """
-LINE Messaging API push client.
+LINE Messaging API push/broadcast client.
 
 Retry-key discipline (verified against LINE's official docs at
 https://developers.line.biz/en/docs/messaging-api/retrying-api-request/):
-    - One logical push attempt = one X-Line-Retry-Key (UUID), decided
+    - One logical send attempt = one X-Line-Retry-Key (UUID), decided
       BEFORE the first HTTP call and reused for every retry of that
       same attempt. Generating a new key on each retry defeats the
-      whole point of the mechanism.
+      whole point of the mechanism. This applies identically to Push,
+      Multicast, and Broadcast endpoints.
     - If a request with a given retry key has already been accepted,
       resending it (even after a timeout) returns 409 Conflict with an
       `x-line-accepted-request-id` header pointing at the original
@@ -20,6 +21,13 @@ https://developers.line.biz/en/docs/messaging-api/retrying-api-request/):
 This uses a hand-rolled retry loop instead of a decorator-based retry
 library specifically so the retry key can be pinned once, outside the
 loop, and reused across every attempt inside it.
+
+push_text() and broadcast_text() share a single _send_text_request()
+implementation — the only difference between a Push and a Broadcast
+call is the endpoint URL and whether the payload has a `to` field.
+Keeping the retry/409/4xx/5xx handling in one place means a future
+change to that logic (e.g. adjusting backoff, handling a new status
+code) can't silently apply to one send mode and not the other.
 """
 
 from __future__ import annotations
@@ -33,10 +41,11 @@ import httpx
 from app.clients.idempotency import create_line_retry_key
 
 LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push"
+LINE_BROADCAST_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
 
 
 class LinePushError(RuntimeError):
-    """Raised when a push ultimately fails after exhausting retries,
+    """Raised when a send ultimately fails after exhausting retries,
     or on a network error with no retries left."""
 
 
@@ -76,6 +85,37 @@ class LineMessagingClient:
     def push_text(
         self, *, target_id: str, text: str, retry_key: UUID | None = None
     ) -> LinePushResult:
+        """Send to ONE specific user/group/room. Does not reveal
+        anything about who else may or may not receive this text —
+        see broadcast_text() for "send to every friend of this OA"."""
+        payload = {"to": target_id, "messages": [{"type": "text", "text": text}]}
+        return self._send_text_request(
+            endpoint=LINE_PUSH_ENDPOINT, payload=payload, retry_key=retry_key
+        )
+
+    def broadcast_text(
+        self, *, text: str, retry_key: UUID | None = None
+    ) -> LinePushResult:
+        """
+        Send to ALL friends of this Official Account — no `to` field,
+        unlike push_text(). Same retry-key/409/4xx/5xx discipline,
+        via the shared _send_text_request(). The lack of a single
+        target_id matters one layer up: see
+        app.delivery.service.DeliveryService.deliver_broadcast()'s
+        docstring for how idempotency is handled without one.
+        """
+        payload = {"messages": [{"type": "text", "text": text}]}
+        return self._send_text_request(
+            endpoint=LINE_BROADCAST_ENDPOINT, payload=payload, retry_key=retry_key
+        )
+
+    def _send_text_request(
+        self,
+        *,
+        endpoint: str,
+        payload: dict,
+        retry_key: UUID | None,
+    ) -> LinePushResult:
         actual_retry_key = retry_key or create_line_retry_key()
 
         headers = {
@@ -83,14 +123,11 @@ class LineMessagingClient:
             "Content-Type": "application/json",
             "X-Line-Retry-Key": str(actual_retry_key),
         }
-        payload = {"to": target_id, "messages": [{"type": "text", "text": text}]}
         client = self._get_client()
 
         for attempt in range(1, self.max_attempts + 1):
             try:
-                response = client.post(
-                    LINE_PUSH_ENDPOINT, headers=headers, json=payload
-                )
+                response = client.post(endpoint, headers=headers, json=payload)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 if attempt >= self.max_attempts:
                     raise LinePushError(
@@ -133,7 +170,8 @@ class LineMessagingClient:
             if 500 <= response.status_code < 600:
                 if attempt >= self.max_attempts:
                     raise LinePushError(
-                        f"LINE server error after {attempt} attempts: {response.status_code}"
+                        f"LINE server error after {attempt} attempts: "
+                        f"{response.status_code}"
                     )
                 self._sleep(attempt)
                 continue
@@ -142,7 +180,7 @@ class LineMessagingClient:
                 f"Unexpected LINE response status: {response.status_code}"
             )
 
-        raise LinePushError("LINE push exhausted all retry attempts")
+        raise LinePushError("LINE send exhausted all retry attempts")
 
     def _sleep(self, attempt: int) -> None:
         time.sleep(self.initial_backoff_seconds * (2 ** (attempt - 1)))

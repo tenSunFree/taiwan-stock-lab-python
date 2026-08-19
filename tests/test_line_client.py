@@ -2,6 +2,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import json
 
 from app.clients.line_client import (
     LineMessagingClient,
@@ -152,3 +153,67 @@ def test_timeout_then_success_reuses_the_same_retry_key():
         len(set(seen_retry_keys)) == 1
     )  # timeout attempt and the retry used the same key
     assert seen_retry_keys[0] == str(result.retry_key)
+
+
+def test_broadcast_text_has_no_to_field():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"x-line-request-id": "broadcast-1"})
+
+    client = make_client(
+        handler
+    )  # 沿用你既有的 test_line_client.py 裡的 make_client() helper
+    result = client.broadcast_text(text="hello family")
+
+    assert captured["url"].endswith("/v2/bot/message/broadcast")
+    assert captured["body"] == {"messages": [{"type": "text", "text": "hello family"}]}
+    assert "to" not in captured["body"]
+    assert result.success is True
+
+
+def test_broadcast_text_uses_provided_retry_key():
+    from uuid import uuid4
+
+    captured = {}
+    fixed_key = uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["retry_key_header"] = request.headers.get("X-Line-Retry-Key")
+        return httpx.Response(200, headers={"x-line-request-id": "broadcast-2"})
+
+    client = make_client(handler)
+    result = client.broadcast_text(text="hello", retry_key=fixed_key)
+
+    assert captured["retry_key_header"] == str(fixed_key)
+    assert result.retry_key == fixed_key
+
+
+def test_broadcast_text_409_is_already_accepted():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, headers={"x-line-accepted-request-id": "already-1"})
+
+    client = make_client(handler)
+    result = client.broadcast_text(text="hello")
+
+    assert result.success is True
+    assert result.already_accepted is True
+    assert result.accepted_request_id == "already-1"
+
+
+def test_broadcast_text_5xx_retries_then_succeeds():
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            return httpx.Response(503)
+        return httpx.Response(200, headers={"x-line-request-id": "broadcast-3"})
+
+    client = make_client(handler, initial_backoff_seconds=0)
+    result = client.broadcast_text(text="hello")
+
+    assert call_count["n"] == 2
+    assert result.success is True
