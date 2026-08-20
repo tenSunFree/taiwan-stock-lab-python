@@ -1,4 +1,5 @@
 import datetime as dt
+from decimal import Decimal
 
 from app.reports.text_renderer import (
     DISCLAIMER,
@@ -12,58 +13,53 @@ from app.reports.text_renderer import (
 TRADING_DATE = dt.date(2026, 8, 7)
 
 
-def test_report_contains_disclaimer():
-    report = render_daily_report(
-        trading_date=TRADING_DATE,
-        data_updated_at="16:47",
-        candidate_count=18,
-        eligible_count=12,
-        strategy_version="rule-v1.0.0",
-        ranked_stocks=[],
-    )
-    assert DISCLAIMER in report
-
-
-def test_report_never_contains_banned_phrases():
-    stock = ReportStockView(
+def _make_stock_view(**overrides) -> ReportStockView:
+    defaults = dict(
         rank=1,
         stock_id="1234",
         stock_name="範例公司",
         total_score=84.2,
-        data_completeness=0.96,
-        top_factor_names=("流動性", "基本面"),
-        risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        data_completeness=0.90,
+        top_factor_names=("流動性", "動能"),
+        risk_flags=(),
+        close_price=Decimal("177.5"),
+        change_percent=9.91,
+        missing_factor_names=("risk_quality",),
+        is_one_price_limit_up=False,
     )
-    report = render_daily_report(
+    defaults.update(overrides)
+    return ReportStockView(**defaults)
+
+
+def _render(*stocks: ReportStockView) -> str:
+    return render_daily_report(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
         candidate_count=18,
         eligible_count=12,
         strategy_version="rule-v1.0.0",
-        ranked_stocks=[stock],
+        ranked_stocks=list(stocks),
     )
+
+
+def test_report_contains_disclaimer():
+    report = _render()
+    assert DISCLAIMER in report
+
+
+def test_report_never_contains_banned_phrases():
+    report = _render(_make_stock_view(risk_flags=("HIGH_FIVE_DAY_RETURN",)))
     banned = ["必買", "明牌", "保證獲利", "最佳買點", "跟單", "穩賺"]
     for phrase in banned:
         assert phrase not in report
 
 
 def test_report_includes_stock_info_and_risk_text():
-    stock = ReportStockView(
-        rank=1,
-        stock_id="1234",
-        stock_name="範例公司",
-        total_score=84.2,
-        data_completeness=0.96,
-        top_factor_names=("流動性",),
-        risk_flags=("HIGH_FIVE_DAY_RETURN",),
-    )
-    report = render_daily_report(
-        trading_date=TRADING_DATE,
-        data_updated_at="16:47",
-        candidate_count=18,
-        eligible_count=12,
-        strategy_version="rule-v1.0.0",
-        ranked_stocks=[stock],
+    report = _render(
+        _make_stock_view(
+            top_factor_names=("流動性",),
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
     )
     assert "範例公司" in report
     assert "1234" in report
@@ -89,6 +85,69 @@ def test_report_uses_candidate_and_completeness_labels():
     )
     assert "進入候選池：18 檔" in report
     assert "通過資料完整度門檻：12 檔" in report
+    assert "展示範圍：綜合分數 Top 5" in report
+
+
+def test_report_shows_close_price_and_positive_change_percent():
+    report = _render(
+        _make_stock_view(close_price=Decimal("177.5"), change_percent=9.91)
+    )
+    assert "收盤價：177.5 元" in report
+    assert "漲幅：+9.91%" in report
+
+
+def test_report_shows_negative_change_percent_with_sign():
+    report = _render(_make_stock_view(change_percent=-2.15))
+    assert "漲幅：-2.15%" in report
+
+
+def test_report_omits_price_lines_when_unavailable():
+    report = _render(_make_stock_view(close_price=None, change_percent=None))
+    assert "收盤價：" not in report
+    assert "漲幅：" not in report
+
+
+def test_report_shows_missing_data_breakdown_with_reason():
+    report = _render(_make_stock_view(missing_factor_names=("risk_quality",)))
+    assert "缺失資料：" in report
+    assert "風險品質（注意／處置狀態尚未串接官方資料源，暫無法評分）" in report
+
+
+def test_report_omits_missing_data_line_when_complete():
+    report = _render(_make_stock_view(missing_factor_names=()))
+    assert "缺失資料：" not in report
+
+
+def test_report_shows_one_price_limit_up_pattern_section():
+    report = _render(_make_stock_view(is_one_price_limit_up=True))
+    assert "型態特徵：" in report
+    assert "・一字漲停" in report
+
+
+def test_report_omits_pattern_section_when_not_one_price_limit_up():
+    report = _render(_make_stock_view(is_one_price_limit_up=False))
+    assert "型態特徵：" not in report
+
+
+def test_report_uses_renamed_section_headers():
+    report = _render(_make_stock_view())
+    assert "主要得分來源：" in report
+    assert "風險提示：" in report
+    # old text-v1 headers must be gone
+    assert "主要優勢：" not in report
+    assert "風險：\n" not in report
+
+
+def test_report_default_risk_text_when_no_flags():
+    report = _render(_make_stock_view(risk_flags=()))
+    assert "今日收盤漲停，隔日追高、開板及價格波動風險偏高" in report
+
+
+def test_report_includes_model_explanation():
+    report = _render(_make_stock_view())
+    assert "模型說明" in report
+    assert "rule-v1.0.0" in report
+    assert "不代表預測報酬率、上漲機率或目標價" in report
 
 
 def test_no_qualified_stock_report_still_sends_disclaimer():

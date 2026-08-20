@@ -1227,7 +1227,7 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert "1. 測試水泥（1101）" in captured.out
     assert "綜合分數：82.50" in captured.out
     assert "資料完整度：90%" in captured.out
-    assert "主要優勢：" in captured.out
+    assert "主要得分來源：" in captured.out
     assert "・流動性" in captured.out
     assert "・基本面" in captured.out
 
