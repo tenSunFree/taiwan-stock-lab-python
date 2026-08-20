@@ -8,6 +8,7 @@ Run: python -m app.jobs.preview_line_report
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 from app.reports.text_renderer import ReportStockView, render_daily_report
 
@@ -21,18 +22,26 @@ def main() -> None:
             stock_id="1234",
             stock_name="範例公司 A",
             total_score=84.2,
-            data_completeness=0.96,
+            data_completeness=0.90,
             top_factor_names=("流動性", "基本面"),
             risk_flags=("HIGH_FIVE_DAY_RETURN",),
+            close_price=Decimal("177.5"),
+            change_percent=9.91,
+            missing_factor_names=("risk_quality",),
+            is_one_price_limit_up=False,
         ),
         ReportStockView(
             rank=2,
             stock_id="5678",
             stock_name="範例公司 B",
             total_score=80.4,
-            data_completeness=0.91,
+            data_completeness=0.90,
             top_factor_names=("法人籌碼", "流動性"),
-            risk_flags=(),
+            risk_flags=("ONE_PRICE_LIMIT_UP",),
+            close_price=Decimal("21.5"),
+            change_percent=9.97,
+            missing_factor_names=("risk_quality",),
+            is_one_price_limit_up=True,
         ),
     ]
 

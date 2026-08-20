@@ -191,7 +191,7 @@ STRATEGY_VERSION = "rule-v1.0.0"
 # content within it) — see app.clients.idempotency's module docstring
 # for why reusing a message_version for genuinely different content
 # is a bug, not a valid rerun.
-MESSAGE_VERSION = "text-v1"
+MESSAGE_VERSION = "text-v2"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -968,8 +968,13 @@ def run(
     report_text: str | None = None
 
     if report_dry_run or line_live_delivery:
+        candidates_by_stock_id = {
+            candidate.stock.stock_id: candidate for candidate in candidates
+        }
         report_stocks = build_report_stocks(
-            top_five=top_five, stock_master=stock_master
+            top_five=top_five,
+            stock_master=stock_master,
+            candidates=candidates_by_stock_id,
         )
 
         # IMPORTANT: must stay deterministic for same-day idempotent
