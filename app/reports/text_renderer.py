@@ -106,6 +106,7 @@ def render_daily_report(
     eligible_count: int,
     strategy_version: str,
     ranked_stocks: list[ReportStockView],
+    ranking_limit: int = 10,
 ) -> str:
     """
     candidate_count: how many stocks entered CandidateBuilder's pool
@@ -115,16 +116,29 @@ def render_daily_report(
     eligible_count: how many of those cleared the RiskPolicy hard
         exclusions and the scoring completeness gate
         (data_completeness >= minimum_data_completeness), i.e. how
-        many were actually eligible to be considered for the Top 5.
+        many were actually eligible to be considered for the ranking.
+    ranking_limit: how many stocks select_top_n() was asked to return
+        at most — purely for the "展示範圍" display line below; it
+        does not itself limit len(ranked_stocks) (the caller already
+        did that upstream via select_top_n).
     """
     lines = [
         f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
+        "",
+        "📌 功能進度",
+        f"✅ 顯示 Top {ranking_limit}",
+        "⬜ 估值：0 < P/E ≤ 20",
+        "⬜ 注意／處置有價證券官方風控",
+        "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
+        "⬜ 技術面：低檔且具起漲訊號",
+        "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+        "⬜ 產業題材：電子業且具 AI 相關性",
         "",
         "資料概況",
         f"資料更新：{data_updated_at}",
         f"進入候選池：{candidate_count} 檔",
         f"通過資料完整度門檻：{eligible_count} 檔",
-        "展示範圍：綜合分數 Top 5",
+        f"展示範圍：綜合分數 Top {ranking_limit}",
         f"策略版本：{strategy_version}",
         "",
     ]
@@ -204,6 +218,7 @@ def render_no_qualified_stock_report(
     data_updated_at: str,
     candidate_count: int,
     strategy_version: str,
+    ranking_limit: int = 10,
 ) -> str:
     """Some days will have limit-up stocks but none passing the
     data-completeness bar. This still needs to be pushed so the reader
@@ -212,10 +227,19 @@ def render_no_qualified_stock_report(
         [
             f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
             "",
+            "📌 功能進度",
+            f"✅ 顯示 Top {ranking_limit}",
+            "⬜ 估值：0 < P/E ≤ 20",
+            "⬜ 注意／處置有價證券官方風控",
+            "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
+            "⬜ 技術面：低檔且具起漲訊號",
+            "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+            "⬜ 產業題材：電子業且具 AI 相關性",
+            "",
             "資料概況",
             f"資料更新：{data_updated_at}",
             f"進入候選池：{candidate_count} 檔",
-            "今日無符合資料完整度門檻的候選股，暫無 Top 5 名單。",
+            f"今日無符合資料完整度門檻的候選股，暫無 Top {ranking_limit} 名單。",
             f"策略版本：{strategy_version}",
             "",
             "模型說明",

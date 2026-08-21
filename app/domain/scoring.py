@@ -3,7 +3,7 @@ Multi-factor scoring.
 
 Normalization population: the day's candidate-pool cross-section
 (i.e. this batch of up to 50 limit-up candidates compared against
-each other), not the whole market — the Top 5 is meant to answer
+each other), not the whole market — the ranking is meant to answer
 "which of today's limit-up candidates is relatively higher quality,"
 not "how does this stock rank against the entire market." As noted in
 the requirements, scores can be unstable when the candidate count is
@@ -14,7 +14,7 @@ cross-section or a rolling historical distribution instead.
 Missing-data handling: missing factors are never filled with a score
 of 50. Instead, the total score is renormalized over the available
 weight, and data_completeness is recorded; stocks below the
-completeness threshold are not eligible for the Top 5.
+completeness threshold are not eligible for ranking.
 """
 
 from __future__ import annotations
@@ -122,17 +122,44 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
     return results
 
 
-def select_top_five(
+def select_top_n(
     scored: list[ScoredStock],
     turnover_by_stock: dict[str, float],
     *,
+    limit: int = 10,
     minimum_data_completeness: float = 0.80,
 ) -> list[ScoredStock]:
-    eligible = [s for s in scored if s.data_completeness >= minimum_data_completeness]
+    """
+    Select the top-ranked stocks from the scored pool.
+
+    Eligibility gate: only stocks whose data_completeness meets
+    minimum_data_completeness are considered — a stock scored on too
+    little data is excluded rather than ranked on an unreliable score.
+
+    Ranking key: (total_score, turnover) descending, both reversed
+    together — turnover only acts as a tie-breaker when total_score is
+    equal; it never overrides total_score on its own.
+
+    limit: how many stocks to return at most (renamed from the old
+    hardcoded top-5 cutoff — see select_top_n's callers in
+    app/jobs/daily_ranking.py for the actual configured value).
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+
+    eligible = [
+        stock
+        for stock in scored
+        if stock.data_completeness >= minimum_data_completeness
+    ]
 
     ranked = sorted(
         eligible,
-        key=lambda s: (s.total_score, turnover_by_stock.get(s.stock_id, 0.0)),
+        key=lambda stock: (
+            stock.total_score,
+            turnover_by_stock.get(stock.stock_id, 0.0),
+        ),
         reverse=True,
     )
-    return ranked[:5]
+
+    return ranked[:limit]

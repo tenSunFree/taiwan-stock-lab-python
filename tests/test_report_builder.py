@@ -84,7 +84,7 @@ def test_build_report_stocks_maps_names_and_rank():
     }
 
     views = build_report_stocks(
-        top_five=scored, stock_master=stock_master, candidates=candidates
+        ranked_stocks=scored, stock_master=stock_master, candidates=candidates
     )
 
     assert [v.rank for v in views] == [1, 2]
@@ -104,7 +104,9 @@ def test_build_report_stocks_falls_back_to_stock_id_when_name_missing():
         )
     ]
     candidates = {"9999": _make_candidate(stock_id="9999")}
-    views = build_report_stocks(top_five=scored, stock_master={}, candidates=candidates)
+    views = build_report_stocks(
+        ranked_stocks=scored, stock_master={}, candidates=candidates
+    )
     assert views[0].stock_name == "9999"
 
 
@@ -136,7 +138,7 @@ def test_build_report_stocks_computes_close_price_and_change_percent():
     )
 
     result = build_report_stocks(
-        top_five=scored,
+        ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
     )
@@ -170,7 +172,7 @@ def test_build_report_stocks_detects_one_price_limit_up():
     )
 
     result = build_report_stocks(
-        top_five=scored,
+        ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
     )
@@ -192,7 +194,7 @@ def test_build_report_stocks_leaves_change_percent_none_without_reference_price(
     candidate = replace(candidate, price=replace(candidate.price, reference_price=None))
 
     result = build_report_stocks(
-        top_five=scored,
+        ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
     )
@@ -212,5 +214,5 @@ def test_build_report_stocks_raises_on_missing_candidate():
 
     with pytest.raises(RuntimeError, match="does not exist in CandidateBuilder output"):
         build_report_stocks(
-            top_five=[scored], stock_master={"1101": stock}, candidates={}
+            ranked_stocks=[scored], stock_master={"1101": stock}, candidates={}
         )
