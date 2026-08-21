@@ -5,7 +5,7 @@ from app.domain.scoring import (
     FACTOR_WEIGHTS,
     ScoredStock,
     score_candidates,
-    select_top_five,
+    select_top_n,
 )
 
 
@@ -68,8 +68,8 @@ def test_missing_factor_reduces_completeness_not_filled_as_50():
     assert scored["B"].factor_scores["institutional"] is None
 
 
-def test_select_top_five_excludes_low_completeness():
-    features = [make_features(f"S{i}") for i in range(8)]
+def test_select_top_n_excludes_low_completeness():
+    features = [make_features(f"S{i}") for i in range(12)]
     scored = score_candidates(features)
 
     # manually push one stock's completeness down to simulate severely incomplete data
@@ -77,7 +77,7 @@ def test_select_top_five_excludes_low_completeness():
         0
     ].__class__(
         stock_id="LOWQ",
-        total_score=99.0,  # score is high, but data completeness is too low to enter the Top 5
+        total_score=99.0,  # score is high, but data completeness is too low to enter the ranking
         data_completeness=0.5,
         factor_scores={},
         risk_flags=tuple(),
@@ -87,22 +87,50 @@ def test_select_top_five_excludes_low_completeness():
     turnover_map = {s.stock_id: 100_000_000.0 for s in features}
     turnover_map["LOWQ"] = 999_999_999.0
 
-    top5 = select_top_five(
-        scored_with_low, turnover_map, minimum_data_completeness=0.80
+    top10 = select_top_n(
+        scored_with_low, turnover_map, limit=10, minimum_data_completeness=0.80
     )
 
-    assert "LOWQ" not in [s.stock_id for s in top5]
-    assert len(top5) == 5
+    assert "LOWQ" not in [s.stock_id for s in top10]
+    assert len(top10) == 10
 
 
-def test_select_top_five_returns_at_most_five():
+def test_select_top_n_returns_at_most_requested_limit():
     features = [
-        make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(10)
+        make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(15)
     ]
     scored = score_candidates(features)
     turnover_map = {f.stock_id: f.turnover for f in features}
-    top5 = select_top_five(scored, turnover_map)
-    assert len(top5) == 5
+    top10 = select_top_n(scored, turnover_map, limit=10)
+    assert len(top10) == 10
+
+
+def test_select_top_n_defaults_to_limit_ten():
+    features = [
+        make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(15)
+    ]
+    scored = score_candidates(features)
+    turnover_map = {f.stock_id: f.turnover for f in features}
+    top_default = select_top_n(scored, turnover_map)
+    assert len(top_default) == 10
+
+
+def test_select_top_n_respects_a_smaller_custom_limit():
+    features = [
+        make_features(f"S{i}", turnover=100_000_000 + i * 1000) for i in range(15)
+    ]
+    scored = score_candidates(features)
+    turnover_map = {f.stock_id: f.turnover for f in features}
+    top3 = select_top_n(scored, turnover_map, limit=3)
+    assert len(top3) == 3
+
+
+def test_select_top_n_rejects_non_positive_limit():
+    features = [make_features("A")]
+    scored = score_candidates(features)
+    turnover_map = {f.stock_id: f.turnover for f in features}
+    with pytest.raises(ValueError):
+        select_top_n(scored, turnover_map, limit=0)
 
 
 # --- Step 3: real-world completeness state (risk_quality_raw always None) ---
@@ -140,7 +168,7 @@ def test_missing_risk_quality_plus_institutional_falls_below_threshold():
     """
     The flip side of the test above: missing risk_quality (0.10) PLUS
     institutional (0.15) leaves only 0.75 available weight, which must
-    fail the default 0.80 Top-5 completeness gate. Without this test,
+    fail the default 0.80 ranking completeness gate. Without this test,
     a broken available_weight calculation could silently let every
     stock through regardless of how much data is actually missing.
     """
@@ -161,13 +189,13 @@ def test_missing_risk_quality_plus_institutional_falls_below_threshold():
     assert len(scored) == 1
     assert scored[0].data_completeness == pytest.approx(0.75)
 
-    top_five = select_top_five(
+    top_ranked = select_top_n(
         scored, {"A": 100_000_000.0}, minimum_data_completeness=0.80
     )
-    assert top_five == []
+    assert top_ranked == []
 
 
-def test_select_top_five_uses_turnover_as_tie_breaker():
+def test_select_top_n_uses_turnover_as_tie_breaker():
     scored = [
         ScoredStock(
             stock_id="LOW_TURNOVER",
@@ -185,9 +213,9 @@ def test_select_top_five_uses_turnover_as_tie_breaker():
         ),
     ]
 
-    top_five = select_top_five(
+    top_ranked = select_top_n(
         scored,
         {"LOW_TURNOVER": 100_000_000.0, "HIGH_TURNOVER": 500_000_000.0},
     )
 
-    assert [stock.stock_id for stock in top_five] == ["HIGH_TURNOVER", "LOW_TURNOVER"]
+    assert [stock.stock_id for stock in top_ranked] == ["HIGH_TURNOVER", "LOW_TURNOVER"]

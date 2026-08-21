@@ -85,7 +85,20 @@ def test_report_uses_candidate_and_completeness_labels():
     )
     assert "進入候選池：18 檔" in report
     assert "通過資料完整度門檻：12 檔" in report
-    assert "展示範圍：綜合分數 Top 5" in report
+    assert "展示範圍：綜合分數 Top 10" in report
+
+
+def test_report_uses_custom_ranking_limit_in_display_line():
+    report = render_daily_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=18,
+        eligible_count=12,
+        strategy_version="rule-v1.0.0",
+        ranked_stocks=[],
+        ranking_limit=15,
+    )
+    assert "展示範圍：綜合分數 Top 15" in report
 
 
 def test_report_shows_close_price_and_positive_change_percent():
@@ -160,6 +173,18 @@ def test_no_qualified_stock_report_still_sends_disclaimer():
     assert DISCLAIMER in report
     assert "今日無符合資料完整度門檻的候選股" in report
     assert "進入候選池：5 檔" in report
+    assert "暫無 Top 10 名單" in report
+
+
+def test_no_qualified_stock_report_uses_custom_ranking_limit():
+    report = render_no_qualified_stock_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=5,
+        strategy_version="rule-v1.0.0",
+        ranking_limit=15,
+    )
+    assert "暫無 Top 15 名單" in report
 
 
 def test_top_factors_picks_highest_scores_only():

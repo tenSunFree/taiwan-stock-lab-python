@@ -12,7 +12,7 @@ As of text-v2, this module also merges in Candidate (see
 app.domain.candidate_builder) so the report can show close price,
 change percent, and derived risk-input pattern features (one-price
 limit-up) without re-fetching anything — CandidateBuilder already
-carries the raw DailyPrice + LimitUpResult that Top 5 stocks came
+carries the raw DailyPrice + LimitUpResult that the ranked stocks came
 from.
 """
 
@@ -27,32 +27,33 @@ from app.reports.text_renderer import FACTOR_DISPLAY_NAMES, ReportStockView
 
 def build_report_stocks(
     *,
-    top_five: list[ScoredStock],
+    ranked_stocks: list[ScoredStock],
     stock_master: dict[str, StockMaster],
     candidates: dict[str, Candidate],
 ) -> list[ReportStockView]:
     """
     candidates: stock_id -> Candidate, keyed from the same
-        CandidateBuilder output the Top 5 was selected from. Every
-        stock_id in top_five MUST have a matching entry here — Top 5
-        is a subset of the candidate pool by construction, so a
-        missing entry means a pipeline invariant broke upstream and
-        this function refuses to silently drop the stock or produce a
-        report that quietly looks normal but is missing data.
+        CandidateBuilder output ranked_stocks was selected from. Every
+        stock_id in ranked_stocks MUST have a matching entry here —
+        ranked_stocks is a subset of the candidate pool by
+        construction, so a missing entry means a pipeline invariant
+        broke upstream and this function refuses to silently drop the
+        stock or produce a report that quietly looks normal but is
+        missing data.
     """
     results: list[ReportStockView] = []
 
-    for rank, scored in enumerate(top_five, start=1):
+    for rank, scored in enumerate(ranked_stocks, start=1):
         stock = stock_master.get(scored.stock_id)
         stock_name = stock.stock_name if stock is not None else scored.stock_id
 
         candidate = candidates.get(scored.stock_id)
         if candidate is None:
             raise RuntimeError(
-                "Report invariant violated: Top-5 stock_id="
+                "Report invariant violated: ranked stock_id="
                 f"{scored.stock_id!r} does not exist in CandidateBuilder "
-                "output. Top 5 must always be a subset of the candidate "
-                "pool passed in via `candidates`."
+                "output. Ranked stocks must always be a subset of the "
+                "candidate pool passed in via `candidates`."
             )
 
         available_factors = [

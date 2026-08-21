@@ -1164,6 +1164,7 @@ def test_run_report_dry_run_prints_no_qualified_report(capsys, monkeypatch, capl
     assert "NOT sent to LINE" in captured.out
     assert "進入候選池：1 檔" in captured.out
     assert "今日無符合資料完整度門檻的候選股" in captured.out
+    assert "暫無 Top 10 名單" in captured.out
     assert "本清單依公開市場資料及固定量化規則產生" in captured.out
     assert "UTF-16 length:" in captured.out
 
@@ -1176,7 +1177,7 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     no-qualified path. Patches score_candidates() at the boundary
     since FinMind price/institutional/revenue enrichment is already
     covered by Steps 1-3's own tests; this test's job is only to
-    verify ScoredStock -> select_top_five -> report_builder ->
+    verify ScoredStock -> select_top_n -> report_builder ->
     renderer -> stdout is wired correctly.
     """
     from unittest.mock import patch
@@ -1224,12 +1225,49 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert result == 0
     captured = capsys.readouterr()
     assert "REPORT_DRY_RUN preview" in captured.out
+    assert "展示範圍：綜合分數 Top 10" in captured.out
     assert "1. 測試水泥（1101）" in captured.out
     assert "綜合分數：82.50" in captured.out
     assert "資料完整度：90%" in captured.out
     assert "主要得分來源：" in captured.out
     assert "・流動性" in captured.out
     assert "・基本面" in captured.out
+
+
+def test_run_uses_ranking_limit_of_ten_not_five_in_pipeline_summary_log(
+    caplog, monkeypatch
+):
+    """
+    Regression test for the Top 5 -> Top 10 change itself: the final
+    pipeline-summary log line must report RANKING_LIMIT's actual
+    configured value (10), not a value hardcoded back down to 5. This
+    is the one assertion in this file that would have caught a
+    regression where RANKING_LIMIT was defined but never actually
+    threaded through to select_top_n()/the log line.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "in Top 10" in caplog.text
+    assert "in Top 5" not in caplog.text
 
 
 def test_run_line_live_push_off_by_default_does_not_touch_delivery(monkeypatch):

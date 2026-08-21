@@ -3,6 +3,7 @@ strategy_version: rule-v1.0.0
 candidate:
   maximum_count: 50
   minimum_turnover: 50000000  # TWD
+  ranking_limit: 10
 
 risk_policy:
   maximum_consecutive_limit_up_days: 3

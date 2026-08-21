@@ -5,7 +5,8 @@ Wires real market data from BOTH TWSE (listed) and TPEx (OTC) through
 to CandidateBuilder, then enriches each candidate with trailing
 historical price features, institutional net-buy ratio, and monthly
 revenue YoY from FinMind, then applies RiskPolicy and multi-factor
-scoring to select a research-only Top 5. When REPORT_DRY_RUN is
+scoring to select a research-only Top N (see RANKING_LIMIT below).
+When REPORT_DRY_RUN is
 enabled, the selected results are adapted into the existing report
 view model and rendered as LINE-compatible text, then printed to
 stdout for manual inspection — no LINE call, no DB write.
@@ -141,7 +142,7 @@ from app.domain.models import StockMaster
 from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
-from app.domain.scoring import ScoredStock, score_candidates, select_top_five
+from app.domain.scoring import ScoredStock, score_candidates, select_top_n
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -183,14 +184,37 @@ logger = logging.getLogger("daily_ranking")
 MINIMUM_TURNOVER = Decimal("50000000")
 MAXIMUM_CANDIDATES = 50
 
+# How many stocks the daily ranking publishes at most. Matches
+# config/strategy-v1.yaml's candidate.ranking_limit by hand for now,
+# same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
+RANKING_LIMIT = 10
+
 # Matches config/strategy-v1.yaml's strategy_version by hand for now,
 # same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
+#
+# NOTE: changing RANKING_LIMIT (5 -> 10) changes which stocks get
+# published, which arguably warrants its own strategy_version bump
+# per this file's own versioning rule (see the yaml's comment: "when
+# tuning, create a new strategy_version instead of overwriting this
+# one, otherwise historical ranking results lose their reference
+# baseline"). Left at rule-v1.0.0 here on the assumption this ships
+# together with, or immediately before, the maximum_pe_ratio filter
+# change (which bumps to rule-v1.1.0 in the next phase) — bump this
+# now instead if the two changes will ship as separate deployments.
 STRATEGY_VERSION = "rule-v1.0.0"
 
 # Change only when the rendered report FORMAT changes (not the
 # content within it) — see app.clients.idempotency's module docstring
 # for why reusing a message_version for genuinely different content
 # is a bug, not a valid rerun.
+#
+# NOTE: render_daily_report()'s hardcoded "展示範圍：綜合分數 Top 5"
+# line becomes a parameterized "Top {ranking_limit}" line as part of
+# this change — that is a template/FORMAT change, not just different
+# content flowing through the same template, so this should bump to
+# "text-v3" before this ships to production. Left at "text-v2" here
+# only because this file is being reviewed piecemeal, file by file —
+# bump it before deploying.
 MESSAGE_VERSION = "text-v2"
 
 # CRITICAL for delivery idempotency: the same
@@ -295,8 +319,8 @@ def log_candidates(candidates: list[Candidate]) -> None:
         )
 
 
-def log_top_five(
-    top_five: list[ScoredStock], stock_master: dict[str, StockMaster]
+def log_top_ranked(
+    ranked_stocks: list[ScoredStock], stock_master: dict[str, StockMaster]
 ) -> None:
     """
     Manual-review checkpoint before report rendering / LINE delivery
@@ -304,12 +328,12 @@ def log_top_five(
     aggregate total_score, so ranking order can be inspected and
     explained ("why did #1 beat #2") rather than taken on faith.
     """
-    if not top_five:
-        logger.info("=== Top 5 (人工檢視用) === 無符合資格股票")
+    if not ranked_stocks:
+        logger.info("=== Ranking (人工檢視用) === 無符合資格股票")
         return
 
-    logger.info("=== Top 5 (人工檢視用,尚未產生報告/推播) ===")
-    for rank, scored in enumerate(top_five, start=1):
+    logger.info("=== Top %d (人工檢視用,尚未產生報告/推播) ===", len(ranked_stocks))
+    for rank, scored in enumerate(ranked_stocks, start=1):
         stock = stock_master.get(scored.stock_id)
         name = stock.stock_name if stock else scored.stock_id
         logger.info(
@@ -925,9 +949,9 @@ def run(
         len(candidates),
     )
 
-    # --- Step 6: multi-factor scoring + Top 5 (manual-review checkpoint) ---
+    # --- Step 6: multi-factor scoring + Top N (manual-review checkpoint) ---
     # Deliberately stops here: no report rendering, no LINE delivery.
-    # See log_top_five()'s docstring for why the full factor breakdown
+    # See log_top_ranked()'s docstring for why the full factor breakdown
     # is logged rather than just the final score.
     scored = score_candidates(features)
     logger.info("Scored %d StockFeatures", len(scored))
@@ -939,9 +963,10 @@ def run(
         1 for stock in scored if stock.data_completeness >= minimum_data_completeness
     )
 
-    top_five = select_top_five(
+    top_ranked = select_top_n(
         scored,
         turnover_by_stock,
+        limit=RANKING_LIMIT,
         minimum_data_completeness=minimum_data_completeness,
     )
 
@@ -951,7 +976,7 @@ def run(
         eligible_count,
         minimum_data_completeness * 100,
     )
-    log_top_five(top_five, stock_master)
+    log_top_ranked(top_ranked, stock_master)
 
     # --- Step 7: report rendering (shared by dry-run preview and live delivery) ---
     report_dry_run = env_flag("REPORT_DRY_RUN")
@@ -972,7 +997,7 @@ def run(
             candidate.stock.stock_id: candidate for candidate in candidates
         }
         report_stocks = build_report_stocks(
-            top_five=top_five,
+            ranked_stocks=top_ranked,
             stock_master=stock_master,
             candidates=candidates_by_stock_id,
         )
@@ -989,6 +1014,7 @@ def run(
                 eligible_count=eligible_count,
                 strategy_version=STRATEGY_VERSION,
                 ranked_stocks=report_stocks,
+                ranking_limit=RANKING_LIMIT,
             )
         else:
             report_text = render_no_qualified_stock_report(
@@ -996,6 +1022,7 @@ def run(
                 data_updated_at=data_updated_at,
                 candidate_count=len(candidates),
                 strategy_version=STRATEGY_VERSION,
+                ranking_limit=RANKING_LIMIT,
             )
 
     if report_dry_run:
@@ -1112,7 +1139,7 @@ def run(
     logger.info(
         "Provisional pipeline complete: %d raw snapshots, %d mapped stocks, "
         "%d prices, %d candidates, %d features built, %d scored, %d eligible, "
-        "%d in Top 5",
+        "%d in Top %d",
         len(repo.saved),
         len(stock_master),
         len(daily_prices),
@@ -1120,7 +1147,8 @@ def run(
         len(features),
         len(scored),
         eligible_count,
-        len(top_five),
+        len(top_ranked),
+        RANKING_LIMIT,
     )
     return 0
 
