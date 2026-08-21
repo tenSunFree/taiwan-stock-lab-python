@@ -215,7 +215,7 @@ STRATEGY_VERSION = "rule-v1.0.0"
 # "text-v3" before this ships to production. Left at "text-v2" here
 # only because this file is being reviewed piecemeal, file by file —
 # bump it before deploying.
-MESSAGE_VERSION = "text-v2"
+MESSAGE_VERSION = "text-v3"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
