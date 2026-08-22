@@ -1198,7 +1198,13 @@ def run(
             report_text = render_daily_report(
                 trading_date=target_date,
                 data_updated_at=data_updated_at,
-                candidate_count=len(candidates),
+                # candidate_count_before_pe_filter, not len(candidates):
+                # `candidates` was reassigned in Step 4.5 to the P/E-
+                # eligible subset, so len(candidates) here would report
+                # the POST-filter count under a label ("進入候選池")
+                # that means "entered CandidateBuilder's pool" — using
+                # it would silently redefine what this field measures.
+                candidate_count=candidate_count_before_pe_filter,
                 eligible_count=eligible_count,
                 strategy_version=STRATEGY_VERSION,
                 ranked_stocks=report_stocks,
@@ -1208,7 +1214,7 @@ def run(
             report_text = render_no_qualified_stock_report(
                 trading_date=target_date,
                 data_updated_at=data_updated_at,
-                candidate_count=len(candidates),
+                candidate_count=candidate_count_before_pe_filter,
                 strategy_version=STRATEGY_VERSION,
                 ranking_limit=RANKING_LIMIT,
             )

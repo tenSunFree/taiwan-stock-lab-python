@@ -710,6 +710,79 @@ def test_strategy_version_bumped_to_rule_v1_1_0():
     assert STRATEGY_VERSION == "rule-v1.1.0"
 
 
+def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypatch):
+    """
+    Regression test for a bug CodeRabbit review caught: Step 4.5
+    reassigns `candidates` to the P/E-eligible subset, so a later
+    len(candidates) no longer means what render_daily_report's
+    candidate_count parameter is documented and labeled ("進入候選
+    池" / "entered CandidateBuilder's pool") to mean. Every OTHER test
+    in this file uses fixtures where the default permissive P/E (15)
+    lets 100% of candidates through, so pre-filter and post-filter
+    counts happened to always be equal — this test deliberately uses
+    TWO candidates where only ONE passes the P/E filter, so the two
+    counts differ and the bug can't hide behind a coincidence.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    twse_csv_two_candidates = (
+        "日期,證券代號,證券名稱,成交股數,成交金額,"
+        "開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數\n"
+        '"1150807","1101","測試水泥","3000000","100000000",'
+        '"41.00","44.65","40.80","44.65","4.05","10000"\n'
+        '"1150807","2330","測試台積電","2000000","80000000",'
+        '"41.00","44.65","40.80","44.65","4.05","8000"\n'
+    )
+    finmind_stock_info_two_candidates = {
+        "data": [
+            {
+                "industry_category": "水泥工業",
+                "stock_id": "1101",
+                "stock_name": "測試水泥",
+                "type": "twse",
+                "date": "2026-08-07",
+            },
+            {
+                "industry_category": "半導體業",
+                "stock_id": "2330",
+                "stock_name": "測試台積電",
+                "type": "twse",
+                "date": "2026-08-07",
+            },
+        ]
+    }
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=twse_csv_two_candidates,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            finmind_stock_info_two_candidates, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # 1101 passes (P/E 15 <= 20), 2330 fails (P/E 25 > 20)
+        twse_valuation_rows=[
+            {"Date": "1150807", "Code": "1101", "PEratio": "15"},
+            {"Date": "1150807", "Code": "2330", "PEratio": "25"},
+        ],
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    # 2 candidates entered CandidateBuilder's pool, even though only 1
+    # survived the P/E filter — the report must say "2 檔" here, not
+    # "1 檔" (which would silently redefine what "進入候選池" means).
+    assert "進入候選池：2 檔" in captured.out
+
+
 def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
