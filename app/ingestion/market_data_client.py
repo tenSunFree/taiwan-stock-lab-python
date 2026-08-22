@@ -429,6 +429,7 @@ class TwseClient(MarketDataClient):
     def __init__(self, repository: RawPayloadRepository, **kwargs) -> None:
         super().__init__(repository, **kwargs)
         self.stock_day_all_url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
+        self.valuation_url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
 
     def fetch_daily_price(
         self, *, ingestion_run_id: str, target_date: dt.date
@@ -465,6 +466,47 @@ class TwseClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
+    def fetch_valuation(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TWSE's BWIBBU_ALL (個股日本益比、殖利率及股價淨值比).
+
+        Deliberately a DIFFERENT TWSE system from fetch_daily_price()'s
+        www.twse.com.tw/exchangeReport/... open-data CSV endpoint — see
+        this class's own docstring warning about not conflating the two.
+        BWIBBU_ALL lives on openapi.twse.com.tw/v1, TWSE's newer Swagger
+        JSON API: no auth, no query params, whole-market JSON response.
+
+        Verified response shape (each element of the JSON array):
+            {"Date": "1150819", "Code": "2330", "Name": "台積電",
+             "PEratio": "23.45", "DividendYield": "1.92",
+             "PBratio": "7.11"}
+        Date is the ROC-calendar trading date the ratios were computed
+        for — same "latest trading day only" limitation as
+        fetch_daily_price(), so the mapper must verify it against
+        target_date the same way twse_mapper does for daily prices.
+
+        request_parameters is a self-describing marker rather than
+        real query params (this endpoint takes none) — the point is
+        purely to make snapshots distinguishable from
+        fetch_daily_price()'s {"response": "open_data"} snapshots,
+        since both share source="twse".
+        """
+        params = {"dataset": "BWIBBU_ALL"}
+
+        def _fetch():
+            response = self.http_client.get(self.valuation_url)
+            response.raise_for_status()
+            return response.json(), None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
+            fetch_fn=_fetch,
+        )
+
 
 class TpexClient(MarketDataClient):
     """
@@ -485,6 +527,9 @@ class TpexClient(MarketDataClient):
         super().__init__(repository, **kwargs)
         self.daily_close_quotes_url = (
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+        )
+        self.peratio_analysis_url = (
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
         )
 
     def fetch_daily_price(
@@ -519,6 +564,48 @@ class TpexClient(MarketDataClient):
             ingestion_run_id=ingestion_run_id,
             target_date=target_date,
             request_parameters={},
+            fetch_fn=_fetch,
+        )
+
+    def fetch_valuation(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TPEx's tpex_mainboard_peratio_analysis (個股本益比、殖利率
+        及股價淨值比). No auth, no query params.
+
+        Verified response shape (re-confirmed via a raw HTTP body dump
+        with Invoke-WebRequest -UseBasicParsing, bypassing
+        PowerShell's Invoke-RestMethod / ConvertTo-Json, both of which
+        can silently reshape a bare array's on-the-wire JSON into
+        something that LOOKS like an OData-style {"value": [...],
+        "Count": N} envelope even when the server never sent one — an
+        earlier version of this docstring was wrong for exactly this
+        reason): a BARE JSON array, same shape as
+        fetch_daily_price()'s:
+            [{"Date": "1150821", "SecuritiesCompanyCode": "1240",
+              "CompanyName": "...", "PriceEarningRatio": "10.59",
+              "DividendPerShare": "0.50000000", "YieldRatio": "0.88",
+              "PriceBookRatio": "1.68"}, ...]
+        PriceEarningRatio is the literal string "N/A" (not absent, not
+        null) when the source has no valid P/E to report — same
+        "zero/negative trailing EPS" meaning as TWSE's "-".
+        Date is ROC-calendar. Unlike fetch_daily_price()'s Date, this
+        endpoint's Date is not guaranteed to equal target_date even on
+        a healthy day — see app.ingestion.valuation_mapper's module
+        docstring for how the mapper handles that.
+        """
+        params = {"dataset": "tpex_mainboard_peratio_analysis"}
+
+        def _fetch():
+            response = self.http_client.get(self.peratio_analysis_url)
+            response.raise_for_status()
+            return response.json(), None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters=params,
             fetch_fn=_fetch,
         )
 

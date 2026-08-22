@@ -138,11 +138,12 @@ from app.db.delivery_repository import DeliveryRepository
 from app.db.models import MessageDelivery
 from app.delivery.service import DeliveryService
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
-from app.domain.models import StockMaster
+from app.domain.models import StockMaster, StockValuation
 from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.domain.scoring import ScoredStock, score_candidates, select_top_n
+from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -173,6 +174,7 @@ from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.ingestion.twse_mapper import (
     roc_date_to_gregorian as twse_roc_date_to_gregorian,
 )
+from app.ingestion.valuation_mapper import build_tpex_valuations, build_twse_valuations
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -189,33 +191,52 @@ MAXIMUM_CANDIDATES = 50
 # same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
 RANKING_LIMIT = 10
 
+# P/E eligibility threshold: 0 < P/E <= MAXIMUM_PE_RATIO (see
+# app.domain.valuation_filter.filter_candidates_by_pe). Matches
+# config/strategy-v1.yaml's candidate.maximum_pe_ratio by hand for
+# now, same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
+MAXIMUM_PE_RATIO = Decimal("20")
+
+# How many calendar days a valuation snapshot's own date (see
+# app.ingestion.valuation_mapper's module docstring for why it's
+# allowed to lag behind target_date at all) may fall behind
+# target_date before it's treated as stale rather than merely
+# "a day or two behind, as expected." "Accept a short lag" (the
+# mapper's job) is a different policy from "accept arbitrarily old
+# data" (this bound's job) — 5 calendar days covers a normal long
+# weekend/holiday gap plus one buffer day; a real gap this size
+# usually means the source itself is broken, not merely running a
+# day behind schedule.
+MAXIMUM_VALUATION_STALENESS_DAYS = 5
+
 # Matches config/strategy-v1.yaml's strategy_version by hand for now,
 # same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
 #
-# NOTE: changing RANKING_LIMIT (5 -> 10) changes which stocks get
-# published, which arguably warrants its own strategy_version bump
-# per this file's own versioning rule (see the yaml's comment: "when
+# Bumped to rule-v1.1.0 for the P/E eligibility filter (Step 4.5):
+# unlike RANKING_LIMIT (which only changes how many qualifying
+# candidates get published), 0 < P/E <= MAXIMUM_PE_RATIO changes WHICH
+# candidates are even eligible to be scored at all — the selected
+# candidate set itself is different now, not just the display cutoff.
+# Per this file's own versioning rule (see the yaml's comment: "when
 # tuning, create a new strategy_version instead of overwriting this
 # one, otherwise historical ranking results lose their reference
-# baseline"). Left at rule-v1.0.0 here on the assumption this ships
-# together with, or immediately before, the maximum_pe_ratio filter
-# change (which bumps to rule-v1.1.0 in the next phase) — bump this
-# now instead if the two changes will ship as separate deployments.
-STRATEGY_VERSION = "rule-v1.0.0"
+# baseline"), that requires its own version rather than reusing
+# rule-v1.0.0.
+STRATEGY_VERSION = "rule-v1.1.0"
 
 # Change only when the rendered report FORMAT changes (not the
 # content within it) — see app.clients.idempotency's module docstring
 # for why reusing a message_version for genuinely different content
 # is a bug, not a valid rerun.
 #
-# NOTE: render_daily_report()'s hardcoded "展示範圍：綜合分數 Top 5"
-# line becomes a parameterized "Top {ranking_limit}" line as part of
-# this change — that is a template/FORMAT change, not just different
-# content flowing through the same template, so this should bump to
-# "text-v3" before this ships to production. Left at "text-v2" here
-# only because this file is being reviewed piecemeal, file by file —
-# bump it before deploying.
-MESSAGE_VERSION = "text-v3"
+# NOT bumped for this P/E filter change: text_renderer.py's template
+# is untouched here (no new lines, no changed labels) — only which
+# candidates reach it changed, which is exactly the kind of "content
+# differs, format doesn't" case this comment describes. If a later
+# change starts showing per-stock P/E or a "通過本益比門檻" funnel
+# line in the report, that WOULD be a format change and this needs to
+# bump to text-v4 at that point.
+MESSAGE_VERSION = "text-v4"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -874,6 +895,153 @@ def run(
         sorted(tpex_reported_dates),
     )
 
+    # --- Step 1c: today's whole-market P/E valuation snapshot (TWSE + TPEx) ---
+    # Fetched at the same "whole-market snapshot" tier as Steps 1a/1b, not
+    # deferred until after CandidateBuilder — TWSE/TPEx's valuation open
+    # data returns the WHOLE market in a single call, just like their price
+    # data, so there's no rate-limit reason to wait. The P/E hard filter
+    # itself is applied later, at Step 4.5, right after CandidateBuilder and
+    # before the per-candidate FinMind enrichment it's meant to protect.
+    #
+    # Date handling — DIFFERENT from Steps 1a/1b's strict-equality check:
+    # confirmed via a real dry run that BWIBBU_ALL / peratio_analysis lag
+    # one or more calendar days behind their price-endpoint counterparts
+    # (P/E depends on data that isn't finalized as fast as a closing
+    # price). build_twse_valuations/build_tpex_valuations use "newest
+    # available date <= target_date" instead of requiring an exact match
+    # — see valuation_mapper.py's module docstring for the full reasoning.
+    #
+    # Failure policy (deliberately stricter than a per-stock gap): if
+    # either whole-market valuation source can't be fetched or parsed at
+    # all, this is treated the same as a TWSE/TPEx price-data failure —
+    # fail the whole run rather than silently publish a ranking that only
+    # partially checked the P/E eligibility rule against some candidates.
+    # A single candidate with no valuation record is a different, much
+    # narrower case (handled per-stock by app.domain.valuation_filter).
+    try:
+        twse_valuation_payload = twse_client.fetch_valuation(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+    except Exception:
+        logger.exception("TWSE fetch_valuation failed")
+        return 1
+
+    if not isinstance(twse_valuation_payload.raw_payload, list):
+        logger.error(
+            "TWSE BWIBBU_ALL returned unexpected raw payload type: %s",
+            type(twse_valuation_payload.raw_payload).__name__,
+        )
+        return 1
+
+    twse_valuation_rows = [
+        row for row in twse_valuation_payload.raw_payload if isinstance(row, dict)
+    ]
+    twse_valuations = build_twse_valuations(
+        target_date=target_date, rows=twse_valuation_rows
+    )
+
+    if not twse_valuations:
+        logger.warning(
+            "WAITING_FOR_DATA: TWSE BWIBBU_ALL returned no usable valuation rows "
+            "at or before %s (raw rows=%d) — P/E cannot be verified for any "
+            "TWSE candidate today, so no ranking will be published rather "
+            "than one that silently skipped every TWSE stock's eligibility "
+            "check",
+            target_date,
+            len(twse_valuation_rows),
+        )
+        return 2
+
+    try:
+        tpex_valuation_payload = tpex_client.fetch_valuation(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+    except Exception:
+        logger.exception("TPEx fetch_valuation failed")
+        return 1
+
+    if not isinstance(tpex_valuation_payload.raw_payload, list):
+        logger.error(
+            "TPEx tpex_mainboard_peratio_analysis returned unexpected raw "
+            "payload type: %s",
+            type(tpex_valuation_payload.raw_payload).__name__,
+        )
+        return 1
+
+    tpex_valuation_rows = [
+        row for row in tpex_valuation_payload.raw_payload if isinstance(row, dict)
+    ]
+    tpex_valuations = build_tpex_valuations(
+        target_date=target_date, rows=tpex_valuation_rows
+    )
+
+    if not tpex_valuations:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx tpex_mainboard_peratio_analysis returned "
+            "no usable valuation rows at or before %s (raw rows=%d) — same "
+            "policy as the TWSE valuation check above",
+            target_date,
+            len(tpex_valuation_rows),
+        )
+        return 2
+
+    valuations_by_stock: dict[str, StockValuation] = {
+        valuation.stock_id: valuation
+        for valuation in [*twse_valuations, *tpex_valuations]
+    }
+
+    # Valuation snapshot dates may lag behind target_date by a day or
+    # two (P/E depends on data that isn't finalized as fast as a
+    # closing price — see valuation_mapper's module docstring for why
+    # a short lag is accepted rather than rejected). A SHORT lag is
+    # expected and fine; an implausibly LONG one is a different
+    # problem — likely a genuinely broken/stalled source, not just
+    # running a day behind schedule — and must not be silently
+    # accepted just because build_twse_valuations/build_tpex_valuations
+    # found *some* date <= target_date.
+    twse_valuation_date = twse_valuations[0].trading_date
+    tpex_valuation_date = tpex_valuations[0].trading_date
+    twse_valuation_staleness_days = (target_date - twse_valuation_date).days
+    tpex_valuation_staleness_days = (target_date - tpex_valuation_date).days
+
+    if twse_valuation_staleness_days > MAXIMUM_VALUATION_STALENESS_DAYS:
+        logger.warning(
+            "WAITING_FOR_DATA: TWSE BWIBBU_ALL's newest available date %s "
+            "is %dd behind target_date %s, exceeding "
+            "MAXIMUM_VALUATION_STALENESS_DAYS=%d — treated as a stalled "
+            "source, not merely a short expected lag",
+            twse_valuation_date,
+            twse_valuation_staleness_days,
+            target_date,
+            MAXIMUM_VALUATION_STALENESS_DAYS,
+        )
+        return 2
+
+    if tpex_valuation_staleness_days > MAXIMUM_VALUATION_STALENESS_DAYS:
+        logger.warning(
+            "WAITING_FOR_DATA: TPEx tpex_mainboard_peratio_analysis's newest "
+            "available date %s is %dd behind target_date %s, exceeding "
+            "MAXIMUM_VALUATION_STALENESS_DAYS=%d — same policy as the TWSE "
+            "valuation check above",
+            tpex_valuation_date,
+            tpex_valuation_staleness_days,
+            target_date,
+            MAXIMUM_VALUATION_STALENESS_DAYS,
+        )
+        return 2
+
+    logger.info(
+        "Valuation snapshot ready: twse=%d (as of %s, %dd before target) "
+        "tpex=%d (as of %s, %dd before target) merged=%d",
+        len(twse_valuations),
+        twse_valuation_date,
+        twse_valuation_staleness_days,
+        len(tpex_valuations),
+        tpex_valuation_date,
+        tpex_valuation_staleness_days,
+        len(valuations_by_stock),
+    )
+
     # --- Step 2: stock master reference data from FinMind ---
     try:
         stock_info_payload = finmind_client.fetch_stock_info(
@@ -933,6 +1101,26 @@ def run(
     )
     candidates = candidate_builder.build(list(stock_master.values()), daily_prices)
     log_candidates(candidates)
+
+    # --- Step 4.5: P/E ratio eligibility filter (0 < P/E <= MAXIMUM_PE_RATIO) ---
+    # Deliberately BEFORE Step 5's FinMind enrichment, not after — a
+    # candidate that fails this filter never costs a FinMind API call for
+    # price history / institutional flow / monthly revenue. This is an
+    # eligibility rule, not a scoring factor (see
+    # app.domain.valuation_filter's module docstring for why it's kept out
+    # of app.domain.scoring's FACTOR_WEIGHTS entirely).
+    candidate_count_before_pe_filter = len(candidates)
+    candidates = filter_candidates_by_pe(
+        candidates,
+        valuations_by_stock,
+        maximum_pe_ratio=MAXIMUM_PE_RATIO,
+    )
+    logger.info(
+        "P/E eligibility filter: before=%d after=%d maximum_pe_ratio=%s",
+        candidate_count_before_pe_filter,
+        len(candidates),
+        MAXIMUM_PE_RATIO,
+    )
 
     # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue + risk) ---
     risk_policy = RiskPolicy()  # matches config/strategy-v1.yaml by hand for now
@@ -1010,7 +1198,13 @@ def run(
             report_text = render_daily_report(
                 trading_date=target_date,
                 data_updated_at=data_updated_at,
-                candidate_count=len(candidates),
+                # candidate_count_before_pe_filter, not len(candidates):
+                # `candidates` was reassigned in Step 4.5 to the P/E-
+                # eligible subset, so len(candidates) here would report
+                # the POST-filter count under a label ("進入候選池")
+                # that means "entered CandidateBuilder's pool" — using
+                # it would silently redefine what this field measures.
+                candidate_count=candidate_count_before_pe_filter,
                 eligible_count=eligible_count,
                 strategy_version=STRATEGY_VERSION,
                 ranked_stocks=report_stocks,
@@ -1020,7 +1214,7 @@ def run(
             report_text = render_no_qualified_stock_report(
                 trading_date=target_date,
                 data_updated_at=data_updated_at,
-                candidate_count=len(candidates),
+                candidate_count=candidate_count_before_pe_filter,
                 strategy_version=STRATEGY_VERSION,
                 ranking_limit=RANKING_LIMIT,
             )

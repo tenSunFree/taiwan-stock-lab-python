@@ -10,6 +10,7 @@ from app.ingestion.market_data_client import (
     TwseClient,
 )
 from app.domain.risk_policy import RiskPolicy
+from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
 
 TARGET_DATE = dt.date(2026, 8, 7)
@@ -94,10 +95,72 @@ FINMIND_STOCK_INFO_TPEX_STOCK = {
 }
 
 
+def _default_twse_valuation_rows(csv_text: str, *, pe_ratio: str = "15") -> list[dict]:
+    """
+    Auto-derive a passing-P/E BWIBBU_ALL row (same Date each row
+    already carries) for every stock_id present in a TWSE
+    STOCK_DAY_ALL fixture, so tests that don't care about the P/E
+    eligibility filter don't need to know it exists. Tests that
+    specifically exercise the filter pass their own valuation_rows to
+    make_twse_client/make_all_clients instead of relying on this.
+    """
+    rows = parse_stock_day_all_csv(csv_text)
+    result: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        stock_id = (row.get("證券代號") or "").strip()
+        date = (row.get("日期") or "").strip()
+        if not stock_id or stock_id in seen:
+            continue
+        seen.add(stock_id)
+        result.append({"Date": date, "Code": stock_id, "PEratio": pe_ratio})
+    return result
+
+
+def _default_tpex_valuation_rows(
+    json_rows: list[dict], *, pe_ratio: str = "15"
+) -> list[dict]:
+    """Same idea as _default_twse_valuation_rows, for TPEx's
+    tpex_mainboard_peratio_analysis shape."""
+    result: list[dict] = []
+    seen: set[str] = set()
+    for row in json_rows:
+        stock_id = str(row.get("SecuritiesCompanyCode") or "").strip()
+        date = str(row.get("Date") or "").strip()
+        if not stock_id or stock_id in seen:
+            continue
+        seen.add(stock_id)
+        result.append(
+            {
+                "Date": date,
+                "SecuritiesCompanyCode": stock_id,
+                "PriceEarningRatio": pe_ratio,
+            }
+        )
+    return result
+
+
 def make_twse_client(
-    repository: InMemoryRawPayloadRepository, csv_text: str
+    repository: InMemoryRawPayloadRepository,
+    csv_text: str,
+    *,
+    valuation_rows: list[dict] | None = None,
 ) -> TwseClient:
+    """
+    valuation_rows: BWIBBU_ALL rows to serve from fetch_valuation().
+        Defaults to a permissive P/E (15) for every stock_id found in
+        csv_text, so callers that don't care about the P/E filter
+        don't have to construct valuation fixtures by hand. Pass an
+        empty list explicitly to simulate "no usable valuation data"
+        (WAITING_FOR_DATA), or a list with specific P/E values to
+        exercise the filter's pass/fail boundary.
+    """
+    if valuation_rows is None:
+        valuation_rows = _default_twse_valuation_rows(csv_text)
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/exchangeReport/BWIBBU_ALL":
+            return httpx.Response(200, json=valuation_rows)
         return httpx.Response(200, text=csv_text)
 
     return TwseClient(
@@ -106,9 +169,26 @@ def make_twse_client(
 
 
 def make_tpex_client(
-    repository: InMemoryRawPayloadRepository, json_rows: list[dict]
+    repository: InMemoryRawPayloadRepository,
+    json_rows: list[dict],
+    *,
+    valuation_rows: list[dict] | None = None,
 ) -> TpexClient:
+    """valuation_rows: same idea as make_twse_client's, but for
+    tpex_mainboard_peratio_analysis, which is a BARE JSON array — same
+    shape as fetch_daily_price()'s, not wrapped in any envelope (an
+    earlier version of this fixture wrongly wrapped it in
+    {"value": [...], "Count": N}; see
+    market_data_client.TpexClient.fetch_valuation's docstring for why
+    that was wrong — confirmed only via a raw HTTP body dump, not
+    PowerShell's Invoke-RestMethod/ConvertTo-Json, which can silently
+    reshape a bare array into something that looks wrapped)."""
+    if valuation_rows is None:
+        valuation_rows = _default_tpex_valuation_rows(json_rows)
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/openapi/v1/tpex_mainboard_peratio_analysis":
+            return httpx.Response(200, json=valuation_rows)
         return httpx.Response(200, json=json_rows)
 
     return TpexClient(
@@ -135,10 +215,12 @@ def make_all_clients(
     twse_csv: str,
     tpex_rows: list[dict],
     stock_info_data: dict,
+    twse_valuation_rows: list[dict] | None = None,
+    tpex_valuation_rows: list[dict] | None = None,
 ) -> tuple[TwseClient, TpexClient, FinMindClient]:
     return (
-        make_twse_client(repository, twse_csv),
-        make_tpex_client(repository, tpex_rows),
+        make_twse_client(repository, twse_csv, valuation_rows=twse_valuation_rows),
+        make_tpex_client(repository, tpex_rows, valuation_rows=tpex_valuation_rows),
         make_finmind_client(repository, stock_info_data),
     )
 
@@ -339,7 +421,9 @@ def test_run_produces_zero_candidates_when_no_stock_is_limit_up(monkeypatch, cap
     assert result == 0
     assert "CandidateBuilder produced 0 provisional candidates" in caplog.text
     assert "twse=1, tpex=1" in caplog.text
-    assert len(repository.saved) == 3
+    # 5 base snapshots: twse price + tpex price + twse valuation +
+    # tpex valuation + finmind stock_info.
+    assert len(repository.saved) == 5
     assert {p.source for p in repository.saved} == {"twse", "tpex", "finmind"}
 
 
@@ -375,11 +459,328 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
-    # 3 base snapshots (twse + tpex + finmind stock_info) + 3 per-candidate
-    # FinMind enrichment snapshots (price history + institutional +
-    # monthly revenue; this test has exactly 1 candidate) = 6.
-    assert len(repository.saved) == 6
+    # 5 base snapshots (twse price + tpex price + twse valuation +
+    # tpex valuation + finmind stock_info) + 3 per-candidate FinMind
+    # enrichment snapshots (price history + institutional + monthly
+    # revenue; this test has exactly 1 candidate) = 8.
+    assert len(repository.saved) == 8
     assert "Built StockFeatures for 1 of 1 candidates after RiskPolicy" in caplog.text
+
+
+# --- P/E eligibility filter (Step 4.5) integration tests --------------------
+
+
+def test_run_excludes_candidate_with_pe_above_maximum_before_finmind_enrichment(
+    monkeypatch, caplog
+):
+    """
+    The core regression this filter exists for: a candidate whose P/E
+    exceeds MAXIMUM_PE_RATIO must be excluded BEFORE FinMind
+    enrichment, not just left out of the final ranking. Asserting on
+    the raw-snapshot count is what actually proves "before enrichment"
+    — if the filter ran after Step 5 instead, the FinMind
+    enrichment snapshots would still show up here.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # override the default permissive P/E: stock 1101 gets 25.00,
+        # which must fail the 0 < P/E <= 20 rule
+        twse_valuation_rows=[{"Date": "1150807", "Code": "1101", "PEratio": "25.00"}],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
+    assert "P/E eligibility filter: before=1 after=0" in caplog.text
+    assert "Built StockFeatures for 0 of 0 candidates after RiskPolicy" in caplog.text
+    # Exactly the 5 base snapshots — zero per-candidate FinMind
+    # enrichment snapshots, proving the excluded candidate never
+    # reached Step 5 at all.
+    assert len(repository.saved) == 5
+
+
+def test_run_keeps_candidate_with_pe_exactly_at_maximum(monkeypatch, caplog):
+    """Boundary test: P/E == MAXIMUM_PE_RATIO (20) is inclusive —
+    "不高於 20 倍" means <= 20, not < 20."""
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        twse_valuation_rows=[{"Date": "1150807", "Code": "1101", "PEratio": "20"}],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "P/E eligibility filter: before=1 after=1" in caplog.text
+    assert "Built StockFeatures for 1 of 1 candidates after RiskPolicy" in caplog.text
+
+
+def test_run_excludes_candidate_with_no_pe_available(monkeypatch, caplog):
+    """A candidate present in the price data but ABSENT from the
+    valuation snapshot (e.g. TWSE didn't publish a P/E for it — zero
+    or negative trailing EPS) must fail-close, the same as an
+    explicit above-threshold P/E."""
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # stock 1101 has no valuation row at all
+        twse_valuation_rows=[],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    # No usable TWSE valuation rows at all -> WAITING_FOR_DATA, per
+    # this file's own failure policy (whole-source valuation gaps are
+    # NOT treated the same as one stock's missing P/E — see the
+    # Step 1c comment in daily_ranking.py). This test's fixture
+    # (empty twse_valuation_rows) exercises exactly that whole-source
+    # case, not the narrower "this one stock has no row" case.
+    assert result == 2
+    assert (
+        "WAITING_FOR_DATA: TWSE BWIBBU_ALL returned no usable valuation rows"
+        in caplog.text
+    )
+
+
+def test_run_waits_for_data_when_valuation_snapshot_is_implausibly_stale(
+    monkeypatch, caplog
+):
+    """
+    A short lag (e.g. 1 day, matching a real observed BWIBBU_ALL
+    delay) is expected and accepted — see
+    build_twse_valuations's docstring. But a valuation snapshot dated
+    far behind target_date (here: 10 days, past
+    MAXIMUM_VALUATION_STALENESS_DAYS=5) must NOT be silently accepted
+    just because build_twse_valuations found *some* date <=
+    target_date — that's indistinguishable from a genuinely stalled
+    source, not a normal short lag.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # target_date is 2026-08-07; this valuation row is dated
+        # 2026-07-28 (ROC 1150728) — 10 calendar days behind.
+        twse_valuation_rows=[{"Date": "1150728", "Code": "1101", "PEratio": "15"}],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 2
+    assert "WAITING_FOR_DATA: TWSE BWIBBU_ALL's newest available date" in caplog.text
+    assert "10d behind target_date" in caplog.text
+
+
+def test_run_accepts_valuation_snapshot_within_staleness_bound(monkeypatch, caplog):
+    """The boundary just inside MAXIMUM_VALUATION_STALENESS_DAYS (5)
+    must still be accepted — this bound rejects genuinely stale data,
+    it isn't a stricter re-implementation of the same-day check we
+    deliberately moved away from."""
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # 2026-08-02 (ROC 1150802) is exactly 5 days before 2026-08-07.
+        twse_valuation_rows=[{"Date": "1150802", "Code": "1101", "PEratio": "15"}],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "Valuation snapshot ready" in caplog.text
+    assert "P/E eligibility filter: before=1 after=1" in caplog.text
+
+
+def test_run_excludes_single_stock_missing_from_an_otherwise_populated_snapshot(
+    monkeypatch, caplog
+):
+    """The narrower case test_run_excludes_candidate_with_no_pe_available's
+    docstring points to: the valuation snapshot itself is fine (has
+    rows), but this ONE candidate's stock_id isn't among them —
+    should fail-close for that stock only, not WAITING_FOR_DATA."""
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # valuation snapshot has data, just not for stock 1101
+        twse_valuation_rows=[{"Date": "1150807", "Code": "9999", "PEratio": "12"}],
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "P/E eligibility filter: before=1 after=0" in caplog.text
+    assert "Built StockFeatures for 0 of 0 candidates after RiskPolicy" in caplog.text
+
+
+def test_strategy_version_bumped_to_rule_v1_1_0():
+    """
+    Regression test for the STRATEGY_VERSION bump itself — the P/E
+    filter changes which candidates are eligible, which per this
+    file's own versioning rule (see the yaml's comment: "when tuning,
+    create a new strategy_version instead of overwriting this one")
+    requires a new strategy_version, not a reuse of rule-v1.0.0.
+
+    Asserted directly on the constant rather than via a run()+caplog
+    round trip: STRATEGY_VERSION is only ever logged when
+    LINE_DELIVERY_MODE != "off" (see the LINE delivery branch further
+    down this file), so an integration-style assertion here would
+    pass or fail for reasons unrelated to what this test actually
+    means to check.
+    """
+    from app.jobs.daily_ranking import STRATEGY_VERSION
+
+    assert STRATEGY_VERSION == "rule-v1.1.0"
+
+
+def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypatch):
+    """
+    Regression test for a bug CodeRabbit review caught: Step 4.5
+    reassigns `candidates` to the P/E-eligible subset, so a later
+    len(candidates) no longer means what render_daily_report's
+    candidate_count parameter is documented and labeled ("進入候選
+    池" / "entered CandidateBuilder's pool") to mean. Every OTHER test
+    in this file uses fixtures where the default permissive P/E (15)
+    lets 100% of candidates through, so pre-filter and post-filter
+    counts happened to always be equal — this test deliberately uses
+    TWO candidates where only ONE passes the P/E filter, so the two
+    counts differ and the bug can't hide behind a coincidence.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    twse_csv_two_candidates = (
+        "日期,證券代號,證券名稱,成交股數,成交金額,"
+        "開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數\n"
+        '"1150807","1101","測試水泥","3000000","100000000",'
+        '"41.00","44.65","40.80","44.65","4.05","10000"\n'
+        '"1150807","2330","測試台積電","2000000","80000000",'
+        '"41.00","44.65","40.80","44.65","4.05","8000"\n'
+    )
+    finmind_stock_info_two_candidates = {
+        "data": [
+            {
+                "industry_category": "水泥工業",
+                "stock_id": "1101",
+                "stock_name": "測試水泥",
+                "type": "twse",
+                "date": "2026-08-07",
+            },
+            {
+                "industry_category": "半導體業",
+                "stock_id": "2330",
+                "stock_name": "測試台積電",
+                "type": "twse",
+                "date": "2026-08-07",
+            },
+        ]
+    }
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=twse_csv_two_candidates,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            finmind_stock_info_two_candidates, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        # 1101 passes (P/E 15 <= 20), 2330 fails (P/E 25 > 20)
+        twse_valuation_rows=[
+            {"Date": "1150807", "Code": "1101", "PEratio": "15"},
+            {"Date": "1150807", "Code": "2330", "PEratio": "25"},
+        ],
+    )
+
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    # 2 candidates entered CandidateBuilder's pool, even though only 1
+    # survived the P/E filter — the report must say "2 檔" here, not
+    # "1 檔" (which would silently redefine what "進入候選池" means).
+    assert "進入候選池：2 檔" in captured.out
 
 
 def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
@@ -401,7 +802,10 @@ def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
     )
 
     assert result == 1
-    assert len(repository.saved) == 3
+    # 5 base snapshots: twse price + tpex price + twse valuation +
+    # tpex valuation + finmind stock_info (saved even though its rows
+    # turned out unusable — "save raw, parse later").
+    assert len(repository.saved) == 5
 
 
 def test_run_returns_1_when_twse_fetch_raises(monkeypatch):

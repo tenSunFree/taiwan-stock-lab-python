@@ -68,3 +68,27 @@ class DailyPrice:
     limit_up_price: Decimal | None = None  # source-provided limit-up price, if any
     has_price_limit_today: bool = True  # False = special day with no daily price limit
     data_quality_ok: bool = True
+
+
+@dataclass(frozen=True)
+class StockValuation:
+    """
+    Daily P/E ratio snapshot, sourced from TWSE's BWIBBU_ALL /
+    TPEx's tpex_mainboard_peratio_analysis — whole-market snapshots,
+    same "latest trading day only" limitation as DailyPrice's own
+    TWSE/TPEx sources.
+
+    pe_ratio may be None: TWSE/TPEx do not compute a P/E ratio when a
+    company's trailing EPS is zero or negative — that is a genuinely
+    missing value, not a data error, and callers (see
+    app.domain.valuation_filter) must treat it as "cannot verify the
+    P/E threshold," not as "assume it passes."
+
+    Deliberately just pe_ratio for now (YAGNI) — dividend_yield and
+    pb_ratio aren't used by any current strategy rule; add them only
+    when an actual rule needs them.
+    """
+
+    trading_date: date
+    stock_id: str
+    pe_ratio: Decimal | None

@@ -136,3 +136,109 @@ def test_fetch_daily_price_raises_on_http_error_without_saving():
         client.fetch_daily_price(ingestion_run_id="run-1", target_date=TARGET_DATE)
 
     assert repository.saved == []
+
+
+# --- fetch_valuation (BWIBBU_ALL) -------------------------------------------
+
+SAMPLE_VALUATION_JSON = [
+    {
+        "Date": "1150807",
+        "Code": "2330",
+        "Name": "台積電",
+        "PEratio": "23.45",
+        "DividendYield": "1.92",
+        "PBratio": "7.11",
+    },
+]
+
+
+def test_fetch_valuation_uses_correct_twse_endpoint():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["host"] = request.url.host
+        captured["path"] = request.url.path
+        return httpx.Response(200, json=SAMPLE_VALUATION_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured["method"] == "GET"
+    assert captured["host"] == "openapi.twse.com.tw"
+    assert captured["path"] == "/v1/exchangeReport/BWIBBU_ALL"
+
+
+def test_fetch_valuation_sends_no_query_params():
+    captured_params = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_params.update(dict(request.url.params))
+        return httpx.Response(200, json=SAMPLE_VALUATION_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured_params == {}
+
+
+def test_fetch_valuation_saves_raw_json_as_is():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_VALUATION_JSON)
+
+    client, repository = make_client(handler)
+    result = client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert len(repository.saved) == 1
+    saved = repository.saved[0]
+    assert saved.source == "twse"
+    assert saved.target_date == TARGET_DATE
+    assert saved.raw_payload == SAMPLE_VALUATION_JSON
+    assert result is saved
+
+
+def test_fetch_valuation_request_parameters_are_distinguishable_from_daily_price():
+    """Regression test for the source="twse" ambiguity between
+    fetch_daily_price() and fetch_valuation(): both share source, but
+    request_parameters must differ so a raw snapshot is identifiable
+    without guessing from raw_payload shape."""
+
+    def price_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=SAMPLE_CSV)
+
+    def valuation_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_VALUATION_JSON)
+
+    price_client, price_repo = make_client(price_handler)
+    price_client.fetch_daily_price(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    valuation_client, valuation_repo = make_client(valuation_handler)
+    valuation_client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert (
+        price_repo.saved[0].request_parameters
+        != valuation_repo.saved[0].request_parameters
+    )
+    assert valuation_repo.saved[0].request_parameters == {"dataset": "BWIBBU_ALL"}
+
+
+def test_fetch_valuation_does_not_fabricate_source_updated_at():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_VALUATION_JSON)
+
+    client, repository = make_client(handler)
+    client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved[0].source_updated_at is None
+
+
+def test_fetch_valuation_raises_on_http_error_without_saving():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client, repository = make_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved == []
