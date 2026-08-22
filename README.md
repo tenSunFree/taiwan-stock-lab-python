@@ -16,14 +16,15 @@
 
 A daily-batch quantitative research pipeline that scans Taiwan Stock
 Exchange (TWSE) and Taipei Exchange (TPEx) common stocks for the day's
-limit-up (漲停) closes, enriches them with historical price,
-institutional-flow, and monthly-revenue data from FinMind, filters
-through a configurable risk policy, scores the survivors with a
-transparent multi-factor model, renders a fixed-template research
-report, and delivers it to LINE — either to a single test recipient or
-broadcast to every subscriber of the Official Account. Built with a
-layered domain design so that data ingestion, business rules, scoring,
-and delivery can each be tested and evolved independently.
+limit-up (漲停) closes, filters them on a hard P/E-ratio eligibility
+rule, enriches the survivors with historical price, institutional-flow,
+and monthly-revenue data from FinMind, filters through a configurable
+risk policy, scores the remainder with a transparent multi-factor
+model, renders a fixed-template research report, and delivers it to
+LINE — either to a single test recipient or broadcast to every
+subscriber of the Official Account. Built with a layered domain design
+so that data ingestion, business rules, scoring, and delivery can each
+be tested and evolved independently.
 
 This project is for research, learning, and personal technical
 practice. It is **not** investment advice, and the generated reports
@@ -55,6 +56,12 @@ a later phase (see [Roadmap](#roadmap)).
 - Source-date verification to avoid silently reusing the previous
   trading day's data (`WAITING_FOR_DATA`, not a crash, when TWSE/TPEx
   haven't published today's close yet)
+- Valuation (P/E ratio) ingestion uses a different date-matching
+  policy than price data: "newest available date at or before the
+  target date" rather than strict same-day equality, since P/E
+  depends on data (EPS, dividends) that isn't finalized as fast as a
+  closing price is — bounded by a staleness ceiling so a genuinely
+  stalled source is still caught, not silently accepted forever
 - Legally correct tick-size table and limit-up price calculation using
   `Decimal` arithmetic, verified against the official TWSE worked
   example (reference price 40.60 → limit-up price 44.65) and against a
@@ -77,6 +84,25 @@ a later phase (see [Roadmap](#roadmap)).
   selection) from intraday-touch-limit-up (`has_touched_limit_up`,
   recorded only) — a stock that opened at limit-up and was later sold
   off is not the same signal as one that closed locked at limit-up
+
+### Valuation Eligibility
+
+- Hard eligibility rule: `0 < P/E <= 20` (configurable via
+  `MAXIMUM_PE_RATIO`), applied **before** FinMind enrichment so a
+  disqualified candidate never costs an enrichment API call — this is
+  an eligibility rule, not a scoring factor: a candidate either passes
+  or is excluded entirely, with no partial credit
+- Sourced from TWSE's `BWIBBU_ALL` and TPEx's
+  `tpex_mainboard_peratio_analysis` — whole-market open-data
+  snapshots, fetched the same way as daily price data
+- Fail-closed on every kind of uncertainty: no valuation record for a
+  stock, a missing P/E (commonly because trailing EPS is zero or
+  negative), or a non-positive value are all treated as "cannot verify
+  eligibility" and excluded, never assumed to pass
+- A whole-market valuation source that can't be fetched, parsed, or
+  that returns no data within a reasonable staleness window fails the
+  entire run (`WAITING_FOR_DATA`) rather than silently publishing a
+  ranking that only partially checked this rule
 
 ### Enrichment (FinMind)
 
@@ -123,7 +149,8 @@ a later phase (see [Roadmap](#roadmap)).
   score is renormalized over the factors that are actually available,
   and `data_completeness` is recorded per stock
 - Stocks below the minimum data-completeness threshold are ineligible
-  for the Top 5, regardless of score
+  for the published ranking (Top N, configurable via `RANKING_LIMIT`),
+  regardless of score
 
 ### Report Rendering
 
@@ -218,9 +245,9 @@ excluded and covered by tests (`tests/test_text_renderer.py`).
 
 - **Python 3.12** — `dataclasses`, `Protocol`, and `StrEnum` used
   throughout to keep domain models explicit and dependency-light
-- **Decimal** — all price and tick-size arithmetic uses `Decimal`,
-  never `float`, to avoid floating-point rounding errors in financial
-  comparisons
+- **Decimal** — all price, tick-size, and P/E-ratio arithmetic uses
+  `Decimal`, never `float`, to avoid floating-point rounding errors in
+  financial comparisons
 - **pandas** — cross-sectional percentile normalization for
   multi-factor scoring
 - **httpx** — HTTP client for market-data ingestion and the LINE
@@ -309,6 +336,11 @@ pytest -v
 - Candidate-pool tests covering instrument-type exclusion, minimum
   turnover exclusion, sort-and-cap-at-50 behavior, and non-limit-up
   exclusion
+- Valuation-filter and valuation-mapper tests covering the full
+  `0 < P/E <= 20` boundary table, fail-closed handling of missing or
+  invalid P/E, and the look-ahead-safe "newest available date at or
+  before target" date-matching policy (including the staleness ceiling
+  that catches a genuinely stalled valuation source)
 - Enrichment tests covering independent fail-soft behavior across
   price-history, institutional-flow, and monthly-revenue fetches, and
   a look-ahead-bias regression test for revenue YoY (a figure is only
@@ -319,7 +351,7 @@ pytest -v
   clean), policy-driven exclusion, and threshold-driven flags
 - Scoring tests covering factor-weight integrity, liquidity ordering,
   missing-factor renormalization (never backfilled with a neutral
-  score), and Top-5 selection under a data-completeness floor
+  score), and Top-N selection under a data-completeness floor
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, and that
   candidate/eligible counts are labeled accurately
@@ -347,8 +379,10 @@ rendering, and delivery:
 app/domain/          Pure business logic — no I/O, no framework dependency
   price_ticks.py         Tick-size table + limit-up price calculation
   limit_up.py             Close-limit-up vs touched-limit-up detection
-  models.py                StockMaster / DailyPrice, decoupled from any data source
+  models.py                StockMaster / DailyPrice / StockValuation,
+                            decoupled from any data source
   candidate_builder.py     Common-stock filtering + turnover ranking
+  valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
   institutional_flow_builder.py
                              Institutional net-buy ratio (look-ahead-safe)
@@ -357,13 +391,14 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   risk_inputs.py             Reliable/heuristic RiskPolicy input reconstruction
   risk_policy.py              Tri-state hard exclusion + soft risk flagging
   scoring.py / normalization.py
-                             Multi-factor scoring and Top-5 selection
+                             Multi-factor scoring and Top-N selection
 
 app/ingestion/        Data source integration
   trading_calendar.py     Trading-day checks
   market_data_client.py    Raw-snapshot-first ingestion clients with retry
   finmind_mapper.py / twse_mapper.py / tpex_mapper.py
                              Provider-specific row parsing
+  valuation_mapper.py       TWSE/TPEx P/E ratio row parsing
 
 app/reports/           Report rendering
   report_builder.py         ScoredStock -> ReportStockView adaptation

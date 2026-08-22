@@ -1,9 +1,10 @@
-strategy_version: rule-v1.0.0
+strategy_version: rule-v1.1.0
 
 candidate:
   maximum_count: 50
   minimum_turnover: 50000000  # TWD
   ranking_limit: 10
+  maximum_pe_ratio: 20  # 0 < P/E <= 20 (see app.domain.valuation_filter)
 
 risk_policy:
   maximum_consecutive_limit_up_days: 3
