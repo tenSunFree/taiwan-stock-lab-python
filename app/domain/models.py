@@ -92,3 +92,57 @@ class StockValuation:
     trading_date: date
     stock_id: str
     pe_ratio: Decimal | None
+
+
+@dataclass(frozen=True)
+class RegulatoryRiskStatus:
+    """
+    Official 注意/處置 (attention/disposition) status for one stock, on
+    one trading date — sourced from TWSE's and TPEx's own announcement
+    pages (see app.ingestion.regulatory_mapper's module docstring for
+    the verified endpoints).
+
+    MERGE TARGET, not a single source's output: attention and
+    disposition are two separate official reports (separate query
+    pages, separate endpoints, TWSE vs TPEx) — a mapper only ever
+    knows about the one report it parsed. app.jobs.daily_ranking is
+    responsible for combining an attention-source hit and a
+    disposition-source hit for the SAME stock_id into one
+    RegulatoryRiskStatus (OR-merge per field, not last-write-wins —
+    a stock can genuinely be both at once). "managed"/full-cash-
+    delivery (全額交割) status has no verified TWSE/TPEx source yet as
+    of this rollout (same "known data gap" status as
+    consecutive_limit_up_days — see README) and deliberately has no
+    field here; app.domain.risk_policy.RiskPolicy.assess() still
+    accepts is_managed as a parameter, this dataclass just never
+    supplies a non-None value for it yet.
+
+    A RegulatoryRiskStatus is only ever constructed for a stock that
+    actually appeared in a source's "currently flagged" list — there
+    is no "confirmed clean, explicitly checked" instance of this
+    class. Confirming a stock is NOT currently flagged is a lookup
+    miss (absent from the dict app.jobs.daily_ranking builds from the
+    mapper output), not a RegulatoryRiskStatus with every field False.
+    That lookup-miss-means-False mapping is only valid once the WHOLE
+    source's fetch for this trading date is confirmed to have
+    succeeded — see daily_ranking's WAITING_FOR_DATA handling, which
+    covers the "cannot verify at all" case for this data the same way
+    it does for TWSE/TPEx price and valuation snapshots. This
+    dataclass's own default values are for the merge step's
+    convenience only (e.g. "found in attention's list, so
+    is_disposition just defaults False on this instance until the
+    disposition mapper's hit — if any — gets merged in"), not a
+    general-purpose three-state signal on their own.
+    """
+
+    trading_date: date
+    stock_id: str
+
+    is_attention: bool = False
+    attention_reason: str | None = None
+
+    is_disposition: bool = False
+    disposition_start_date: date | None = None
+    disposition_end_date: date | None = None
+    disposition_reason: str | None = None
+    disposition_measure: str | None = None

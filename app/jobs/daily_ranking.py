@@ -138,7 +138,7 @@ from app.db.delivery_repository import DeliveryRepository
 from app.db.models import MessageDelivery
 from app.delivery.service import DeliveryService
 from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
-from app.domain.models import StockMaster, StockValuation
+from app.domain.models import Market, RegulatoryRiskStatus, StockMaster, StockValuation
 from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
@@ -164,6 +164,10 @@ from app.ingestion.market_data_client import (
     TwseClient,
     new_ingestion_run_id,
 )
+from app.ingestion.regulatory_mapper import (
+    build_tpex_attention_statuses,
+    build_tpex_disposition_statuses,
+)
 from app.ingestion.tpex_mapper import build_daily_prices as build_tpex_daily_prices
 from app.ingestion.tpex_mapper import (
     roc_date_to_gregorian as tpex_roc_date_to_gregorian,
@@ -173,6 +177,10 @@ from app.ingestion.twse_mapper import build_daily_prices as build_twse_daily_pri
 from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.ingestion.twse_mapper import (
     roc_date_to_gregorian as twse_roc_date_to_gregorian,
+)
+from app.ingestion.twse_regulatory_mapper import (
+    build_twse_attention_statuses,
+    build_twse_disposition_statuses,
 )
 from app.ingestion.valuation_mapper import build_tpex_valuations, build_twse_valuations
 from sqlalchemy import create_engine
@@ -212,30 +220,44 @@ MAXIMUM_VALUATION_STALENESS_DAYS = 5
 # Matches config/strategy-v1.yaml's strategy_version by hand for now,
 # same status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES above.
 #
-# Bumped to rule-v1.1.0 for the P/E eligibility filter (Step 4.5):
-# unlike RANKING_LIMIT (which only changes how many qualifying
-# candidates get published), 0 < P/E <= MAXIMUM_PE_RATIO changes WHICH
-# candidates are even eligible to be scored at all — the selected
-# candidate set itself is different now, not just the display cutoff.
-# Per this file's own versioning rule (see the yaml's comment: "when
-# tuning, create a new strategy_version instead of overwriting this
-# one, otherwise historical ranking results lose their reference
-# baseline"), that requires its own version rather than reusing
-# rule-v1.0.0.
-STRATEGY_VERSION = "rule-v1.1.0"
+# rule-v1.1.0: the P/E eligibility filter (Step 4.5) — 0 < P/E <=
+# MAXIMUM_PE_RATIO changes WHICH candidates are even eligible to be
+# scored at all, not just the display cutoff.
+#
+# rule-v1.2.0: RiskPolicyConfig's disposition/managed-stock handling
+# changed from unconditional hard exclusion to configurable (default:
+# allowed, flagged) — a disposition/managed stock that used to
+# silently vanish from every report now appears with a
+# DISPOSITION_STOCK/MANAGED_STOCK flag instead. ATTENTION_STOCK's
+# score penalty also dropped from 0.15 to 0.0 (display-only for now —
+# see RISK_FLAG_PENALTIES's own docstring). Both are real changes to
+# which candidates end up in the published ranking and what score
+# they get, so per this file's own versioning rule (see the yaml's
+# comment: "when tuning, create a new strategy_version instead of
+# overwriting this one, otherwise historical ranking results lose
+# their reference baseline"), this needs its own version too.
+STRATEGY_VERSION = "rule-v1.2.0"
 
 # Change only when the rendered report FORMAT changes (not the
 # content within it) — see app.clients.idempotency's module docstring
 # for why reusing a message_version for genuinely different content
 # is a bug, not a valid rerun.
 #
-# NOT bumped for this P/E filter change: text_renderer.py's template
-# is untouched here (no new lines, no changed labels) — only which
-# candidates reach it changed, which is exactly the kind of "content
-# differs, format doesn't" case this comment describes. If a later
-# change starts showing per-stock P/E or a "通過本益比門檻" funnel
-# line in the report, that WOULD be a format change and this needs to
-# bump to text-v4 at that point.
+# Bumped for this rollout's report-display step (Step 6): the risk
+# section can now render multi-line entries (ATTENTION_STOCK/
+# DISPOSITION_STOCK with reason text, DISPOSITION_STOCK additionally
+# with a period line and a 🚨 marker instead of a plain "・" bullet) —
+# see text_renderer.py's _render_risk_flag_lines for the new template
+# shape. This is a genuine format change (new possible line shapes),
+# not just different content flowing through the unchanged template.
+#
+# IMPORTANT — this sandbox's own text_renderer.py does not have the
+# "📌 功能進度" checklist section that a prior, separately-tracked
+# change (outside this session) added to the real project's copy and
+# bumped to "text-v4" for. If the real file is already at "text-v4",
+# bump it to "text-v5" for this change instead of reusing "text-v4" —
+# do not just copy this literal string without checking the real
+# file's current value first.
 MESSAGE_VERSION = "text-v4"
 
 # CRITICAL for delivery idempotency: the same
@@ -322,6 +344,89 @@ def extract_data_rows(payload: RawSourcePayload) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _merge_regulatory_status(
+    a: RegulatoryRiskStatus, b: RegulatoryRiskStatus
+) -> RegulatoryRiskStatus:
+    """
+    OR-merges two RegulatoryRiskStatus records for the SAME stock_id —
+    used when a stock appears in both an attention-source hit and a
+    disposition-source hit from the same market (see
+    app.domain.models.RegulatoryRiskStatus's own "MERGE TARGET"
+    docstring for why this is necessary: attention and disposition are
+    two separate reports, so a single mapper call only ever populates
+    one side's fields). Takes whichever side has a True flag / non-None
+    detail field for each attribute — never lets one side's defaults
+    silently clobber the other's real data.
+    """
+    return RegulatoryRiskStatus(
+        trading_date=a.trading_date,
+        stock_id=a.stock_id,
+        is_attention=a.is_attention or b.is_attention,
+        attention_reason=a.attention_reason or b.attention_reason,
+        is_disposition=a.is_disposition or b.is_disposition,
+        disposition_start_date=a.disposition_start_date or b.disposition_start_date,
+        disposition_end_date=a.disposition_end_date or b.disposition_end_date,
+        disposition_reason=a.disposition_reason or b.disposition_reason,
+        disposition_measure=a.disposition_measure or b.disposition_measure,
+    )
+
+
+def _resolve_regulatory_flags(
+    *,
+    stock_id: str,
+    market: Market,
+    regulatory_by_stock: dict[str, RegulatoryRiskStatus],
+    twse_attention_ok: bool,
+    twse_disposition_ok: bool,
+    tpex_attention_ok: bool,
+    tpex_disposition_ok: bool,
+) -> tuple[bool | None, bool | None]:
+    """
+    Resolves (is_attention, is_disposition) for one candidate, per this
+    feature's fail-closed-to-UNKNOWN policy (not fail-closed-to-False):
+
+    - A positive hit in regulatory_by_stock is always True, regardless
+      of source health — a stock that's already IN the list has
+      obviously been checked successfully as far as that one row goes.
+    - An ABSENCE from the dict is only trustworthy as "confirmed not
+      flagged" (False) when the specific market+category source that
+      would have found it actually succeeded this run. Otherwise it
+      must stay None (unconfirmed) — see RiskPolicy.assess()'s own
+      tri-state handling, which already does the right thing with
+      None (tracked in missing_inputs, never treated as "confirmed
+      clean"). This is the actual enforcement point for this
+      project's "資料抓不到時要標 Unknown，不能因為 API 失敗就當成不是
+      注意股" requirement — Step 1d in run() only RECORDS which
+      sources succeeded; this function is what turns that into the
+      correct per-candidate tri-state value.
+
+    Only the candidate's OWN market's sources matter — a TPEx stock's
+    is_attention is never affected by whether TWSE's fetch succeeded,
+    since TWSE's attention list could never have contained a TPEx
+    stock_id in the first place.
+    """
+    status = regulatory_by_stock.get(stock_id)
+
+    if market == Market.TWSE:
+        attention_source_ok = twse_attention_ok
+        disposition_source_ok = twse_disposition_ok
+    else:
+        attention_source_ok = tpex_attention_ok
+        disposition_source_ok = tpex_disposition_ok
+
+    if status is not None and status.is_attention:
+        is_attention: bool | None = True
+    else:
+        is_attention = False if attention_source_ok else None
+
+    if status is not None and status.is_disposition:
+        is_disposition: bool | None = True
+    else:
+        is_disposition = False if disposition_source_ok else None
+
+    return is_attention, is_disposition
+
+
 def log_candidates(candidates: list[Candidate]) -> None:
     logger.info("CandidateBuilder produced %d provisional candidates", len(candidates))
     for index, candidate in enumerate(candidates, start=1):
@@ -376,6 +481,11 @@ def build_stock_features(
     finmind_client: FinMindClient,
     ingestion_run_id: str,
     risk_policy: RiskPolicy,
+    regulatory_by_stock: dict[str, RegulatoryRiskStatus] | None = None,
+    twse_attention_ok: bool = False,
+    twse_disposition_ok: bool = False,
+    tpex_attention_ok: bool = False,
+    tpex_disposition_ok: bool = False,
 ) -> list[StockFeatures]:
     """
     Enrich candidate stocks with trailing historical price features,
@@ -611,11 +721,26 @@ def build_stock_features(
             one_price = is_one_price_limit_up(
                 price=candidate.price, limit_up_price=candidate.limit_up.limit_up_price
             )
+            resolved_is_attention, resolved_is_disposition = _resolve_regulatory_flags(
+                stock_id=stock_id,
+                market=candidate.stock.market,
+                regulatory_by_stock=regulatory_by_stock or {},
+                twse_attention_ok=twse_attention_ok,
+                twse_disposition_ok=twse_disposition_ok,
+                tpex_attention_ok=tpex_attention_ok,
+                tpex_disposition_ok=tpex_disposition_ok,
+            )
             assessment = risk_policy.assess(
                 stock_id=stock_id,
-                is_attention=candidate.stock.is_attention,
-                is_disposition=candidate.stock.is_disposition,
-                is_managed=candidate.stock.is_managed,
+                is_attention=resolved_is_attention,
+                is_disposition=resolved_is_disposition,
+                # No verified TWSE/TPEx source for managed/full-cash-
+                # delivery status yet (unlike attention/disposition
+                # above) — see app.domain.models.RegulatoryRiskStatus's
+                # own docstring for why this field simply doesn't exist
+                # there yet, same "known data gap" status as
+                # consecutive_limit_up_days below.
+                is_managed=None,
                 is_ky=is_ky_stock(candidate.stock.stock_name),
                 is_one_price_limit_up=one_price,
                 # No reliable historical reference-price/limit-up
@@ -1042,6 +1167,124 @@ def run(
         len(valuations_by_stock),
     )
 
+    # --- Step 1d: official regulatory risk data (attention/disposition) ---
+    # TWSE + TPEx, whole-market. UNLIKE Step 1c's valuation snapshot, a
+    # failure fetching or parsing any ONE of these four sources does NOT
+    # fail the whole run — this data is display-only in rule-v1.2.0
+    # (RiskPolicy defaults to NOT excluding on it; see
+    # RiskPolicyConfig.allow_disposition_stock's own docstring), so there
+    # is no "cannot verify eligibility" reason to block the pipeline the
+    # way Step 1c's P/E check does. Per this feature's own requirement
+    # ("資料抓不到時要標 Unknown，不能因為 API 失敗就當成不是注意股"): a
+    # failed source just means every candidate on THAT MARKET's
+    # is_attention/is_disposition stays None (unconfirmed) rather than
+    # being assumed False — see _resolve_regulatory_flags below, which is
+    # the only place that distinction is actually enforced.
+    twse_attention_by_stock: dict[str, RegulatoryRiskStatus] = {}
+    twse_attention_ok = False
+    try:
+        twse_attention_payload = twse_client.fetch_attention(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        twse_attention_by_stock = build_twse_attention_statuses(
+            target_date=target_date, html_text=twse_attention_payload.raw_payload
+        )
+        twse_attention_ok = True
+    except Exception:
+        logger.exception(
+            "TWSE announcement/notice fetch/parse failed — is_attention "
+            "will be Unknown for every TWSE candidate this run, not "
+            "assumed False"
+        )
+
+    twse_disposition_by_stock: dict[str, RegulatoryRiskStatus] = {}
+    twse_disposition_ok = False
+    try:
+        twse_disposition_payload = twse_client.fetch_disposition(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        twse_disposition_by_stock = build_twse_disposition_statuses(
+            target_date=target_date, html_text=twse_disposition_payload.raw_payload
+        )
+        twse_disposition_ok = True
+    except Exception:
+        logger.exception(
+            "TWSE announcement/punish fetch/parse failed — is_disposition "
+            "will be Unknown for every TWSE candidate this run, not "
+            "assumed False"
+        )
+
+    tpex_attention_by_stock: dict[str, RegulatoryRiskStatus] = {}
+    tpex_attention_ok = False
+    try:
+        tpex_attention_payload = tpex_client.fetch_attention(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        tpex_attention_by_stock = build_tpex_attention_statuses(
+            target_date=target_date, payload=tpex_attention_payload.raw_payload
+        )
+        tpex_attention_ok = True
+    except Exception:
+        logger.exception(
+            "TPEx bulletin/attention fetch/parse failed — is_attention "
+            "will be Unknown for every TPEx candidate this run, not "
+            "assumed False"
+        )
+
+    tpex_disposition_by_stock: dict[str, RegulatoryRiskStatus] = {}
+    tpex_disposition_ok = False
+    try:
+        tpex_disposition_payload = tpex_client.fetch_disposition(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        tpex_disposition_by_stock = build_tpex_disposition_statuses(
+            target_date=target_date, payload=tpex_disposition_payload.raw_payload
+        )
+        tpex_disposition_ok = True
+    except Exception:
+        logger.exception(
+            "TPEx bulletin/disposal fetch/parse failed — is_disposition "
+            "will be Unknown for every TPEx candidate this run, not "
+            "assumed False"
+        )
+
+    # OR-merge: a stock can appear in both an attention hit and a
+    # disposition hit (from the same market) — combine into one
+    # RegulatoryRiskStatus per stock_id rather than letting the later
+    # source's dict silently overwrite the earlier one's fields. A given
+    # stock_id is only ever produced by ONE market's mappers (TWSE and
+    # TPEx list disjoint stock_ids), so cross-market collisions can't
+    # happen here — only attention-vs-disposition, within the same market.
+    regulatory_by_stock: dict[str, RegulatoryRiskStatus] = {}
+    for source_dict in (
+        twse_attention_by_stock,
+        twse_disposition_by_stock,
+        tpex_attention_by_stock,
+        tpex_disposition_by_stock,
+    ):
+        for stock_id, status in source_dict.items():
+            existing = regulatory_by_stock.get(stock_id)
+            regulatory_by_stock[stock_id] = (
+                status
+                if existing is None
+                else _merge_regulatory_status(existing, status)
+            )
+
+    logger.info(
+        "Regulatory risk snapshot: twse_attention_ok=%s(%d) "
+        "twse_disposition_ok=%s(%d) tpex_attention_ok=%s(%d) "
+        "tpex_disposition_ok=%s(%d) merged=%d",
+        twse_attention_ok,
+        len(twse_attention_by_stock),
+        twse_disposition_ok,
+        len(twse_disposition_by_stock),
+        tpex_attention_ok,
+        len(tpex_attention_by_stock),
+        tpex_disposition_ok,
+        len(tpex_disposition_by_stock),
+        len(regulatory_by_stock),
+    )
+
     # --- Step 2: stock master reference data from FinMind ---
     try:
         stock_info_payload = finmind_client.fetch_stock_info(
@@ -1130,6 +1373,11 @@ def run(
         finmind_client=finmind_client,
         ingestion_run_id=ingestion_run_id,
         risk_policy=risk_policy,
+        regulatory_by_stock=regulatory_by_stock,
+        twse_attention_ok=twse_attention_ok,
+        twse_disposition_ok=twse_disposition_ok,
+        tpex_attention_ok=tpex_attention_ok,
+        tpex_disposition_ok=tpex_disposition_ok,
     )
     logger.info(
         "Built StockFeatures for %d of %d candidates after RiskPolicy",
@@ -1188,6 +1436,7 @@ def run(
             ranked_stocks=top_ranked,
             stock_master=stock_master,
             candidates=candidates_by_stock_id,
+            regulatory_by_stock=regulatory_by_stock,
         )
 
         # IMPORTANT: must stay deterministic for same-day idempotent

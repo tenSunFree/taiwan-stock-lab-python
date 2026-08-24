@@ -14,12 +14,22 @@ change percent, and derived risk-input pattern features (one-price
 limit-up) without re-fetching anything — CandidateBuilder already
 carries the raw DailyPrice + LimitUpResult that the ranked stocks came
 from.
+
+As of text-v5, also merges in RegulatoryRiskStatus (see
+app.domain.models) so the report can show WHY a stock is flagged
+ATTENTION_STOCK/DISPOSITION_STOCK (short reason text) and, for
+disposition, the active period — not just the bare flag name. Unlike
+stock_master/candidates above, a missing regulatory_by_stock entry is
+NOT a pipeline invariant violation: most ranked stocks simply aren't
+under attention/disposition at all, so a lookup miss here just means
+"no detail to show," the same everyday case as a stock having no
+risk_flags.
 """
 
 from __future__ import annotations
 
 from app.domain.candidate_builder import Candidate
-from app.domain.models import StockMaster
+from app.domain.models import RegulatoryRiskStatus, StockMaster
 from app.domain.risk_inputs import is_one_price_limit_up
 from app.domain.scoring import FACTOR_WEIGHTS, ScoredStock
 from app.reports.text_renderer import FACTOR_DISPLAY_NAMES, ReportStockView
@@ -30,6 +40,7 @@ def build_report_stocks(
     ranked_stocks: list[ScoredStock],
     stock_master: dict[str, StockMaster],
     candidates: dict[str, Candidate],
+    regulatory_by_stock: dict[str, RegulatoryRiskStatus] | None = None,
 ) -> list[ReportStockView]:
     """
     candidates: stock_id -> Candidate, keyed from the same
@@ -40,7 +51,13 @@ def build_report_stocks(
         broke upstream and this function refuses to silently drop the
         stock or produce a report that quietly looks normal but is
         missing data.
+    regulatory_by_stock: stock_id -> RegulatoryRiskStatus, the same
+        merged dict app.jobs.daily_ranking builds in Step 1d/Step 5.
+        Optional and defaults to {} — unlike `candidates` above, an
+        absent entry here is the ordinary case (most stocks aren't
+        flagged), not an invariant violation.
     """
+    regulatory_by_stock = regulatory_by_stock or {}
     results: list[ReportStockView] = []
 
     for rank, scored in enumerate(ranked_stocks, start=1):
@@ -88,6 +105,8 @@ def build_report_stocks(
             limit_up_price=candidate.limit_up.limit_up_price,
         )
 
+        regulatory = regulatory_by_stock.get(scored.stock_id)
+
         results.append(
             ReportStockView(
                 rank=rank,
@@ -101,6 +120,20 @@ def build_report_stocks(
                 change_percent=change_percent,
                 missing_factor_names=missing_factor_names,
                 is_one_price_limit_up=one_price_limit_up,
+                attention_reason=(
+                    regulatory.attention_reason if regulatory is not None else None
+                ),
+                disposition_start_date=(
+                    regulatory.disposition_start_date
+                    if regulatory is not None
+                    else None
+                ),
+                disposition_end_date=(
+                    regulatory.disposition_end_date if regulatory is not None else None
+                ),
+                disposition_reason=(
+                    regulatory.disposition_reason if regulatory is not None else None
+                ),
             )
         )
 

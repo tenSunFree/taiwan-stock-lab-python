@@ -142,6 +142,107 @@ def test_report_omits_pattern_section_when_not_one_price_limit_up():
     assert "型態特徵：" not in report
 
 
+# --- Official regulatory risk display (Step 6) ------------------------------
+
+
+def test_report_shows_attention_reason_inline_when_available():
+    report = _render(
+        _make_stock_view(
+            risk_flags=("ATTENTION_STOCK",),
+            attention_reason="最近六個營業日累積漲幅達32.74%",
+        )
+    )
+    assert "注意有價證券（最近六個營業日累積漲幅達32.74%）" in report
+
+
+def test_report_falls_back_to_plain_label_when_attention_reason_missing():
+    """If the reason text somehow isn't available, still show SOME
+    label rather than an empty/broken line — the flag itself is real
+    even without detail."""
+    report = _render(_make_stock_view(risk_flags=("ATTENTION_STOCK",)))
+    assert "・注意股" in report
+
+
+def test_report_shows_disposition_period_and_reason_with_emphasis_marker():
+    """
+    Core regression for the "使用者應該馬上看到處置警示" requirement:
+    a disposition stock must NOT be rendered as a plain "・" bullet
+    the way other flags are — it gets a distinct 🚨 marker plus its
+    own period line, since this is a far more serious official signal
+    than an attention flag.
+    """
+    report = _render(
+        _make_stock_view(
+            risk_flags=("DISPOSITION_STOCK",),
+            disposition_start_date=dt.date(2026, 8, 24),
+            disposition_end_date=dt.date(2026, 8, 28),
+            disposition_reason="連續三次",
+        )
+    )
+    assert "🚨 處置有價證券（處置期間：2026/08/24～2026/08/28）" in report
+    assert "處置原因：連續三次" in report
+    assert "詳細處置措施請參閱交易所公告" in report
+    # must NOT render as a plain bullet the way other flags do
+    assert "・處置股" not in report
+
+
+def test_report_disposition_never_reproduces_full_legal_text():
+    """
+    ReportStockView deliberately has no field for disposition_measure
+    (the full legal-text paragraph, which can run several hundred
+    characters in real TWSE/TPEx fixtures) — only the short
+    disposition_reason. This test guards against a future change
+    accidentally reintroducing the full text and risking the
+    5000-UTF16-unit LINE message limit on a day with several
+    disposition stocks.
+    """
+    long_legal_text = (
+        "以人工管制之撮合終端機執行撮合作業" * 20
+    )  # simulate a long paragraph
+    report = _render(
+        _make_stock_view(
+            risk_flags=("DISPOSITION_STOCK",),
+            disposition_start_date=dt.date(2026, 8, 24),
+            disposition_end_date=dt.date(2026, 8, 28),
+            disposition_reason="連續三次",
+        )
+    )
+    assert long_legal_text not in report  # was never passed in, sanity check
+    assert "以人工管制之撮合終端機執行撮合作業" not in report
+
+
+def test_report_falls_back_to_plain_label_when_disposition_period_missing():
+    """A DISPOSITION_STOCK flag without period detail (shouldn't
+    normally happen, but handled gracefully) still shows something,
+    not a broken/empty line."""
+    report = _render(_make_stock_view(risk_flags=("DISPOSITION_STOCK",)))
+    assert "・處置股" in report
+
+
+def test_report_shows_managed_stock_plain_label():
+    """MANAGED_STOCK has no period/reason fields in RegulatoryRiskStatus
+    at all (no verified data source yet) — always the plain label."""
+    report = _render(_make_stock_view(risk_flags=("MANAGED_STOCK",)))
+    assert "・全額交割／變更交易方法股票" in report
+
+
+def test_report_combines_multiple_regulatory_flags_on_one_stock():
+    """A stock can genuinely be both attention AND disposition at
+    once (see app.domain.models.RegulatoryRiskStatus's own docstring)
+    — both must render, each with its own detail."""
+    report = _render(
+        _make_stock_view(
+            risk_flags=("ATTENTION_STOCK", "DISPOSITION_STOCK"),
+            attention_reason="近期異常",
+            disposition_start_date=dt.date(2026, 8, 24),
+            disposition_end_date=dt.date(2026, 8, 28),
+            disposition_reason="連續三次",
+        )
+    )
+    assert "注意有價證券（近期異常）" in report
+    assert "🚨 處置有價證券（處置期間：2026/08/24～2026/08/28）" in report
+
+
 def test_report_uses_renamed_section_headers():
     report = _render(_make_stock_view())
     assert "主要得分來源：" in report

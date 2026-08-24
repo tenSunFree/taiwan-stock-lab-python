@@ -1,4 +1,4 @@
-strategy_version: rule-v1.1.0
+strategy_version: rule-v1.2.0
 
 candidate:
   maximum_count: 50
@@ -10,7 +10,17 @@ risk_policy:
   maximum_consecutive_limit_up_days: 3
   excessive_return_5d: 0.35
   minimum_data_completeness: 0.80
+
+  # rule-v1.2.0: official regulatory statuses (attention/disposition/
+  # managed) are all "allowed but flagged" by default now, not hard
+  # exclusion — see app.domain.risk_policy.RiskPolicyConfig's own
+  # docstring for why disposition/managed default to True (not
+  # excluded) even though they're a more serious official signal than
+  # an attention stock: display the official status honestly first,
+  # decide whether to actually exclude only after backtesting.
   allow_attention_stock: true
+  allow_disposition_stock: true
+  allow_managed_stock: true
   allow_ky_stock: true
   allow_one_price_limit_up: true
 
@@ -18,8 +28,17 @@ risk_policy:
   # now (no config loader reads this section yet) — same status as
   # candidate.minimum_turnover/maximum_count above. strategy-v1
   # provisional assumptions, must be tuned via backtesting.
+  #
+  # rule-v1.2.0: attention_stock/disposition_stock/managed_stock are
+  # all 0.0 (display-only) — attention_stock previously carried 0.15
+  # here before is_attention had any wired-in data source, which
+  # would have started silently penalizing scores the moment real
+  # data was wired in. This is the single place to change once
+  # backtesting justifies a real penalty for any of the three.
   penalties:
-    attention_stock: 0.15
+    attention_stock: 0.0
+    disposition_stock: 0.0
+    managed_stock: 0.0
     ky_stock: 0.10
     one_price_limit_up: 0.20
     excessive_consecutive_limit_up: 0.30
@@ -36,5 +55,5 @@ weights:
 # All thresholds and weights above are only strategy-v1 initial
 # assumptions and must be tuned via Phase 5 performance tracking and
 # out-of-sample backtesting. When tuning, create a new
-# strategy_version (e.g. rule-v1.1.0) instead of overwriting this one,
+# strategy_version (e.g. rule-v1.2.0) instead of overwriting this one,
 # otherwise historical ranking results lose their reference baseline.

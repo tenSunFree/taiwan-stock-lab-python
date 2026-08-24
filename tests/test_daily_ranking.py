@@ -9,7 +9,7 @@ from app.ingestion.market_data_client import (
     TpexClient,
     TwseClient,
 )
-from app.domain.risk_policy import RiskPolicy
+from app.domain.risk_policy import RiskPolicy, RiskPolicyConfig
 from app.ingestion.twse_mapper import parse_stock_day_all_csv
 from app.jobs.daily_ranking import InMemoryRawPayloadRepository, run
 
@@ -140,11 +140,90 @@ def _default_tpex_valuation_rows(
     return result
 
 
+def _default_twse_attention_html() -> str:
+    """
+    Structurally valid, empty attention list, with a deliberately WIDE
+    title date range (2001~2110) so it satisfies
+    build_twse_attention_statuses's title-window-covers-target_date
+    check regardless of which target_date a given test happens to use
+    — most tests in this file don't care about regulatory data at all
+    and shouldn't need to track target_date just to get a passing
+    default fixture.
+    """
+    return (
+        "<!doctype html><html><body><div><table><thead>"
+        "<tr><th colspan='8'><div>公布注意有價證券資訊 "
+        "(90年01月01日 至 199年12月31日 全部上市有價證券)</div></th></tr>"
+        "<tr><th>編號</th><th>證券代號</th><th>證券名稱</th><th>累計次數</th>"
+        "<th>注意交易資訊</th><th>日期</th><th>收盤價</th><th>本益比</th></tr>"
+        "</thead><tbody></tbody></table></div></body></html>"
+    )
+
+
+def _default_twse_disposition_html() -> str:
+    """Structurally valid, empty disposition list. Disposition only
+    needs a PARSEABLE title (not one covering target_date — see
+    build_twse_disposition_statuses's own docstring), so the exact
+    date range here doesn't matter as long as it parses."""
+    return (
+        "<!doctype html><html><body><div><table><thead>"
+        "<tr><th colspan='10'><div>公布處置有價證券資訊 "
+        "(115/01/01 至 115/12/31)</div></th></tr>"
+        "<tr><th>編號</th><th>公布日期</th><th>證券代號</th><th>證券名稱</th>"
+        "<th>累計</th><th>處置條件</th><th>處置起迄時間</th><th>處置措施</th>"
+        "<th>處置內容</th><th>備註</th></tr>"
+        "</thead><tbody></tbody></table></div></body></html>"
+    )
+
+
+_DEFAULT_TPEX_ATTENTION_PAYLOAD = {
+    "tables": [
+        {
+            "fields": [
+                "編號",
+                "證券代號",
+                "證券名稱",
+                "累計",
+                "注意交易資訊",
+                "公告日期",
+                "收盤價",
+                "本益比",
+                "link",
+            ],
+            "data": [],
+        }
+    ]
+}
+
+_DEFAULT_TPEX_DISPOSITION_PAYLOAD = {
+    "tables": [
+        {
+            "fields": [
+                "編號",
+                "公布日期",
+                "證券代號",
+                "證券名稱",
+                "累計",
+                "處置起訖時間",
+                "處置原因",
+                "處置內容",
+                "收盤價",
+                "本益比",
+                " ",
+            ],
+            "data": [],
+        }
+    ]
+}
+
+
 def make_twse_client(
     repository: InMemoryRawPayloadRepository,
     csv_text: str,
     *,
     valuation_rows: list[dict] | None = None,
+    attention_html: str | None = None,
+    disposition_html: str | None = None,
 ) -> TwseClient:
     """
     valuation_rows: BWIBBU_ALL rows to serve from fetch_valuation().
@@ -154,13 +233,28 @@ def make_twse_client(
         empty list explicitly to simulate "no usable valuation data"
         (WAITING_FOR_DATA), or a list with specific P/E values to
         exercise the filter's pass/fail boundary.
+    attention_html / disposition_html: raw HTML to serve from
+        fetch_attention()/fetch_disposition(). Default to a
+        structurally valid, empty (zero currently-flagged stocks)
+        response, so callers that don't care about regulatory risk
+        data don't have to construct HTML fixtures by hand. Pass a
+        deliberately malformed string to exercise
+        RegulatorySourceFormatError handling.
     """
     if valuation_rows is None:
         valuation_rows = _default_twse_valuation_rows(csv_text)
+    if attention_html is None:
+        attention_html = _default_twse_attention_html()
+    if disposition_html is None:
+        disposition_html = _default_twse_disposition_html()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/exchangeReport/BWIBBU_ALL":
             return httpx.Response(200, json=valuation_rows)
+        if request.url.path == "/announcement/notice":
+            return httpx.Response(200, text=attention_html)
+        if request.url.path == "/announcement/punish":
+            return httpx.Response(200, text=disposition_html)
         return httpx.Response(200, text=csv_text)
 
     return TwseClient(
@@ -173,6 +267,8 @@ def make_tpex_client(
     json_rows: list[dict],
     *,
     valuation_rows: list[dict] | None = None,
+    attention_payload: dict | None = None,
+    disposition_payload: dict | None = None,
 ) -> TpexClient:
     """valuation_rows: same idea as make_twse_client's, but for
     tpex_mainboard_peratio_analysis, which is a BARE JSON array — same
@@ -182,13 +278,24 @@ def make_tpex_client(
     market_data_client.TpexClient.fetch_valuation's docstring for why
     that was wrong — confirmed only via a raw HTTP body dump, not
     PowerShell's Invoke-RestMethod/ConvertTo-Json, which can silently
-    reshape a bare array into something that looks wrapped)."""
+    reshape a bare array into something that looks wrapped).
+    attention_payload / disposition_payload: same idea, for
+    fetch_attention()/fetch_disposition() — default to a structurally
+    valid, empty {"tables": [...]} response."""
     if valuation_rows is None:
         valuation_rows = _default_tpex_valuation_rows(json_rows)
+    if attention_payload is None:
+        attention_payload = _DEFAULT_TPEX_ATTENTION_PAYLOAD
+    if disposition_payload is None:
+        disposition_payload = _DEFAULT_TPEX_DISPOSITION_PAYLOAD
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/openapi/v1/tpex_mainboard_peratio_analysis":
             return httpx.Response(200, json=valuation_rows)
+        if request.url.path == "/www/zh-tw/bulletin/attention":
+            return httpx.Response(200, json=attention_payload)
+        if request.url.path == "/www/zh-tw/bulletin/disposal":
+            return httpx.Response(200, json=disposition_payload)
         return httpx.Response(200, json=json_rows)
 
     return TpexClient(
@@ -217,10 +324,26 @@ def make_all_clients(
     stock_info_data: dict,
     twse_valuation_rows: list[dict] | None = None,
     tpex_valuation_rows: list[dict] | None = None,
+    twse_attention_html: str | None = None,
+    twse_disposition_html: str | None = None,
+    tpex_attention_payload: dict | None = None,
+    tpex_disposition_payload: dict | None = None,
 ) -> tuple[TwseClient, TpexClient, FinMindClient]:
     return (
-        make_twse_client(repository, twse_csv, valuation_rows=twse_valuation_rows),
-        make_tpex_client(repository, tpex_rows, valuation_rows=tpex_valuation_rows),
+        make_twse_client(
+            repository,
+            twse_csv,
+            valuation_rows=twse_valuation_rows,
+            attention_html=twse_attention_html,
+            disposition_html=twse_disposition_html,
+        ),
+        make_tpex_client(
+            repository,
+            tpex_rows,
+            valuation_rows=tpex_valuation_rows,
+            attention_payload=tpex_attention_payload,
+            disposition_payload=tpex_disposition_payload,
+        ),
         make_finmind_client(repository, stock_info_data),
     )
 
@@ -421,9 +544,10 @@ def test_run_produces_zero_candidates_when_no_stock_is_limit_up(monkeypatch, cap
     assert result == 0
     assert "CandidateBuilder produced 0 provisional candidates" in caplog.text
     assert "twse=1, tpex=1" in caplog.text
-    # 5 base snapshots: twse price + tpex price + twse valuation +
-    # tpex valuation + finmind stock_info.
-    assert len(repository.saved) == 5
+    # 9 base snapshots: twse price + tpex price + twse valuation +
+    # tpex valuation + twse attention + twse disposition + tpex
+    # attention + tpex disposition + finmind stock_info.
+    assert len(repository.saved) == 9
     assert {p.source for p in repository.saved} == {"twse", "tpex", "finmind"}
 
 
@@ -459,11 +583,13 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
-    # 5 base snapshots (twse price + tpex price + twse valuation +
-    # tpex valuation + finmind stock_info) + 3 per-candidate FinMind
-    # enrichment snapshots (price history + institutional + monthly
-    # revenue; this test has exactly 1 candidate) = 8.
-    assert len(repository.saved) == 8
+    # 9 base snapshots (twse price + tpex price + twse valuation +
+    # tpex valuation + twse attention + twse disposition + tpex
+    # attention + tpex disposition + finmind stock_info) + 3
+    # per-candidate FinMind enrichment snapshots (price history +
+    # institutional + monthly revenue; this test has exactly 1
+    # candidate) = 12.
+    assert len(repository.saved) == 12
     assert "Built StockFeatures for 1 of 1 candidates after RiskPolicy" in caplog.text
 
 
@@ -508,10 +634,10 @@ def test_run_excludes_candidate_with_pe_above_maximum_before_finmind_enrichment(
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "P/E eligibility filter: before=1 after=0" in caplog.text
     assert "Built StockFeatures for 0 of 0 candidates after RiskPolicy" in caplog.text
-    # Exactly the 5 base snapshots — zero per-candidate FinMind
+    # Exactly the 9 base snapshots — zero per-candidate FinMind
     # enrichment snapshots, proving the excluded candidate never
     # reached Step 5 at all.
-    assert len(repository.saved) == 5
+    assert len(repository.saved) == 9
 
 
 def test_run_keeps_candidate_with_pe_exactly_at_maximum(monkeypatch, caplog):
@@ -690,13 +816,17 @@ def test_run_excludes_single_stock_missing_from_an_otherwise_populated_snapshot(
     assert "Built StockFeatures for 0 of 0 candidates after RiskPolicy" in caplog.text
 
 
-def test_strategy_version_bumped_to_rule_v1_1_0():
+def test_strategy_version_bumped_to_rule_v1_2_0():
     """
-    Regression test for the STRATEGY_VERSION bump itself — the P/E
-    filter changes which candidates are eligible, which per this
-    file's own versioning rule (see the yaml's comment: "when tuning,
-    create a new strategy_version instead of overwriting this one")
-    requires a new strategy_version, not a reuse of rule-v1.0.0.
+    Regression test for the STRATEGY_VERSION bump — both the P/E
+    filter (rule-v1.1.0) and the disposition/managed-stock policy
+    change (rule-v1.2.0: hard exclusion -> configurable, default
+    allowed-but-flagged; ATTENTION_STOCK penalty 0.15 -> 0.0) changed
+    which candidates are eligible and what score they get, which per
+    this file's own versioning rule (see the yaml's comment: "when
+    tuning, create a new strategy_version instead of overwriting this
+    one") each require their own version rather than reusing a prior
+    one.
 
     Asserted directly on the constant rather than via a run()+caplog
     round trip: STRATEGY_VERSION is only ever logged when
@@ -707,7 +837,7 @@ def test_strategy_version_bumped_to_rule_v1_1_0():
     """
     from app.jobs.daily_ranking import STRATEGY_VERSION
 
-    assert STRATEGY_VERSION == "rule-v1.1.0"
+    assert STRATEGY_VERSION == "rule-v1.2.0"
 
 
 def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypatch):
@@ -783,6 +913,178 @@ def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypa
     assert "進入候選池：2 檔" in captured.out
 
 
+# --- Step 1d / Step 5: official regulatory risk data end-to-end ------------
+
+
+def test_run_surfaces_twse_attention_flag_through_the_whole_pipeline(
+    monkeypatch, caplog
+):
+    """
+    End-to-end regression: a stock hit in TWSE's real HTML attention
+    response must actually flow through fetch_attention() ->
+    twse_regulatory_mapper's HTML parsing -> the OR-merge into
+    regulatory_by_stock — proves the real ingestion path is wired
+    correctly, not just each piece in isolation (fetch tested at the
+    client level, parsing tested in test_twse_regulatory_mapper.py,
+    RiskPolicy resolution tested in
+    test_build_stock_features_disposition_stock_allowed_but_flagged's
+    siblings — this is the piece connecting all three).
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    attention_html = (
+        "<!doctype html><html><body><div><table><thead>"
+        "<tr><th colspan='8'><div>公布注意有價證券資訊 "
+        "(115年08月07日 至 115年08月07日 全部上市有價證券)</div></th></tr>"
+        "<tr><th>編號</th><th>證券代號</th><th>證券名稱</th><th>累計次數</th>"
+        "<th>注意交易資訊</th><th>日期</th><th>收盤價</th><th>本益比</th></tr>"
+        "</thead><tbody>"
+        "<tr><td>1</td><td>1101</td><td>測試水泥</td><td>3</td>"
+        "<td>近期異常</td><td>115/08/07</td><td>44.65</td><td>15.0</td></tr>"
+        "</tbody></table></div></body></html>"
+    )
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        twse_attention_html=attention_html,
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    assert "Regulatory risk snapshot: twse_attention_ok=True(1)" in caplog.text
+    assert "merged=1" in caplog.text
+
+
+def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
+    capsys, monkeypatch
+):
+    """
+    Step 6 end-to-end regression: a disposition hit from TWSE's real
+    HTML must flow all the way through fetch -> mapper -> merge ->
+    RiskPolicy -> ScoredStock.risk_flags -> report_builder's
+    regulatory_by_stock merge -> the rendered report text, showing the
+    actual disposition period — not just the bare DISPOSITION_STOCK
+    flag name. Patches score_candidates() at the boundary (same
+    pattern as test_run_report_dry_run_prints_ranked_report) since
+    FinMind enrichment internals are already covered elsewhere; this
+    test's job is to prove the regulatory data specifically reaches
+    the final report text.
+    """
+    from unittest.mock import patch
+
+    from app.domain.scoring import ScoredStock
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    disposition_html = (
+        "<!doctype html><html><body><div><table><thead>"
+        "<tr><th colspan='10'><div>公布處置有價證券資訊 "
+        "(115/08/01 至 115/08/07)</div></th></tr>"
+        "<tr><th>編號</th><th>公布日期</th><th>證券代號</th><th>證券名稱</th>"
+        "<th>累計</th><th>處置條件</th><th>處置起迄時間</th><th>處置措施</th>"
+        "<th>處置內容</th><th>備註</th></tr>"
+        "</thead><tbody>"
+        "<tr><td>1</td><td>115/08/07</td><td>1101</td><td>測試水泥</td>"
+        "<td>3</td><td>連續三次</td><td>115/08/07～115/08/13</td>"
+        "<td>人工管制撮合</td><td>依交易所公告執行撮合作業</td><td></td></tr>"
+        "</tbody></table></div></body></html>"
+    )
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        twse_disposition_html=disposition_html,
+    )
+
+    fake_scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=82.5,
+            data_completeness=0.90,
+            factor_scores={
+                "liquidity": 90.0,
+                "volume_price": 80.0,
+                "momentum": 75.0,
+                "institutional": 70.0,
+                "fundamental": 85.0,
+                "risk_quality": None,
+            },
+            risk_flags=("DISPOSITION_STOCK",),
+        )
+    ]
+
+    with patch("app.jobs.daily_ranking.score_candidates", return_value=fake_scored):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "🚨 處置有價證券（處置期間：2026/08/07～2026/08/13）" in captured.out
+    assert "處置原因：連續三次" in captured.out
+    # the full legal-text "處置內容" must never appear verbatim
+    assert "依交易所公告執行撮合作業" not in captured.out
+
+
+def test_run_treats_regulatory_source_failure_as_non_fatal(monkeypatch, caplog):
+    """
+    Core regression for this feature's failure policy: unlike Step 1c's
+    P/E valuation check (which returns WAITING_FOR_DATA on a source
+    failure), a regulatory source failure must NOT block the whole
+    run — this data is display-only in v1, so there's no "cannot
+    verify eligibility" reason to withhold the entire ranking. Uses a
+    deliberately malformed TWSE attention response (missing the
+    expected table structure) to trigger the failure path.
+    """
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client = make_all_clients(
+        repository=repository,
+        twse_csv=TWSE_CSV_LIMIT_UP,
+        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+        stock_info_data=_merged_stock_info(
+            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+        ),
+        twse_attention_html="<html><body>not a valid report table</body></html>",
+    )
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+        )
+
+    # The run must still succeed overall (0), not fail (1) or wait (2).
+    assert result == 0
+    assert "TWSE announcement/notice fetch/parse failed" in caplog.text
+    assert "twse_attention_ok=False" in caplog.text
+
+
 def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
@@ -802,10 +1104,11 @@ def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
     )
 
     assert result == 1
-    # 5 base snapshots: twse price + tpex price + twse valuation +
-    # tpex valuation + finmind stock_info (saved even though its rows
-    # turned out unusable — "save raw, parse later").
-    assert len(repository.saved) == 5
+    # 9 base snapshots: twse price + tpex price + twse valuation +
+    # tpex valuation + twse attention + twse disposition + tpex
+    # attention + tpex disposition + finmind stock_info (saved even
+    # though its rows turned out unusable — "save raw, parse later").
+    assert len(repository.saved) == 9
 
 
 def test_run_returns_1_when_twse_fetch_raises(monkeypatch):
@@ -1335,10 +1638,30 @@ def test_build_stock_features_revenue_empty_rows_leaves_revenue_yoy_none():
 # --- Risk assessment (Step 2) ---
 
 
-def test_build_stock_features_disposition_stock_is_excluded_from_features():
+def test_build_stock_features_disposition_stock_allowed_by_default_but_flagged():
+    """
+    Regression test for the v1 "官方風控" rollout: RiskPolicy's default
+    allow_disposition_stock=True means a disposition stock must NOT be
+    silently dropped from features — it must still reach the report
+    with a DISPOSITION_STOCK flag so the reader sees the official
+    warning, not just a smaller ranking with no explanation. See
+    RiskPolicyConfig.allow_disposition_stock's own docstring for why
+    v1 defaults to NOT excluding, unlike attention stocks which were
+    already display-only-by-default before this change.
+
+    Regulatory status is supplied via regulatory_by_stock (the real
+    integration path — see _resolve_regulatory_flags), not via
+    _make_candidate's is_disposition kwarg: that kwarg only sets
+    StockMaster.is_disposition, which build_stock_features's
+    RiskPolicy.assess() call no longer reads (that field is always
+    None in production — FinMind never populates it — the real
+    signal now comes from regulatory_by_stock, populated by
+    app.ingestion.regulatory_mapper / twse_regulatory_mapper).
+    """
+    from app.domain.models import RegulatoryRiskStatus
     from app.jobs.daily_ranking import build_stock_features
 
-    candidates = [_make_candidate("1101", is_disposition=True)]
+    candidates = [_make_candidate("1101")]
     client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
 
     features = build_stock_features(
@@ -1347,9 +1670,88 @@ def test_build_stock_features_disposition_stock_is_excluded_from_features():
         finmind_client=client,
         ingestion_run_id="run-1",
         risk_policy=RiskPolicy(),
+        regulatory_by_stock={
+            "1101": RegulatoryRiskStatus(
+                trading_date=TARGET_DATE,
+                stock_id="1101",
+                is_disposition=True,
+                disposition_reason="連續三次",
+                disposition_measure="人工管制撮合",
+            )
+        },
+        twse_attention_ok=True,
+        twse_disposition_ok=True,
+    )
+
+    assert len(features) == 1
+    assert "DISPOSITION_STOCK" in features[0].risk_flags
+    # is_managed/consecutive_limit_up_days are still unknown for this
+    # fixture, so risk_quality_raw correctly stays None rather than a
+    # fabricated score — this test is about exclusion, not
+    # completeness.
+    assert features[0].risk_quality_raw is None
+
+
+def test_build_stock_features_disposition_stock_excluded_when_policy_disallows():
+    """The exclusion behavior still exists, just gated behind config
+    now instead of being unconditional — see RiskPolicy.assess()."""
+    from app.domain.models import RegulatoryRiskStatus
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(RiskPolicyConfig(allow_disposition_stock=False)),
+        regulatory_by_stock={
+            "1101": RegulatoryRiskStatus(
+                trading_date=TARGET_DATE, stock_id="1101", is_disposition=True
+            )
+        },
+        twse_attention_ok=True,
+        twse_disposition_ok=True,
     )
 
     assert features == []
+
+
+def test_build_stock_features_regulatory_source_failure_leaves_flags_unknown_not_false():
+    """
+    The core regression this feature's "Unknown when API fails"
+    requirement exists for: when a source's fetch/parse failed this
+    run (twse_disposition_ok=False), a candidate absent from
+    regulatory_by_stock must resolve to is_disposition=None
+    (unconfirmed), which RiskPolicy.assess() tracks in
+    missing_inputs — NOT is_disposition=False (which would silently
+    claim "confirmed not under disposition" when the source was never
+    actually successfully checked)."""
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+        regulatory_by_stock={},
+        twse_attention_ok=True,
+        twse_disposition_ok=False,  # simulates a failed TWSE punish fetch
+    )
+
+    assert len(features) == 1
+    assert "DISPOSITION_STOCK" not in features[0].risk_flags
+    # risk_quality_raw stays None because is_disposition is Unknown
+    # (in missing_inputs), the same observable proxy the existing
+    # test_build_stock_features_unknown_status_never_yields_full_risk_quality
+    # uses — StockFeatures doesn't expose missing_inputs directly.
+    assert features[0].risk_quality_raw is None
 
 
 def test_build_stock_features_ky_stock_flagged_with_known_clean_status():

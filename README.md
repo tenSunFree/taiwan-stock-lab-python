@@ -41,6 +41,14 @@ a later phase (see [Roadmap](#roadmap)).
 
 ---
 
+## Preview
+
+<p align="left">
+  <img src="https://i.postimg.cc/RF5LzJN6/Screenshot-20260824-234847.png" width="160"/>
+</p>
+
+---
+
 ## Features
 
 ### Data Pipeline
@@ -62,6 +70,20 @@ a later phase (see [Roadmap](#roadmap)).
   depends on data (EPS, dividends) that isn't finalized as fast as a
   closing price is — bounded by a staleness ceiling so a genuinely
   stalled source is still caught, not silently accepted forever
+- Official regulatory risk ingestion (attention/disposition) from
+  TWSE's HTML report pages (`announcement/notice`,
+  `announcement/punish`) and TPEx's JSON bulletin endpoints
+  (`bulletin/attention`, `bulletin/disposal`). Each of the four
+  sources (TWSE attention, TWSE disposition, TPEx attention, TPEx
+  disposition) fetches and parses independently and fails
+  non-fatally — a failed source leaves that market's
+  `is_attention`/`is_disposition` flags `None` (unconfirmed) for every
+  candidate on that market this run, never silently assumed `False`.
+  TWSE's `announcement/notice` endpoint only ever reports on the
+  current calendar day's query window (no historical date parameter
+  is exposed), so a backfill run for a past `TARGET_TRADING_DATE`
+  will correctly fail this one source rather than risk mismatching a
+  different day's data
 - Legally correct tick-size table and limit-up price calculation using
   `Decimal` arithmetic, verified against the official TWSE worked
   example (reference price 40.60 → limit-up price 44.65) and against a
@@ -122,16 +144,37 @@ a later phase (see [Roadmap](#roadmap)).
 
 ### Risk Policy
 
-- Hard exclusions (disposition stocks, managed/full-cash-delivery
-  stocks) kept separate from soft risk flags (attention stock, KY
-  stock, one-price limit-up, excessive consecutive limit-up days,
-  elevated 5-day return) that are recorded but do not remove a
-  candidate from consideration
+- Official attention/disposition/managed status is tri-state
+  (`bool | None`) and, as of `rule-v1.2.0`, defaults to **allowed but
+  flagged** rather than hard exclusion: a disposition or
+  managed/full-cash-delivery stock still reaches scoring and the
+  report with a `DISPOSITION_STOCK`/`MANAGED_STOCK` flag, instead of
+  silently vanishing from the candidate pool with no explanation.
+  This is a more serious official signal than an attention stock, but
+  hard exclusion is deliberately deferred until the flag has been
+  observed and backtested — display the official status honestly
+  first, decide whether to actually exclude later. Each is
+  independently configurable back to hard exclusion via
+  `RiskPolicyConfig.allow_disposition_stock` /
+  `allow_managed_stock` (and the pre-existing
+  `allow_attention_stock`)
+- Score penalties for `ATTENTION_STOCK`/`DISPOSITION_STOCK`/
+  `MANAGED_STOCK` are `0.0` (display-only) in `rule-v1.2.0` — flagging
+  a stock never changes its `risk_quality` score yet, only what's
+  shown in the report. `RISK_FLAG_PENALTIES` is the single place to
+  change once backtesting justifies a real penalty for any of the
+  three
+- Soft risk flags that were already display-only before this change
+  (KY stock, one-price limit-up, excessive consecutive limit-up days,
+  elevated 5-day return) are unaffected
 - Tri-state inputs (`bool | None`, not `bool`): `None` means "no data
   source has confirmed this status yet," and is never silently
   coerced into `False`/"confirmed clean" — an unconfirmed input is
   tracked in `missing_inputs` and disqualifies that stock's
-  `risk_quality_raw` from being scored as if it were verified
+  `risk_quality_raw` from being scored as if it were verified. A
+  source failure for attention/disposition data (see Data Pipeline
+  above) is exactly this case: it leaves the affected market's
+  candidates with `None`, not `False`
 - Every threshold lives in a versioned `RiskPolicyConfig`
   (`config/strategy-v1.yaml`) rather than being hardcoded
 
@@ -158,6 +201,14 @@ a later phase (see [Roadmap](#roadmap)).
   with explicit counts distinguishing "entered the candidate pool"
   from "cleared the completeness gate" — no field is named in a way
   that overstates what it actually measures
+- Attention/disposition flags render with their official reason text
+  and, for disposition, the active period (e.g. `2026/08/24 ~
+  2026/08/28`) — not just the bare flag name — so the reader sees
+  *why* a stock is flagged, not only that it is. The full legal-text
+  description (`disposition_measure`, which can run several hundred
+  characters in real TWSE/TPEx responses) is deliberately never
+  reproduced in the report, to stay within LINE's message length
+  budget; the reader is pointed to the official announcement instead
 - Always renders a report even when zero stocks qualify, rather than
   silently sending nothing — the reader can confirm the pipeline ran
   normally
@@ -213,14 +264,21 @@ a later phase (see [Roadmap](#roadmap)).
   meant only for local/manual validation), Cloud Scheduler + Cloud Run
   Job as an alternative to GitHub Actions scheduling, and an optional
   web dashboard for historical ranking queries
-- **Known data gaps** — `is_attention` / `is_disposition` / `is_managed`
-  have no wired-in official data source yet (TaiwanStockInfo doesn't
-  provide them) and remain `None` for every stock; `consecutive_limit_up_days`
-  has no reliable historical reference-price source and is not
-  reconstructed from raw closing prices, since doing so would violate
-  this project's own rule against inferring limit-up status via
-  "previous close × 1.10." Both gaps are logged as an explicit warning
-  on every run rather than silently assumed fixed.
+- **Known data gaps** — `is_managed` (full-cash-delivery status) still
+  has no wired-in official data source and remains `None` for every
+  stock; `RiskPolicy.assess()` still accepts it as a parameter, it's
+  just never supplied a non-`None` value yet. `is_attention` /
+  `is_disposition` are now wired to TWSE's `announcement/notice` /
+  `announcement/punish` and TPEx's `bulletin/attention` /
+  `bulletin/disposal` endpoints (see Data Pipeline above) — a
+  per-source fetch/parse failure leaves that market's flags `None`
+  (unconfirmed) for the run, never silently coerced to `False`.
+  `consecutive_limit_up_days` still has no reliable historical
+  reference-price source and is not reconstructed from raw closing
+  prices, since doing so would violate this project's own rule
+  against inferring limit-up status via "previous close × 1.10." Both
+  remaining gaps are logged as an explicit warning on every run rather
+  than silently assumed fixed.
 
 ---
 
@@ -305,7 +363,7 @@ python -m app.jobs.daily_ranking   # run the pipeline locally
 Strategy thresholds and factor weights are centralized in
 `config/strategy-v1.yaml` and never hardcoded into domain logic.
 When tuning thresholds after backtesting, create a new
-`strategy_version` (e.g. `rule-v1.1.0`) rather than overwriting the
+`strategy_version` (e.g. `rule-v1.2.0`) rather than overwriting the
 existing file, so historical ranking results keep a stable reference
 baseline.
 
@@ -321,6 +379,13 @@ Environment variables consumed by the job (see
 | `LINE_DELIVERY_MODE`        | `off` (default) / `push` (single target) / `broadcast` (all OA friends)                      |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Required when `LINE_DELIVERY_MODE` is `push` or `broadcast`                                  |
 | `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` — the single LINE user/group/room to deliver to |
+
+> **Note:** TWSE's `announcement/notice` (attention) endpoint only
+> ever reports the current calendar day's data — it has no verified
+> historical date-query parameter. A `TARGET_TRADING_DATE` backfill
+> for a date other than today will correctly fail this one source
+> (logged, non-fatal) rather than risk mismatching a different day's
+> attention list; the rest of the pipeline still completes normally.
 
 ---
 
@@ -346,15 +411,26 @@ pytest -v
   a look-ahead-bias regression test for revenue YoY (a figure is only
   usable once its own disclosure date has passed, not just once its
   calendar month has)
-- Risk-policy tests covering hard exclusion, tri-state input handling
-  (an unconfirmed status is never scored as if it were confirmed
-  clean), policy-driven exclusion, and threshold-driven flags
+- Regulatory-mapper tests (TWSE HTML via `twse_regulatory_mapper.py`,
+  TPEx JSON via `regulatory_mapper.py`) covering exact-announcement-date
+  matching for attention data vs active-period matching for
+  disposition data, title/date-range validation that raises rather
+  than silently trusting a wrong-day or malformed response, and an
+  end-to-end regression proving a real attention/disposition hit flows
+  all the way from the raw fetch through to the rendered report text
+- Risk-policy tests covering tri-state input handling (an unconfirmed
+  status is never scored as if it were confirmed clean), the
+  `rule-v1.2.0` allowed-but-flagged default for disposition/managed
+  stocks alongside the still-available hard-exclusion configuration,
+  and threshold-driven soft flags
 - Scoring tests covering factor-weight integrity, liquidity ordering,
   missing-factor renormalization (never backfilled with a neutral
   score), and Top-N selection under a data-completeness floor
 - Report-renderer tests asserting the disclaimer is always present,
-  that promotional language never appears in output, and that
-  candidate/eligible counts are labeled accurately
+  that promotional language never appears in output, that
+  candidate/eligible counts are labeled accurately, and that a
+  disposition stock's rendered period/reason never leaks the full
+  legal-text description
 - LINE client tests using `httpx.MockTransport` to simulate 200 / 409
   / 429 / 500 responses for both Push and Broadcast endpoints,
   verifying retry-key propagation, duplicate handling, and
@@ -379,8 +455,9 @@ rendering, and delivery:
 app/domain/          Pure business logic — no I/O, no framework dependency
   price_ticks.py         Tick-size table + limit-up price calculation
   limit_up.py             Close-limit-up vs touched-limit-up detection
-  models.py                StockMaster / DailyPrice / StockValuation,
-                            decoupled from any data source
+  models.py                StockMaster / DailyPrice / StockValuation /
+                            RegulatoryRiskStatus, decoupled from any
+                            data source
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
@@ -389,19 +466,24 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   monthly_revenue_builder.py
                              Revenue YoY (look-ahead-safe via available_at)
   risk_inputs.py             Reliable/heuristic RiskPolicy input reconstruction
-  risk_policy.py              Tri-state hard exclusion + soft risk flagging
+  risk_policy.py              Tri-state hard exclusion + soft risk flagging,
+                              configurable allow/exclude per official flag
   scoring.py / normalization.py
                              Multi-factor scoring and Top-N selection
 
 app/ingestion/        Data source integration
   trading_calendar.py     Trading-day checks
-  market_data_client.py    Raw-snapshot-first ingestion clients with retry
+  market_data_client.py    Raw-snapshot-first ingestion clients with retry,
+                            including TWSE/TPEx attention + disposition fetches
   finmind_mapper.py / twse_mapper.py / tpex_mapper.py
                              Provider-specific row parsing
   valuation_mapper.py       TWSE/TPEx P/E ratio row parsing
+  regulatory_mapper.py       TPEx attention/disposition JSON parsing
+  twse_regulatory_mapper.py  TWSE attention/disposition HTML parsing
 
 app/reports/           Report rendering
-  report_builder.py         ScoredStock -> ReportStockView adaptation
+  report_builder.py         ScoredStock -> ReportStockView adaptation,
+                            merging in official regulatory detail
   text_renderer.py            Fixed-template LINE-compatible text output
 
 app/clients/           External API clients
@@ -427,14 +509,14 @@ app/jobs/              Scheduled job entry points
 - Commit messages follow a structured, scope-prefixed summary format
   (`feat:`, `fix:`, `chore:`) so `git log` doubles as a changelog
 - Two GitHub Actions workflows:
-    - `tests.yml` — runs the full test suite on every push/PR, no
-      external credentials required; this is what the Tests badge above
-      reflects
-    - `daily-limit-up-ranking.yml` — runs the full pipeline on a
-      three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
-      `concurrency` group to prevent overlapping runs, plus a
-      `workflow_dispatch` input for manually backfilling a specific
-      trading date or testing in dry-run mode before going live
+  - `tests.yml` — runs the full test suite on every push/PR, no
+    external credentials required; this is what the Tests badge above
+    reflects
+  - `daily-limit-up-ranking.yml` — runs the full pipeline on a
+    three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
+    `concurrency` group to prevent overlapping runs, plus a
+    `workflow_dispatch` input for manually backfilling a specific
+    trading date or testing in dry-run mode before going live
 - Automated AI-assisted code review via CodeRabbit on every Pull
   Request to identify potential bugs, security concerns,
   maintainability issues, and consistency violations before merging
