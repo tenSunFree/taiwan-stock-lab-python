@@ -35,38 +35,78 @@ def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-# Display names for factor scores, used when rendering the report
+# Display names for factor scores, used when rendering the report.
+# Still imported by report_builder.py to build top_factor_names —
+# kept even though the current template no longer renders a
+# standalone "主要得分來源" section, so that call site doesn't need
+# to change as part of this rollout.
 FACTOR_DISPLAY_NAMES: dict[str, str] = {
     "liquidity": "流動性",
-    "volume_price": "量價結構",
+    "volume_price": "量價",
     "momentum": "動能",
-    "institutional": "法人籌碼",
+    "institutional": "籌碼",
     "fundamental": "基本面",
     "risk_quality": "風險品質",
 }
 
-RISK_FLAG_DISPLAY: dict[str, str] = {
-    "ATTENTION_STOCK": "注意股",
-    "DISPOSITION_STOCK": "處置股",
-    "MANAGED_STOCK": "全額交割／變更交易方法股票",
-    "KY_STOCK": "KY 股",
-    "ONE_PRICE_LIMIT_UP": "一字漲停，隔日追價風險偏高",
-    "EXCESSIVE_CONSECUTIVE_LIMIT_UP": "連續漲停天數偏高",
-    "HIGH_FIVE_DAY_RETURN": "近 5 日累積漲幅偏高",
-}
+# Order the six factors appear in the "訊號" block. Deliberately
+# includes risk_quality — its factor_scores entry is already a
+# normalized 0-100 value (or None when risk_missing_inputs is
+# non-empty), so it renders through the exact same emoji/word logic
+# as every other factor; no separate special-casing needed here.
+_SIGNAL_FACTOR_ORDER: tuple[tuple[str, str], ...] = (
+    ("liquidity", "流動性"),
+    ("volume_price", "量價"),
+    ("momentum", "動能"),
+    ("institutional", "籌碼"),
+    ("fundamental", "基本面"),
+    ("risk_quality", "風險品質"),
+)
 
-# Why a given factor is missing, keyed by the raw factor name (see
-# app.domain.scoring.FACTOR_WEIGHTS). Shown in the "缺失資料" section
-# so a reader can see *why* data_completeness isn't 100% instead of
-# just seeing an unexplained percentage.
+# Why a given (non-risk_quality) factor is missing, keyed by the raw
+# factor name (see app.domain.scoring.FACTOR_WEIGHTS). risk_quality is
+# deliberately NOT in this dict — its reason is computed dynamically
+# from risk_missing_inputs by _risk_quality_missing_reason() below,
+# since "why risk_quality is missing" can be any combination of four
+# different underlying inputs, not a single fixed sentence.
 MISSING_FACTOR_REASON: dict[str, str] = {
-    "risk_quality": ("風險品質（注意／處置狀態尚未串接官方資料源，暫無法評分）"),
     "liquidity": "流動性（成交量/成交金額資料缺失）",
     "volume_price": "量價結構（歷史量價資料不足）",
     "momentum": "動能（近期報酬率資料不足）",
     "institutional": "法人籌碼（法人買賣超資料缺失）",
     "fundamental": "基本面（月營收資料缺失）",
 }
+
+# Display labels for RiskAssessment's missing_inputs entries (see
+# app.domain.risk_policy.RiskAssessment.missing_inputs) — these are
+# the FOUR underlying tri-state inputs RiskPolicy needs, distinct from
+# the six scoring factors above. is_attention/is_disposition being
+# regulatory-source-fetch failures is why this can appear even though
+# TWSE/TPEx attention & disposition are wired in (see
+# app.jobs.daily_ranking's Step 1d) — a source failure this run still
+# leaves that specific input Unknown for this run.
+_RISK_MISSING_INPUT_DISPLAY: dict[str, str] = {
+    "is_attention": "注意股狀態",
+    "is_disposition": "處置股狀態",
+    "is_managed": "全額交割／變更交易方法狀態",
+    "consecutive_limit_up_days": "連續漲停天數",
+}
+
+
+def _risk_quality_missing_reason(missing_inputs: tuple[str, ...]) -> str:
+    """
+    Builds the "風險品質" gap sentence FROM THE ACTUAL missing inputs
+    for this stock, rather than a single hardcoded sentence — the
+    bug this replaces: a static string that said "注意／處置狀態尚未
+    串接官方資料源" even after attention/disposition were wired in,
+    because it never looked at which inputs were actually still
+    missing. See RiskAssessment.missing_inputs / RiskPolicy.assess()
+    for where this tuple originates.
+    """
+    if not missing_inputs:
+        return "風險品質（資料不足，暫無法評分）"
+    labels = [_RISK_MISSING_INPUT_DISPLAY.get(name, name) for name in missing_inputs]
+    return f"風險品質（{'、'.join(labels)}尚未確認，暫無法完整評分）"
 
 
 @dataclass(frozen=True)
@@ -80,7 +120,7 @@ class ReportStockView:
     stock_name: str
     total_score: float
     data_completeness: float
-    top_factor_names: tuple[str, ...]  # the 1-2 highest-scoring factors
+    top_factor_names: tuple[str, ...]  # kept for callers/tests; not rendered directly
     risk_flags: tuple[str, ...]
     close_price: Decimal | None = None
     change_percent: float | None = None  # vs. reference (previous close) price
@@ -105,12 +145,38 @@ class ReportStockView:
     disposition_end_date: dt.date | None = None
     disposition_reason: str | None = None
 
+    # --- Phase A additions ---
+    # Every factor's own 0-100 normalized score (or None when that
+    # factor couldn't be scored) — same dict ScoredStock.factor_scores
+    # carries. Drives the "訊號" block; deliberately the FULL dict, not
+    # just the top 1-2 names, so volume_price and risk_quality (which
+    # may not be "top factors") are still visible.
+    factor_scores: dict[str, float | None] = field(default_factory=dict)
+
+    # From StockFeatures — used for the "漲停結構" block's volume-ratio
+    # line. None means "not computed" (e.g. insufficient trailing
+    # history), rendered as an explicit "資料不足", never silently
+    # omitted (see _render_limit_up_structure_lines).
+    volume_ratio_20d: float | None = None
+
+    # RiskAssessment.missing_inputs, carried all the way through
+    # StockFeatures -> ScoredStock -> here. This is what lets the
+    # renderer distinguish "officially confirmed clean" (False, not in
+    # this tuple) from "genuinely unknown" (the underlying input is
+    # None, present in this tuple) for is_attention/is_disposition/
+    # is_managed — and is also what _risk_quality_missing_reason uses
+    # to build an accurate sentence instead of a stale hardcoded one.
+    risk_missing_inputs: tuple[str, ...] = field(default_factory=tuple)
+
 
 def top_factors(
     factor_scores: dict[str, float | None], limit: int = 2
 ) -> tuple[str, ...]:
-    """Pick the N highest-scoring factor names (display form) for the
-    report's "主要優勢" line."""
+    """Pick the N highest-scoring factor names (display form). Not
+    used by the current per-stock template (superseded by the "訊號"
+    block, which shows every factor), but kept as a standalone utility
+    since report_builder.py still calls it to populate
+    ReportStockView.top_factor_names."""
     available = [
         (name, value) for name, value in factor_scores.items() if value is not None
     ]
@@ -118,43 +184,179 @@ def top_factors(
     return tuple(FACTOR_DISPLAY_NAMES.get(name, name) for name, _ in available[:limit])
 
 
-def _render_risk_flag_lines(flag: str, stock: ReportStockView) -> list[str]:
-    """
-    Renders one risk_flags entry as one or more report lines.
+# --- 訊號 (factor signal lights) ---------------------------------------------
 
-    DISPOSITION_STOCK gets a visually stronger 🚨 marker and its own
-    period line — deliberately more prominent than a plain "・" bullet
-    the way every other flag gets, since disposition is a far more
-    serious official signal than an attention flag (it can affect how
-    the stock is actually matched/settled, not just a warning label)
-    and the reader must not be able to miss it while skimming.
-    Falls back to the plain "・" + RISK_FLAG_DISPLAY label whenever the
-    richer detail fields aren't available (e.g. MANAGED_STOCK, which
-    has no period/reason fields in RegulatoryRiskStatus at all — see
-    that dataclass's own docstring for why — or a DISPOSITION_STOCK
-    flag reached without its detail fields populated, which
-    shouldn't normally happen but is handled gracefully rather than
-    raising).
-    """
-    if (
-        flag == "DISPOSITION_STOCK"
-        and stock.disposition_start_date
-        and stock.disposition_end_date
-    ):
-        period = (
-            f"{stock.disposition_start_date:%Y/%m/%d}"
-            f"～{stock.disposition_end_date:%Y/%m/%d}"
-        )
-        lines = [f"🚨 處置有價證券（處置期間：{period}）"]
+
+def _signal_emoji(score: float | None) -> str:
+    """0-100 的因子分數轉成燈號。None（尚未評分）用 ⚪，不用紅燈——
+    紅燈代表「已知表現差」，None 代表「不知道」，兩者語意不同，不該
+    混在一起顯示成同一個顏色。"""
+    if score is None:
+        return "⚪"
+    if score >= 70:
+        return "🟢"
+    if score >= 40:
+        return "🟡"
+    return "🔴"
+
+
+def _signal_word(score: float | None) -> str:
+    if score is None:
+        return "資料不足"
+    if score >= 70:
+        return "強"
+    if score >= 40:
+        return "普通"
+    return "偏弱"
+
+
+def _render_signal_lines(factor_scores: dict[str, float | None]) -> list[str]:
+    lines = ["訊號"]
+    for key, label in _SIGNAL_FACTOR_ORDER:
+        score = factor_scores.get(key)
+        lines.append(f"{_signal_emoji(score)} {label}：{_signal_word(score)}")
+    return lines
+
+
+# --- 監管狀態 (tri-state regulatory status) -----------------------------------
+
+
+def _is_risk_input_missing(stock: ReportStockView, name: str) -> bool:
+    return name in stock.risk_missing_inputs
+
+
+def _attention_status_line(stock: ReportStockView) -> str:
+    if "ATTENTION_STOCK" in stock.risk_flags:
+        if stock.attention_reason:
+            return f"⚠️ 注意股：注意中（{stock.attention_reason}）"
+        return "⚠️ 注意股：注意中"
+    if _is_risk_input_missing(stock, "is_attention"):
+        return "⚪ 注意股：待確認"
+    return "✅ 注意股：正常"
+
+
+def _disposition_status_lines(stock: ReportStockView) -> list[str]:
+    if "DISPOSITION_STOCK" in stock.risk_flags:
+        lines = ["🚨 處置股：處置中"]
+        if stock.disposition_start_date and stock.disposition_end_date:
+            lines.append(
+                "　處置期間："
+                f"{stock.disposition_start_date:%Y/%m/%d}"
+                f"～{stock.disposition_end_date:%Y/%m/%d}"
+            )
         if stock.disposition_reason:
             lines.append(f"　處置原因：{stock.disposition_reason}")
-        lines.append("　詳細處置措施請參閱交易所公告")
         return lines
+    if _is_risk_input_missing(stock, "is_disposition"):
+        return ["⚪ 處置股：待確認"]
+    return ["✅ 處置股：正常"]
 
-    if flag == "ATTENTION_STOCK" and stock.attention_reason:
-        return [f"・注意有價證券（{stock.attention_reason}）"]
 
-    return [f"・{RISK_FLAG_DISPLAY.get(flag, flag)}"]
+def _managed_status_line(stock: ReportStockView) -> str:
+    if "MANAGED_STOCK" in stock.risk_flags:
+        return "🚨 全額交割／變更交易方法：是"
+    if _is_risk_input_missing(stock, "is_managed"):
+        return "⚪ 全額交割／變更交易方法：待確認"
+    return "✅ 全額交割／變更交易方法：否"
+
+
+def _render_regulatory_status_lines(stock: ReportStockView) -> list[str]:
+    lines = ["監管狀態", _attention_status_line(stock)]
+    lines.extend(_disposition_status_lines(stock))
+    lines.append(_managed_status_line(stock))
+    return lines
+
+
+# --- 漲停結構 (Phase A subset — no intraday data yet) --------------------------
+
+
+def _render_limit_up_structure_lines(stock: ReportStockView) -> list[str]:
+    lines = ["漲停結構"]
+    lines.append("・一字漲停" if stock.is_one_price_limit_up else "・非一字漲停")
+    if stock.volume_ratio_20d is not None:
+        lines.append(f"・成交量 {stock.volume_ratio_20d:.1f}×20 日均量")
+    else:
+        lines.append("・20 日量比：資料不足")
+    return lines
+
+
+# --- 主要風險 ------------------------------------------------------------------
+
+# Regulatory flags (ATTENTION_STOCK/DISPOSITION_STOCK/MANAGED_STOCK)
+# are deliberately NOT in this dict — they're already covered in full
+# detail by the 監管狀態 block above; listing them again here would be
+# redundant.
+_PRIMARY_RISK_FLAG_LABELS: dict[str, str] = {
+    "ONE_PRICE_LIMIT_UP": "一字漲停，流動性與成交機會風險",
+    "EXCESSIVE_CONSECUTIVE_LIMIT_UP": "連續漲停天數偏高",
+    "HIGH_FIVE_DAY_RETURN": "短線過熱",
+    "KY_STOCK": "KY 股制度與資訊揭露差異風險",
+}
+
+
+def _render_primary_risk_lines(stock: ReportStockView) -> list[str]:
+    # Base risks every limit-up stock carries, always shown first —
+    # flag-driven risks are ADDITIONAL to these, never a replacement
+    # for them (a stock with HIGH_FIVE_DAY_RETURN still also carries
+    # ordinary next-day chase-in / opening risk).
+    labels = ["隔日追價風險", "開板風險"]
+    for flag in stock.risk_flags:
+        label = _PRIMARY_RISK_FLAG_LABELS.get(flag)
+        if label and label not in labels:
+            labels.append(label)
+    return ["主要風險", *(f"・{label}" for label in labels)]
+
+
+# --- 資料缺口 -------------------------------------------------------------------
+
+
+def _render_data_gap_line(stock: ReportStockView) -> str | None:
+    gaps: list[str] = []
+    for factor_name in stock.missing_factor_names:
+        if factor_name == "risk_quality":
+            continue  # handled separately below, using risk_missing_inputs
+        reason = MISSING_FACTOR_REASON.get(factor_name)
+        if reason:
+            gaps.append(reason)
+    if "risk_quality" in stock.missing_factor_names:
+        gaps.append(_risk_quality_missing_reason(stock.risk_missing_inputs))
+    if not gaps:
+        return None
+    return "資料缺口：" + "、".join(gaps)
+
+
+# --- Per-stock block ------------------------------------------------------------
+
+
+def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[str]:
+    lines = [
+        f"{stock.rank}. {stock.stock_name}（{stock.stock_id}）",
+    ]
+
+    if stock.close_price is not None:
+        lines.append(f"收盤價：{stock.close_price} 元")
+    if stock.change_percent is not None:
+        lines.append(f"漲幅：{stock.change_percent:+.2f}%")
+
+    lines.append(f"綜合分數：{stock.total_score:.2f}")
+    lines.append(f"今日排名：{stock.rank} / {ranking_limit}")
+    lines.append(f"資料完整度：{stock.data_completeness:.0%}")
+
+    gap_line = _render_data_gap_line(stock)
+    if gap_line is not None:
+        lines.append(gap_line)
+
+    lines.append("")
+    lines.extend(_render_limit_up_structure_lines(stock))
+    lines.append("")
+    lines.extend(_render_signal_lines(stock.factor_scores))
+    lines.append("")
+    lines.extend(_render_regulatory_status_lines(stock))
+    lines.append("")
+    lines.extend(_render_primary_risk_lines(stock))
+    lines.append("")
+
+    return lines
 
 
 def render_daily_report(
@@ -177,9 +379,11 @@ def render_daily_report(
         (data_completeness >= minimum_data_completeness), i.e. how
         many were actually eligible to be considered for the ranking.
     ranking_limit: how many stocks select_top_n() was asked to return
-        at most — purely for the "展示範圍" display line below; it
-        does not itself limit len(ranked_stocks) (the caller already
-        did that upstream via select_top_n).
+        at most — used both for the "展示範圍" display line and as
+        the denominator in each stock's "今日排名：N / ranking_limit"
+        line, so there is exactly ONE source of truth for this number
+        (never a separate per-stock field that could drift out of
+        sync with it).
     """
     lines = [
         f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
@@ -188,6 +392,7 @@ def render_daily_report(
         f"✅ 顯示 Top {ranking_limit}",
         "✅ 估值：0 < P/E ≤ 20",
         "✅ 注意／處置有價證券官方風控",
+        "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
         "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
         "⬜ 技術面：低檔且具起漲訊號",
         "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
@@ -203,56 +408,23 @@ def render_daily_report(
     ]
 
     for stock in ranked_stocks:
-        lines.append(f"{stock.rank}. {stock.stock_name}（{stock.stock_id}）")
-
-        if stock.close_price is not None:
-            lines.append(f"收盤價：{stock.close_price} 元")
-
-        if stock.change_percent is not None:
-            lines.append(f"漲幅：{stock.change_percent:+.2f}%")
-
-        lines.append(f"綜合分數：{stock.total_score:.2f}")
-        lines.append(f"資料完整度：{stock.data_completeness:.0%}")
-
-        if stock.missing_factor_names:
-            missing_display = "、".join(
-                MISSING_FACTOR_REASON.get(name, name)
-                for name in stock.missing_factor_names
-            )
-            lines.append(f"缺失資料：{missing_display}")
-
-        lines.append("")
-
-        if stock.top_factor_names:
-            lines.append("主要得分來源：")
-            lines.extend(f"・{name}" for name in stock.top_factor_names)
-            lines.append("")
-
-        if stock.is_one_price_limit_up:
-            lines.append("型態特徵：")
-            lines.append("・一字漲停")
-            lines.append("")
-
-        lines.append("風險提示：")
-        if stock.risk_flags:
-            for flag in stock.risk_flags:
-                lines.extend(_render_risk_flag_lines(flag, stock))
-        else:
-            lines.append("・今日收盤漲停，隔日追高、開板及價格波動風險偏高")
-
-        lines.append("")
+        lines.extend(_render_stock_block(stock, ranking_limit=ranking_limit))
 
     lines.extend(
         [
             "模型說明",
             (
                 f"綜合分數為各量化因子依 {strategy_version} "
-                "加權計算後的相對評分，用於候選標的之間的排序，"
+                "加權計算後的相對評分，用於當日候選標的之間排序，"
                 "不代表預測報酬率、上漲機率或目標價。"
             ),
             (
-                "「主要得分來源」代表對該標的綜合分數貢獻較高的"
-                "量化因子，並非對個股基本面或未來股價的主觀評價。"
+                "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
+                "⚪ 代表該因子目前資料不足，並不代表負面訊號。"
+            ),
+            (
+                "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
+                "待累積足夠歷史樣本及建立回測流程後提供。"
             ),
             DISCLAIMER,
         ]
@@ -289,6 +461,7 @@ def render_no_qualified_stock_report(
             f"✅ 顯示 Top {ranking_limit}",
             "✅ 估值：0 < P/E ≤ 20",
             "✅ 注意／處置有價證券官方風控",
+            "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
             "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
             "⬜ 技術面：低檔且具起漲訊號",
             "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",

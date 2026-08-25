@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from app.domain.candidate_builder import Candidate
+from app.domain.features import StockFeatures
 from app.domain.limit_up import LimitUpResult, LimitUpSource
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 from app.domain.scoring import ScoredStock
@@ -57,6 +58,29 @@ def _make_candidate(
     return Candidate(stock=stock, price=price, limit_up=limit_up)
 
 
+def _make_features(stock_id: str, **overrides) -> StockFeatures:
+    """Minimal StockFeatures fixture for tests that don't care about
+    the specific enrichment values — build_report_stocks() as of
+    text-v6 requires a matching entry in features_by_stock for every
+    ranked stock_id (see that function's fail-fast docstring), so
+    every test that calls it needs at least this much."""
+    defaults = dict(
+        stock_id=stock_id,
+        turnover=1_000_000.0,
+        average_turnover_20d=800_000.0,
+        volume_ratio_20d=1.5,
+        return_5d=0.05,
+        return_20d=0.10,
+        institutional_net_buy_ratio_5d=0.01,
+        revenue_yoy=0.12,
+        risk_quality_raw=None,
+        risk_flags=(),
+        risk_missing_inputs=(),
+    )
+    defaults.update(overrides)
+    return StockFeatures(**defaults)
+
+
 def test_build_report_stocks_maps_names_and_rank():
     scored = [
         ScoredStock(
@@ -82,9 +106,16 @@ def test_build_report_stocks_maps_names_and_rank():
         "1234": _make_candidate(stock_id="1234", stock_name="Example Corp A"),
         "5678": _make_candidate(stock_id="5678", stock_name="Example Corp B"),
     }
+    features_by_stock = {
+        "1234": _make_features("1234"),
+        "5678": _make_features("5678"),
+    }
 
     views = build_report_stocks(
-        ranked_stocks=scored, stock_master=stock_master, candidates=candidates
+        ranked_stocks=scored,
+        stock_master=stock_master,
+        candidates=candidates,
+        features_by_stock=features_by_stock,
     )
 
     assert [v.rank for v in views] == [1, 2]
@@ -104,8 +135,12 @@ def test_build_report_stocks_falls_back_to_stock_id_when_name_missing():
         )
     ]
     candidates = {"9999": _make_candidate(stock_id="9999")}
+    features_by_stock = {"9999": _make_features("9999")}
     views = build_report_stocks(
-        ranked_stocks=scored, stock_master={}, candidates=candidates
+        ranked_stocks=scored,
+        stock_master={},
+        candidates=candidates,
+        features_by_stock=features_by_stock,
     )
     assert views[0].stock_name == "9999"
 
@@ -141,6 +176,7 @@ def test_build_report_stocks_computes_close_price_and_change_percent():
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
     )
 
     assert result[0].close_price == Decimal("44.65")
@@ -175,6 +211,7 @@ def test_build_report_stocks_detects_one_price_limit_up():
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
     )
 
     assert result[0].is_one_price_limit_up is True
@@ -197,6 +234,7 @@ def test_build_report_stocks_leaves_change_percent_none_without_reference_price(
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
     )
 
     assert result[0].change_percent is None
@@ -214,7 +252,38 @@ def test_build_report_stocks_raises_on_missing_candidate():
 
     with pytest.raises(RuntimeError, match="does not exist in CandidateBuilder output"):
         build_report_stocks(
-            ranked_stocks=[scored], stock_master={"1101": stock}, candidates={}
+            ranked_stocks=[scored],
+            stock_master={"1101": stock},
+            candidates={},
+            # candidates check fires before features_by_stock is ever
+            # looked at, so an empty dict here is safe and deliberate
+            # — this test is specifically about the `candidates` guard.
+            features_by_stock={},
+        )
+
+
+def test_build_report_stocks_raises_on_missing_features():
+    """Mirror of test_build_report_stocks_raises_on_missing_candidate,
+    for the features_by_stock invariant added in text-v6 — a ranked
+    stock without a matching StockFeatures entry means score_candidates
+    was called with a features list inconsistent with `candidates`,
+    which is a pipeline bug, not ordinary missing data."""
+    stock = _make_stock("1101", "測試水泥")
+    candidate = _make_candidate(stock_id="1101")
+    scored = ScoredStock(
+        stock_id="1101",
+        total_score=80.0,
+        data_completeness=0.90,
+        factor_scores={},
+        risk_flags=(),
+    )
+
+    with pytest.raises(RuntimeError, match="does not exist in features_by_stock"):
+        build_report_stocks(
+            ranked_stocks=[scored],
+            stock_master={"1101": stock},
+            candidates={"1101": candidate},
+            features_by_stock={},
         )
 
 
@@ -239,6 +308,7 @@ def test_build_report_stocks_populates_disposition_detail_from_regulatory_by_sto
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
         regulatory_by_stock={
             "1101": RegulatoryRiskStatus(
                 trading_date=TRADING_DATE,
@@ -276,6 +346,7 @@ def test_build_report_stocks_leaves_regulatory_fields_none_when_not_flagged():
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
         regulatory_by_stock={},
     )
 
@@ -302,6 +373,38 @@ def test_build_report_stocks_defaults_regulatory_by_stock_to_empty():
         ranked_stocks=scored,
         stock_master={"1101": candidate.stock},
         candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
     )
 
     assert result[0].attention_reason is None
+
+
+# --- StockFeatures merge (text-v6) --------------------------------------------
+
+
+def test_build_report_stocks_populates_volume_ratio_and_factor_scores_from_features():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            data_completeness=0.90,
+            factor_scores={"liquidity": 90.0, "risk_quality": None},
+            risk_flags=(),
+            risk_missing_inputs=("is_managed", "consecutive_limit_up_days"),
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101", volume_ratio_20d=2.4)},
+    )
+
+    assert result[0].volume_ratio_20d == 2.4
+    assert result[0].factor_scores == {"liquidity": 90.0, "risk_quality": None}
+    assert result[0].risk_missing_inputs == (
+        "is_managed",
+        "consecutive_limit_up_days",
+    )

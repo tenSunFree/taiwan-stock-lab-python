@@ -175,6 +175,12 @@ a later phase (see [Roadmap](#roadmap)).
   source failure for attention/disposition data (see Data Pipeline
   above) is exactly this case: it leaves the affected market's
   candidates with `None`, not `False`
+- `RiskAssessment.missing_inputs` is carried all the way through
+  `StockFeatures.risk_missing_inputs` → `ScoredStock.risk_missing_inputs`
+  → the rendered report, so the reader-facing text can explain
+  *which* specific inputs are still unconfirmed for a given stock
+  (e.g. "全額交割／變更交易方法狀態、連續漲停天數尚未確認"), not just
+  that `risk_quality` couldn't be scored — see Report Rendering below
 - Every threshold lives in a versioned `RiskPolicyConfig`
   (`config/strategy-v1.yaml`) rather than being hardcoded
 
@@ -201,6 +207,31 @@ a later phase (see [Roadmap](#roadmap)).
   with explicit counts distinguishing "entered the candidate pool"
   from "cleared the completeness gate" — no field is named in a way
   that overstates what it actually measures
+- As of `text-v6`, each stock's block shows a **signal-light summary**
+  (🟢 strong / 🟡 moderate / 🔴 weak / ⚪ insufficient data) for all
+  six scoring factors — including `volume_price`, which the earlier
+  template never surfaced on its own — so a reader can scan relative
+  strength across every factor at a glance, not just the top 1-2
+  highest-scoring names
+- A **tri-state regulatory status display** (`✅` confirmed clean /
+  `⚠️`/`🚨` flagged / `⚪` unconfirmed) for attention, disposition, and
+  managed status, shown individually rather than folded into a single
+  risk-flag bullet list. An officially-confirmed-clean `False` and a
+  genuinely-unknown `None` (e.g. because that market's regulatory
+  source failed to fetch this run) are never rendered as the same
+  thing — this is the report-facing expression of the tri-state
+  design in Risk Policy above. Flagged disposition stocks additionally
+  show their active period and official reason text
+- A **漲停結構 (limit-up structure)** section combining
+  `is_one_price_limit_up` and the 20-day volume ratio; a missing
+  volume ratio is rendered as an explicit "資料不足," never silently
+  omitted
+- The "資料缺口" line explaining why `risk_quality` couldn't be scored
+  is built **dynamically** from the stock's actual
+  `risk_missing_inputs`, rather than a single fixed sentence — this
+  replaced an earlier bug where the sentence kept saying
+  "attention/disposition not yet wired in" even after those two
+  sources were actually wired in and healthy
 - Attention/disposition flags render with their official reason text
   and, for disposition, the active period (e.g. `2026/08/24 ~
   2026/08/28`) — not just the bare flag name — so the reader sees
@@ -226,6 +257,12 @@ a later phase (see [Roadmap](#roadmap)).
 - Report content is deterministic for a given trading date/strategy
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
+- The report FORMAT itself is separately versioned via
+  `MESSAGE_VERSION` (currently `text-v6`) — bumped whenever the
+  rendered template's shape changes (new sections, new line
+  semantics), independent of `STRATEGY_VERSION`'s scoring-logic
+  versioning, so a format-only change and a scoring-only change can
+  each be tracked and idempotency-keyed without conflating the two
 - Two intentionally separate idempotency mechanisms:
   a SHA-256 **database idempotency key** (trading date + strategy
   version + delivery target/scope + message version) for
@@ -254,7 +291,9 @@ a later phase (see [Roadmap](#roadmap)).
   a subscriber table and would move to LINE's Multicast API instead.
 - **Phase 7** — Performance tracking: T+1 / T+5 / T+20 returns, a fill
   simulation model that distinguishes signal return from assumed-fill
-  return, and transaction cost modeling
+  return, and transaction cost modeling. The report already carries a
+  placeholder note ("歷史分位及 T+1／T+5 統計尚未納入目前版本") so
+  readers aren't left guessing why these numbers don't appear yet.
 - **Phase 8** — LLM-assisted report writing on top of the existing
   rule-based renderer, with strict JSON-schema validation and
   automatic fallback to the fixed template on any validation failure
@@ -278,7 +317,8 @@ a later phase (see [Roadmap](#roadmap)).
   prices, since doing so would violate this project's own rule
   against inferring limit-up status via "previous close × 1.10." Both
   remaining gaps are logged as an explicit warning on every run rather
-  than silently assumed fixed.
+  than silently assumed fixed, and are reflected per-stock in the
+  report's dynamic "資料缺口" line (see Report Rendering above).
 
 ---
 
@@ -371,7 +411,7 @@ Environment variables consumed by the job (see
 `.github/workflows/daily-limit-up-ranking.yml`):
 
 | Variable                    | Purpose                                                                                      |
-|-----------------------------|----------------------------------------------------------------------------------------------|
+|-----------------------------|------------------------------------------------------------------------------------------------|
 | `FINMIND_TOKEN`             | FinMind API token                                                                            |
 | `DATABASE_URL`              | PostgreSQL connection string (delivery idempotency tracking)                                 |
 | `TARGET_TRADING_DATE`       | Manual override for `workflow_dispatch` backfills; defaults to today                         |
@@ -426,6 +466,12 @@ pytest -v
 - Scoring tests covering factor-weight integrity, liquidity ordering,
   missing-factor renormalization (never backfilled with a neutral
   score), and Top-N selection under a data-completeness floor
+- Signal-light and tri-state regulatory-status renderer tests covering
+  all six factors' emoji/word mapping (including the "unconfirmed ≠
+  confirmed clean" distinction for attention/disposition/managed), and
+  a dynamic-missing-reason regression test guarding against the old
+  stale-hardcoded-sentence bug recurring once a previously-unwired
+  input gets wired in
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, and that a
@@ -458,6 +504,8 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   models.py                StockMaster / DailyPrice / StockValuation /
                             RegulatoryRiskStatus, decoupled from any
                             data source
+  features.py               StockFeatures, including risk_missing_inputs
+                            (carried through from RiskAssessment)
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
@@ -469,7 +517,8 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   risk_policy.py              Tri-state hard exclusion + soft risk flagging,
                               configurable allow/exclude per official flag
   scoring.py / normalization.py
-                             Multi-factor scoring and Top-N selection
+                             Multi-factor scoring, Top-N selection, and
+                             risk_missing_inputs propagation to ScoredStock
 
 app/ingestion/        Data source integration
   trading_calendar.py     Trading-day checks
@@ -482,9 +531,14 @@ app/ingestion/        Data source integration
   twse_regulatory_mapper.py  TWSE attention/disposition HTML parsing
 
 app/reports/           Report rendering
-  report_builder.py         ScoredStock -> ReportStockView adaptation,
-                            merging in official regulatory detail
-  text_renderer.py            Fixed-template LINE-compatible text output
+  report_builder.py         ScoredStock + StockFeatures -> ReportStockView
+                            adaptation, merging in official regulatory detail,
+                            factor_scores, volume_ratio_20d, and
+                            risk_missing_inputs
+  text_renderer.py            Fixed-template LINE-compatible text output:
+                            per-factor signal lights, tri-state regulatory
+                            status, limit-up structure, and a dynamically
+                            built risk_quality gap explanation
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
@@ -509,14 +563,14 @@ app/jobs/              Scheduled job entry points
 - Commit messages follow a structured, scope-prefixed summary format
   (`feat:`, `fix:`, `chore:`) so `git log` doubles as a changelog
 - Two GitHub Actions workflows:
-    - `tests.yml` — runs the full test suite on every push/PR, no
-      external credentials required; this is what the Tests badge above
-      reflects
-    - `daily-limit-up-ranking.yml` — runs the full pipeline on a
-      three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
-      `concurrency` group to prevent overlapping runs, plus a
-      `workflow_dispatch` input for manually backfilling a specific
-      trading date or testing in dry-run mode before going live
+  - `tests.yml` — runs the full test suite on every push/PR, no
+    external credentials required; this is what the Tests badge above
+    reflects
+  - `daily-limit-up-ranking.yml` — runs the full pipeline on a
+    three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
+    `concurrency` group to prevent overlapping runs, plus a
+    `workflow_dispatch` input for manually backfilling a specific
+    trading date or testing in dry-run mode before going live
 - Automated AI-assisted code review via CodeRabbit on every Pull
   Request to identify potential bugs, security concerns,
   maintainability issues, and consistency violations before merging

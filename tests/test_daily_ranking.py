@@ -982,6 +982,12 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
     FinMind enrichment internals are already covered elsewhere; this
     test's job is to prove the regulatory data specifically reaches
     the final report text.
+
+    text-v6 update: disposition detail now renders inside the
+    "監管狀態" block as three separate lines (a "🚨 處置股：處置中"
+    status line, a "處置期間：…" line, and a "處置原因：…" line) instead
+    of the old text-v5 single-line "🚨 處置有價證券（處置期間：…）"
+    format — see text_renderer.py's _disposition_status_lines.
     """
     from unittest.mock import patch
 
@@ -1042,7 +1048,8 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
 
     assert result == 0
     captured = capsys.readouterr()
-    assert "🚨 處置有價證券（處置期間：2026/08/07～2026/08/13）" in captured.out
+    assert "🚨 處置股：處置中" in captured.out
+    assert "處置期間：2026/08/07～2026/08/13" in captured.out
     assert "處置原因：連續三次" in captured.out
     # the full legal-text "處置內容" must never appear verbatim
     assert "依交易所公告執行撮合作業" not in captured.out
@@ -1985,6 +1992,11 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     covered by Steps 1-3's own tests; this test's job is only to
     verify ScoredStock -> select_top_n -> report_builder ->
     renderer -> stdout is wired correctly.
+
+    text-v6 update: the per-stock "主要得分來源" section was replaced
+    by the "訊號" block, which shows every factor as a 🟢/🟡/🔴/⚪ light
+    instead of just the top 1-2 highest-scoring factor names — see
+    text_renderer.py's _render_signal_lines.
     """
     from unittest.mock import patch
 
@@ -2035,9 +2047,9 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert "1. 測試水泥（1101）" in captured.out
     assert "綜合分數：82.50" in captured.out
     assert "資料完整度：90%" in captured.out
-    assert "主要得分來源：" in captured.out
-    assert "・流動性" in captured.out
-    assert "・基本面" in captured.out
+    assert "訊號" in captured.out
+    assert "🟢 流動性：強" in captured.out
+    assert "🟢 基本面：強" in captured.out
 
 
 def test_run_uses_ranking_limit_of_ten_not_five_in_pipeline_summary_log(
