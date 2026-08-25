@@ -242,3 +242,114 @@ def test_fetch_valuation_raises_on_http_error_without_saving():
         client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
 
     assert repository.saved == []
+
+
+# --- fetch_attention / fetch_disposition (announcement/notice, announcement/punish) ---
+
+SAMPLE_NOTICE_HTML = "<html><body>notice placeholder</body></html>"
+SAMPLE_PUNISH_HTML = "<html><body>punish placeholder</body></html>"
+
+
+def test_fetch_attention_uses_correct_twse_endpoint_and_response_param():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["host"] = request.url.host
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, text=SAMPLE_NOTICE_HTML)
+
+    client, _ = make_client(handler)
+    client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured["method"] == "GET"
+    assert captured["host"] == "www.twse.com.tw"
+    assert captured["path"] == "/announcement/notice"
+    assert captured["params"] == {"response": "html"}
+
+
+def test_fetch_attention_saves_raw_html_text_as_is():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=SAMPLE_NOTICE_HTML)
+
+    client, repository = make_client(handler)
+    result = client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert len(repository.saved) == 1
+    saved = repository.saved[0]
+    assert saved.source == "twse"
+    assert saved.raw_payload == SAMPLE_NOTICE_HTML
+    assert isinstance(saved.raw_payload, str)
+    assert result is saved
+
+
+def test_fetch_attention_raises_on_http_error_without_saving():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client, repository = make_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved == []
+
+
+def test_fetch_disposition_uses_correct_twse_endpoint_and_response_param():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, text=SAMPLE_PUNISH_HTML)
+
+    client, _ = make_client(handler)
+    client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured["path"] == "/announcement/punish"
+    assert captured["params"] == {"response": "html"}
+
+
+def test_fetch_disposition_saves_raw_html_text_as_is():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=SAMPLE_PUNISH_HTML)
+
+    client, repository = make_client(handler)
+    result = client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert len(repository.saved) == 1
+    saved = repository.saved[0]
+    assert saved.source == "twse"
+    assert saved.raw_payload == SAMPLE_PUNISH_HTML
+    assert result is saved
+
+
+def test_fetch_disposition_raises_on_http_error_without_saving():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client, repository = make_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved == []
+
+
+def test_fetch_attention_and_fetch_disposition_use_distinguishable_request_parameters():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html></html>")
+
+    attention_client, attention_repo = make_client(handler)
+    attention_client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    disposition_client, disposition_repo = make_client(handler)
+    disposition_client.fetch_disposition(
+        ingestion_run_id="run-1", target_date=TARGET_DATE
+    )
+
+    assert (
+        attention_repo.saved[0].request_parameters
+        != disposition_repo.saved[0].request_parameters
+    )

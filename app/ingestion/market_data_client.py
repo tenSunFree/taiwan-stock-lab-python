@@ -430,6 +430,8 @@ class TwseClient(MarketDataClient):
         super().__init__(repository, **kwargs)
         self.stock_day_all_url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
         self.valuation_url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
+        self.attention_url = "https://www.twse.com.tw/announcement/notice"
+        self.disposition_url = "https://www.twse.com.tw/announcement/punish"
 
     def fetch_daily_price(
         self, *, ingestion_run_id: str, target_date: dt.date
@@ -507,6 +509,84 @@ class TwseClient(MarketDataClient):
             fetch_fn=_fetch,
         )
 
+    def fetch_attention(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TWSE's announcement/notice (公布注意有價證券資訊).
+
+        Verified response shape: a full HTML document (an older
+        report-generator "報表" template), NOT JSON — confirmed via
+        three separate response= attempts (html/csv/json), all of
+        which returned the same HTML. Parsing belongs in
+        app.ingestion.twse_regulatory_mapper.build_twse_attention_statuses,
+        which expects this raw HTML text (raw_payload here is a str,
+        not a dict/list the way every other client in this file
+        returns — "save raw, parse later" still applies, it's just
+        that "raw" is HTML for this one source).
+
+        NOT YET independently confirmed: whether this endpoint accepts
+        an explicit date-range query parameter the way TPEx's
+        bulletin/attention does (startDate/endDate) — no params are
+        sent here, relying on the server's own default window, which a
+        real fetch on 2026-08-22 showed to be "today only"
+        (公布注意有價證券資訊 (115年08月22日 至 115年08月22日 全部上市
+        有價證券)). This means a target_date that ISN'T "today" (e.g.
+        a workflow_dispatch backfill via TARGET_TRADING_DATE) will
+        likely not be covered by this response — see
+        build_twse_attention_statuses's own title-window validation,
+        which will correctly raise rather than silently use the wrong
+        day's data in that case.
+        """
+        params = {"response": "html"}
+
+        def _fetch():
+            response = self.http_client.get(
+                self.attention_url, params={"response": "html"}
+            )
+            response.raise_for_status()
+            return response.text, None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            # source="twse" is shared across fetch_daily_price (CSV),
+            # fetch_valuation (BWIBBU_ALL), and this method — the
+            # literal query params={"response": "html"} sent on the
+            # wire are IDENTICAL to fetch_disposition()'s below (same
+            # value, different URL), so request_parameters here adds
+            # an explicit "endpoint" marker to keep raw snapshots
+            # distinguishable from each other without guessing from
+            # raw_payload content alone.
+            request_parameters={**params, "endpoint": "notice"},
+            fetch_fn=_fetch,
+        )
+
+    def fetch_disposition(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TWSE's announcement/punish (公布處置有價證券資訊). Same
+        HTML-not-JSON shape and same unconfirmed date-range-param
+        status as fetch_attention() above — see that docstring and
+        app.ingestion.twse_regulatory_mapper.build_twse_disposition_statuses.
+        """
+        params = {"response": "html"}
+
+        def _fetch():
+            response = self.http_client.get(
+                self.disposition_url, params={"response": "html"}
+            )
+            response.raise_for_status()
+            return response.text, None
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters={**params, "endpoint": "punish"},
+            fetch_fn=_fetch,
+        )
+
 
 class TpexClient(MarketDataClient):
     """
@@ -531,6 +611,8 @@ class TpexClient(MarketDataClient):
         self.peratio_analysis_url = (
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
         )
+        self.attention_url = "https://www.tpex.org.tw/www/zh-tw/bulletin/attention"
+        self.disposition_url = "https://www.tpex.org.tw/www/zh-tw/bulletin/disposal"
 
     def fetch_daily_price(
         self, *, ingestion_run_id: str, target_date: dt.date
@@ -606,6 +688,109 @@ class TpexClient(MarketDataClient):
             ingestion_run_id=ingestion_run_id,
             target_date=target_date,
             request_parameters=params,
+            fetch_fn=_fetch,
+        )
+
+    def _fetch_bulletin(
+        self, *, url: str, extra_params: dict[str, str]
+    ) -> tuple[Any, None]:
+        params = {
+            "startDate": "",
+            "endDate": "",
+            "code": "",
+            "cate": "",
+            "type": "all",
+            "order": "date",
+            "id": "",
+            "response": "json",
+            **extra_params,
+        }
+        response = self.http_client.post(
+            url,
+            data=params,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+            },
+        )
+        response.raise_for_status()
+        return response.json(), None
+
+    def fetch_attention(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TPEx's www/zh-tw/bulletin/attention (上櫃公布注意有價證券
+        資訊). No auth, no Cloudflare cookie required — confirmed via a
+        clean POST with no session/cookie state at all.
+
+        Verified response shape:
+            {"tables": [{"fields": [...], "data": [[...], ...]}], ...}
+        Same envelope TPEx's bulletin/disposal uses — confirmed via a
+        real HAR capture + PowerShell round-trip, not assumed.
+
+        startDate=endDate=target_date (a single-day window), formatted
+        "YYYY/MM/DD" matching the confirmed real request format from a
+        HAR capture — build_tpex_attention_statuses filters to rows
+        whose OWN 公告日期 exactly equals target_date anyway, so a
+        single-day query window is sufficient and precise; no reason
+        to ask the server for a wider range than what the mapper will
+        keep.
+        """
+        date_str = target_date.strftime("%Y/%m/%d")
+        params = {"startDate": date_str, "endDate": date_str}
+
+        def _fetch():
+            return self._fetch_bulletin(url=self.attention_url, extra_params=params)
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters={"bulletin": "attention"},
+            fetch_fn=_fetch,
+        )
+
+    def fetch_disposition(
+        self, *, ingestion_run_id: str, target_date: dt.date
+    ) -> RawSourcePayload:
+        """
+        Fetch TPEx's www/zh-tw/bulletin/disposal (上櫃公布處置有價證券
+        資訊). Same auth/shape reasoning as fetch_attention() above —
+        see app.ingestion.regulatory_mapper.build_tpex_disposition_statuses,
+        which filters by each row's own 處置起訖時間 PERIOD covering
+        target_date, not by the query window.
+
+        UNLIKE fetch_attention()'s single-day window: a disposition
+        can be ANNOUNCED well before its active PERIOD still covers
+        target_date (real fixture data showed an escalating chain of
+        disposition rounds spanning ~12 calendar days for one stock),
+        so this queries a 30-calendar-day lookback window
+        (target_date - 30 days ~ target_date) rather than a single
+        day — generous enough to catch a realistic escalation chain
+        without needing to know the server's own maximum disposition
+        duration precisely; build_tpex_disposition_statuses's own
+        per-row period check still does the real filtering.
+
+        disposal's own form additionally has reason=-1&measure=-1
+        (confirmed via a real HAR capture) — "-1" means "no filter on
+        this field," matching this fetch's own "get everything within
+        the window, filter client-side in the mapper" approach.
+        """
+        end_str = target_date.strftime("%Y/%m/%d")
+        start_str = (target_date - dt.timedelta(days=30)).strftime("%Y/%m/%d")
+        params = {
+            "startDate": start_str,
+            "endDate": end_str,
+            "reason": "-1",
+            "measure": "-1",
+        }
+
+        def _fetch():
+            return self._fetch_bulletin(url=self.disposition_url, extra_params=params)
+
+        return self.fetch_and_snapshot(
+            ingestion_run_id=ingestion_run_id,
+            target_date=target_date,
+            request_parameters={"bulletin": "disposal"},
             fetch_fn=_fetch,
         )
 

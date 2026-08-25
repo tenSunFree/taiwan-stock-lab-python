@@ -234,3 +234,142 @@ def test_fetch_valuation_raises_on_http_error_without_saving():
         client.fetch_valuation(ingestion_run_id="run-1", target_date=TARGET_DATE)
 
     assert repository.saved == []
+
+
+# --- fetch_attention / fetch_disposition (bulletin/attention, bulletin/disposal) ---
+
+SAMPLE_BULLETIN_JSON = {
+    "tables": [{"fields": ["編號", "證券代號"], "data": []}],
+    "stat": "ok",
+}
+
+
+def test_fetch_attention_uses_correct_tpex_endpoint():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["host"] = request.url.host
+        captured["path"] = request.url.path
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured["method"] == "POST"
+    assert captured["host"] == "www.tpex.org.tw"
+    assert captured["path"] == "/www/zh-tw/bulletin/attention"
+
+
+def test_fetch_attention_sends_single_day_start_end_date_matching_target_date():
+    captured_body = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    # TARGET_DATE is 2026-08-12 in this test module
+    assert captured_body["startDate"] == "2026/08/12"
+    assert captured_body["endDate"] == "2026/08/12"
+    assert captured_body["response"] == "json"
+
+
+def test_fetch_attention_saves_raw_json_as_is():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, repository = make_client(handler)
+    result = client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert len(repository.saved) == 1
+    saved = repository.saved[0]
+    assert saved.source == "tpex"
+    assert saved.raw_payload == SAMPLE_BULLETIN_JSON
+    assert result is saved
+
+
+def test_fetch_attention_raises_on_http_error_without_saving():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client, repository = make_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved == []
+
+
+def test_fetch_disposition_uses_correct_tpex_endpoint():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert captured["path"] == "/www/zh-tw/bulletin/disposal"
+
+
+def test_fetch_disposition_sends_thirty_day_lookback_window_and_reason_measure_filters():
+    captured_body = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, _ = make_client(handler)
+    client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    # TARGET_DATE is 2026-08-12; lookback is 30 calendar days -> 2026-07-13
+    assert captured_body["startDate"] == "2026/07/13"
+    assert captured_body["endDate"] == "2026/08/12"
+    assert captured_body["reason"] == "-1"
+    assert captured_body["measure"] == "-1"
+
+
+def test_fetch_disposition_saves_raw_json_as_is():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    client, repository = make_client(handler)
+    result = client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert len(repository.saved) == 1
+    assert repository.saved[0].raw_payload == SAMPLE_BULLETIN_JSON
+    assert result is repository.saved[0]
+
+
+def test_fetch_disposition_raises_on_http_error_without_saving():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client, repository = make_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.fetch_disposition(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    assert repository.saved == []
+
+
+def test_fetch_attention_and_fetch_disposition_use_distinguishable_request_parameters():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=SAMPLE_BULLETIN_JSON)
+
+    attention_client, attention_repo = make_client(handler)
+    attention_client.fetch_attention(ingestion_run_id="run-1", target_date=TARGET_DATE)
+
+    disposition_client, disposition_repo = make_client(handler)
+    disposition_client.fetch_disposition(
+        ingestion_run_id="run-1", target_date=TARGET_DATE
+    )
+
+    assert (
+        attention_repo.saved[0].request_parameters
+        != disposition_repo.saved[0].request_parameters
+    )

@@ -216,3 +216,92 @@ def test_build_report_stocks_raises_on_missing_candidate():
         build_report_stocks(
             ranked_stocks=[scored], stock_master={"1101": stock}, candidates={}
         )
+
+
+# --- regulatory_by_stock merge (Step 6) --------------------------------------
+
+
+def test_build_report_stocks_populates_disposition_detail_from_regulatory_by_stock():
+    from app.domain.models import RegulatoryRiskStatus
+
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            data_completeness=0.90,
+            factor_scores={},
+            risk_flags=("DISPOSITION_STOCK",),
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        regulatory_by_stock={
+            "1101": RegulatoryRiskStatus(
+                trading_date=TRADING_DATE,
+                stock_id="1101",
+                is_disposition=True,
+                disposition_start_date=dt.date(2026, 8, 24),
+                disposition_end_date=dt.date(2026, 8, 28),
+                disposition_reason="連續三次",
+            )
+        },
+    )
+
+    assert result[0].disposition_start_date == dt.date(2026, 8, 24)
+    assert result[0].disposition_end_date == dt.date(2026, 8, 28)
+    assert result[0].disposition_reason == "連續三次"
+
+
+def test_build_report_stocks_leaves_regulatory_fields_none_when_not_flagged():
+    """The ordinary case: a ranked stock that simply isn't under
+    attention/disposition at all — absent from regulatory_by_stock is
+    NOT a pipeline invariant violation, unlike a missing `candidates`
+    entry."""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            data_completeness=0.90,
+            factor_scores={},
+            risk_flags=(),
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        regulatory_by_stock={},
+    )
+
+    assert result[0].attention_reason is None
+    assert result[0].disposition_start_date is None
+    assert result[0].disposition_reason is None
+
+
+def test_build_report_stocks_defaults_regulatory_by_stock_to_empty():
+    """regulatory_by_stock is optional — callers that don't pass it at
+    all (e.g. existing tests written before Step 6) must not break."""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            data_completeness=0.90,
+            factor_scores={},
+            risk_flags=(),
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+    )
+
+    assert result[0].attention_reason is None

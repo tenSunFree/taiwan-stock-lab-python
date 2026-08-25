@@ -53,6 +53,17 @@ class RiskPolicyConfig:
         True  # opened and locked at limit-up with no chance to buy in
     )
 
+    # Deliberately True (not excluded) for now, even though a
+    # disposition/managed stock is a much more serious official signal
+    # than an attention stock — see this project's "官方風控" rollout
+    # plan: display the official status honestly first (risk_flags +
+    # the rendered report), decide whether to actually exclude only
+    # after that data has been observed for a while and backtested.
+    # Flip to False once that decision is made; nothing else in
+    # RiskPolicy.assess() needs to change to do so.
+    allow_disposition_stock: bool = True
+    allow_managed_stock: bool = True
+
 
 @dataclass(frozen=True)
 class RiskAssessment:
@@ -91,11 +102,11 @@ class RiskPolicy:
         # must never be treated as if it were True OR False; it is
         # simply not evaluated as a positive match here, and is
         # recorded in missing_inputs below instead.
-        if is_disposition is True:
+        if not self.config.allow_disposition_stock and is_disposition is True:
             return RiskAssessment(
                 stock_id, True, "disposition stock, excluded by strategy policy"
             )
-        if is_managed is True:
+        if not self.config.allow_managed_stock and is_managed is True:
             return RiskAssessment(
                 stock_id,
                 True,
@@ -125,6 +136,16 @@ class RiskPolicy:
 
         if is_attention is True:
             flags.append("ATTENTION_STOCK")
+        # Only reachable when allow_disposition_stock/allow_managed_stock
+        # is True (otherwise the hard-exclusion checks above already
+        # returned) — still worth flagging even though it's "allowed",
+        # since this is a far more serious official signal than an
+        # attention stock and the reader must see it regardless of
+        # whether the strategy currently excludes on it.
+        if is_disposition is True:
+            flags.append("DISPOSITION_STOCK")
+        if is_managed is True:
+            flags.append("MANAGED_STOCK")
         if is_ky:
             flags.append("KY_STOCK")
         if is_one_price_limit_up:
@@ -169,7 +190,17 @@ class RiskPolicy:
 # there by a config loader (same "hardcoded to match YAML by hand"
 # status as MINIMUM_TURNOVER/MAXIMUM_CANDIDATES in daily_ranking.py).
 RISK_FLAG_PENALTIES: dict[str, float] = {
-    "ATTENTION_STOCK": 0.15,
+    # ATTENTION_STOCK / DISPOSITION_STOCK / MANAGED_STOCK deliberately
+    # 0.0 for now — v1 of the official 注意/處置 rollout is display-only
+    # (the flag shows up in risk_flags and the rendered report), not a
+    # score penalty. ATTENTION_STOCK previously had 0.15 baked in here
+    # before is_attention had any wired-in data source, which would
+    # have silently started penalizing scores the moment real data was
+    # wired in — this table is the single place to change once
+    # backtesting justifies a real penalty for any of the three.
+    "ATTENTION_STOCK": 0.0,
+    "DISPOSITION_STOCK": 0.0,
+    "MANAGED_STOCK": 0.0,
     "KY_STOCK": 0.10,
     "ONE_PRICE_LIMIT_UP": 0.20,
     "EXCESSIVE_CONSECUTIVE_LIMIT_UP": 0.30,

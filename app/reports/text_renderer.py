@@ -47,6 +47,8 @@ FACTOR_DISPLAY_NAMES: dict[str, str] = {
 
 RISK_FLAG_DISPLAY: dict[str, str] = {
     "ATTENTION_STOCK": "注意股",
+    "DISPOSITION_STOCK": "處置股",
+    "MANAGED_STOCK": "全額交割／變更交易方法股票",
     "KY_STOCK": "KY 股",
     "ONE_PRICE_LIMIT_UP": "一字漲停，隔日追價風險偏高",
     "EXCESSIVE_CONSECUTIVE_LIMIT_UP": "連續漲停天數偏高",
@@ -85,6 +87,24 @@ class ReportStockView:
     missing_factor_names: tuple[str, ...] = field(default_factory=tuple)
     is_one_price_limit_up: bool = False
 
+    # Official regulatory risk detail (see app.domain.models.
+    # RegulatoryRiskStatus) — deliberately just the SHORT fields here,
+    # not disposition_measure's full legal-text paragraph. A real
+    # disposition_measure can run several hundred characters (verified
+    # against real TWSE/TPEx fixtures), and this view can hold many
+    # stocks in one LINE message capped at
+    # text_renderer.MAX_LINE_TEXT_UTF16_UNITS — reproducing the full
+    # legal text per flagged stock risks blowing that budget on a day
+    # with several disposition stocks. attention_reason and
+    # disposition_reason are the SHORT trigger-condition fields
+    # (observed ~20-40 characters in real fixtures), safe to include
+    # directly; the reader is pointed to the official announcement for
+    # the full text instead of it being reproduced here.
+    attention_reason: str | None = None
+    disposition_start_date: dt.date | None = None
+    disposition_end_date: dt.date | None = None
+    disposition_reason: str | None = None
+
 
 def top_factors(
     factor_scores: dict[str, float | None], limit: int = 2
@@ -96,6 +116,45 @@ def top_factors(
     ]
     available.sort(key=lambda item: item[1], reverse=True)
     return tuple(FACTOR_DISPLAY_NAMES.get(name, name) for name, _ in available[:limit])
+
+
+def _render_risk_flag_lines(flag: str, stock: ReportStockView) -> list[str]:
+    """
+    Renders one risk_flags entry as one or more report lines.
+
+    DISPOSITION_STOCK gets a visually stronger 🚨 marker and its own
+    period line — deliberately more prominent than a plain "・" bullet
+    the way every other flag gets, since disposition is a far more
+    serious official signal than an attention flag (it can affect how
+    the stock is actually matched/settled, not just a warning label)
+    and the reader must not be able to miss it while skimming.
+    Falls back to the plain "・" + RISK_FLAG_DISPLAY label whenever the
+    richer detail fields aren't available (e.g. MANAGED_STOCK, which
+    has no period/reason fields in RegulatoryRiskStatus at all — see
+    that dataclass's own docstring for why — or a DISPOSITION_STOCK
+    flag reached without its detail fields populated, which
+    shouldn't normally happen but is handled gracefully rather than
+    raising).
+    """
+    if (
+        flag == "DISPOSITION_STOCK"
+        and stock.disposition_start_date
+        and stock.disposition_end_date
+    ):
+        period = (
+            f"{stock.disposition_start_date:%Y/%m/%d}"
+            f"～{stock.disposition_end_date:%Y/%m/%d}"
+        )
+        lines = [f"🚨 處置有價證券（處置期間：{period}）"]
+        if stock.disposition_reason:
+            lines.append(f"　處置原因：{stock.disposition_reason}")
+        lines.append("　詳細處置措施請參閱交易所公告")
+        return lines
+
+    if flag == "ATTENTION_STOCK" and stock.attention_reason:
+        return [f"・注意有價證券（{stock.attention_reason}）"]
+
+    return [f"・{RISK_FLAG_DISPLAY.get(flag, flag)}"]
 
 
 def render_daily_report(
@@ -128,7 +187,7 @@ def render_daily_report(
         "📌 功能進度",
         f"✅ 顯示 Top {ranking_limit}",
         "✅ 估值：0 < P/E ≤ 20",
-        "⬜ 注意／處置有價證券官方風控",
+        "✅ 注意／處置有價證券官方風控",
         "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
         "⬜ 技術面：低檔且具起漲訊號",
         "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
@@ -176,9 +235,8 @@ def render_daily_report(
 
         lines.append("風險提示：")
         if stock.risk_flags:
-            lines.extend(
-                f"・{RISK_FLAG_DISPLAY.get(flag, flag)}" for flag in stock.risk_flags
-            )
+            for flag in stock.risk_flags:
+                lines.extend(_render_risk_flag_lines(flag, stock))
         else:
             lines.append("・今日收盤漲停，隔日追高、開板及價格波動風險偏高")
 
@@ -230,7 +288,7 @@ def render_no_qualified_stock_report(
             "📌 功能進度",
             f"✅ 顯示 Top {ranking_limit}",
             "✅ 估值：0 < P/E ≤ 20",
-            "⬜ 注意／處置有價證券官方風控",
+            "✅ 注意／處置有價證券官方風控",
             "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
             "⬜ 技術面：低檔且具起漲訊號",
             "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
