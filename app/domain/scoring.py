@@ -44,6 +44,14 @@ class ScoredStock:
     factor_scores: dict[str, float | None]
     risk_flags: tuple[str, ...]
 
+    # Carried straight through from StockFeatures.risk_missing_inputs
+    # (see that dataclass's own docstring) so the report layer can
+    # render an accurate "why is risk_quality missing" reason instead
+    # of a generic/stale one. Defaults to () so any existing caller
+    # that constructs a ScoredStock without this field (e.g. an older
+    # test fixture) keeps working unchanged.
+    risk_missing_inputs: tuple[str, ...] = ()
+
 
 def _build_factor_frame(features: list[StockFeatures]) -> pd.DataFrame:
     return pd.DataFrame(
@@ -84,6 +92,7 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
     )
 
     flags_by_stock = {f.stock_id: f.risk_flags for f in features}
+    risk_missing_inputs_by_stock = {f.stock_id: f.risk_missing_inputs for f in features}
 
     results: list[ScoredStock] = []
     total_weight = sum(FACTOR_WEIGHTS.values())
@@ -116,6 +125,7 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
                 data_completeness=data_completeness,
                 factor_scores=row_scores,
                 risk_flags=flags_by_stock.get(stock_id, tuple()),
+                risk_missing_inputs=risk_missing_inputs_by_stock.get(stock_id, tuple()),
             )
         )
 

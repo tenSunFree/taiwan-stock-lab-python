@@ -24,11 +24,25 @@ NOT a pipeline invariant violation: most ranked stocks simply aren't
 under attention/disposition at all, so a lookup miss here just means
 "no detail to show," the same everyday case as a stock having no
 risk_flags.
+
+As of text-v6, also merges in StockFeatures (see
+app.domain.features) — required, not optional, unlike
+regulatory_by_stock above: ranked_stocks is ALWAYS produced from
+StockFeatures via score_candidates/select_top_n, so every ranked
+stock_id is guaranteed to have a matching StockFeatures entry the same
+way it's guaranteed to have a matching Candidate entry. A missing
+entry here is therefore a pipeline invariant violation, handled with
+the same fail-fast policy as the existing `candidates` check below —
+never silently dropped or defaulted. This is what supplies
+volume_ratio_20d for the "漲停結構" block, and factor_scores /
+risk_missing_inputs are carried straight through from ScoredStock to
+drive the "訊號" and "監管狀態" blocks.
 """
 
 from __future__ import annotations
 
 from app.domain.candidate_builder import Candidate
+from app.domain.features import StockFeatures
 from app.domain.models import RegulatoryRiskStatus, StockMaster
 from app.domain.risk_inputs import is_one_price_limit_up
 from app.domain.scoring import FACTOR_WEIGHTS, ScoredStock
@@ -40,6 +54,7 @@ def build_report_stocks(
     ranked_stocks: list[ScoredStock],
     stock_master: dict[str, StockMaster],
     candidates: dict[str, Candidate],
+    features_by_stock: dict[str, StockFeatures],
     regulatory_by_stock: dict[str, RegulatoryRiskStatus] | None = None,
 ) -> list[ReportStockView]:
     """
@@ -51,11 +66,18 @@ def build_report_stocks(
         broke upstream and this function refuses to silently drop the
         stock or produce a report that quietly looks normal but is
         missing data.
+    features_by_stock: stock_id -> StockFeatures, keyed from the same
+        build_stock_features() output ranked_stocks was scored from.
+        Same fail-fast guarantee as `candidates` above — every
+        ranked_stocks entry traces back to a StockFeatures record via
+        score_candidates(), so a missing entry here is also an
+        invariant violation, not ordinary incompleteness.
     regulatory_by_stock: stock_id -> RegulatoryRiskStatus, the same
         merged dict app.jobs.daily_ranking builds in Step 1d/Step 5.
-        Optional and defaults to {} — unlike `candidates` above, an
-        absent entry here is the ordinary case (most stocks aren't
-        flagged), not an invariant violation.
+        Optional and defaults to {} — unlike `candidates`/
+        `features_by_stock` above, an absent entry here is the
+        ordinary case (most stocks aren't flagged), not an invariant
+        violation.
     """
     regulatory_by_stock = regulatory_by_stock or {}
     results: list[ReportStockView] = []
@@ -73,6 +95,15 @@ def build_report_stocks(
                 "candidate pool passed in via `candidates`."
             )
 
+        features = features_by_stock.get(scored.stock_id)
+        if features is None:
+            raise RuntimeError(
+                "Report invariant violated: ranked stock_id="
+                f"{scored.stock_id!r} does not exist in "
+                "features_by_stock. Ranked stocks must always trace "
+                "back to a StockFeatures record via score_candidates()."
+            )
+
         available_factors = [
             (name, value)
             for name, value in scored.factor_scores.items()
@@ -83,7 +114,7 @@ def build_report_stocks(
             FACTOR_DISPLAY_NAMES.get(name, name) for name, _ in available_factors[:2]
         )
 
-        # Preserve FACTOR_WEIGHTS' declared ordering so the "缺失資料"
+        # Preserve FACTOR_WEIGHTS' declared ordering so the "資料缺口"
         # list renders in a stable, predictable order.
         missing_factor_names = tuple(
             name for name in FACTOR_WEIGHTS if scored.factor_scores.get(name) is None
@@ -134,6 +165,9 @@ def build_report_stocks(
                 disposition_reason=(
                     regulatory.disposition_reason if regulatory is not None else None
                 ),
+                factor_scores=dict(scored.factor_scores),
+                volume_ratio_20d=features.volume_ratio_20d,
+                risk_missing_inputs=scored.risk_missing_inputs,
             )
         )
 

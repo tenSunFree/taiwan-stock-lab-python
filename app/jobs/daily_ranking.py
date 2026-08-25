@@ -102,16 +102,21 @@ KNOWN LIMITATIONS in this checkpoint:
       whole-market failure policy above: one missing stock's
       history/flow/revenue is ordinary incompleteness; an entire
       market's data being unavailable is not.
-    - RiskPolicy's is_attention/is_disposition/is_managed inputs and
-      consecutive_limit_up_days are always None (unknown) — no
-      wired-in data source exists for the former, and no reliable
-      historical reference-price source exists for the latter (see
-      app.domain.risk_inputs's module docstring). Consequently
-      risk_quality_raw is always None too (see
-      app.domain.risk_policy.build_risk_quality_raw's docstring for
-      why "no flags raised" must not be scored as "confirmed clean"
-      when the underlying inputs were never checked). A warning is
-      logged on every build_stock_features() call to keep this gap
+    - RiskPolicy's is_managed input and consecutive_limit_up_days are
+      still always None (unknown) — no wired-in official data source
+      exists for full-cash-delivery status, and no reliable historical
+      reference-price source exists for the latter (see
+      app.domain.risk_inputs's module docstring). is_attention/
+      is_disposition ARE wired in as of rule-v1.2.0 (see Step 1d
+      below), but a per-source fetch/parse failure still leaves the
+      affected market's candidates with those two inputs Unknown for
+      that run — see _resolve_regulatory_flags. As long as is_managed/
+      consecutive_limit_up_days remain unwired, risk_quality_raw stays
+      None for every stock regardless of how attention/disposition
+      resolve, since RiskPolicy.assess() requires ALL FOUR inputs to
+      be confirmed before it will score risk_quality at all (see
+      build_risk_quality_raw()'s docstring). A warning is logged on
+      every build_stock_features() call to keep this remaining gap
       visible rather than silently assumed fixed.
     - candidate thresholds (minimum_turnover, maximum_candidates) are
       hardcoded here to match config/strategy-v1.yaml rather than
@@ -243,22 +248,25 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # for why reusing a message_version for genuinely different content
 # is a bug, not a valid rerun.
 #
-# Bumped for this rollout's report-display step (Step 6): the risk
-# section can now render multi-line entries (ATTENTION_STOCK/
-# DISPOSITION_STOCK with reason text, DISPOSITION_STOCK additionally
-# with a period line and a 🚨 marker instead of a plain "・" bullet) —
-# see text_renderer.py's _render_risk_flag_lines for the new template
-# shape. This is a genuine format change (new possible line shapes),
-# not just different content flowing through the unchanged template.
+# text-v5: report-display step (Step 6) — the risk section rendered
+# multi-line entries (ATTENTION_STOCK/DISPOSITION_STOCK with reason
+# text, DISPOSITION_STOCK additionally with a period line and a 🚨
+# marker instead of a plain "・" bullet).
 #
-# Confirmed against the real project's text_renderer.py: the
-# "📌 功能進度" checklist section already exists there, meaning that
-# earlier, separately-tracked change already bumped MESSAGE_VERSION to
-# text-v4. This rollout's disposition/attention detail rendering is a
-# further format change layered on top of that, so it bumps again to
-# text-v5 — matching what report_builder.py's own docstring already
-# says ("As of text-v5").
-MESSAGE_VERSION = "text-v5"
+# text-v6: replaced the per-stock block's rendering entirely — new
+# "訊號" section (all six factor scores as 🟢/🟡/🔴/⚪ lights, including
+# volume_price, which the old template never surfaced on its own),
+# new "監管狀態" section (explicit tri-state attention/disposition/
+# managed display instead of folding them into risk_flags bullets),
+# new "漲停結構" section (one-price-limit-up + 20-day volume ratio),
+# an explicit "今日排名：N / ranking_limit" line, and the risk_quality
+# gap sentence in "資料缺口" is now built dynamically from
+# ReportStockView.risk_missing_inputs instead of a single hardcoded
+# string — see text_renderer.py's _render_stock_block and
+# _risk_quality_missing_reason. This is a genuine format change (new
+# section shapes, new line semantics), not just different content
+# flowing through the unchanged template — bumps again from text-v5.
+MESSAGE_VERSION = "text-v6"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -526,18 +534,25 @@ def build_stock_features(
     fail-soft family as blocks 1-3 — see the inline comment at that
     block for why. is_attention/is_disposition/is_managed and
     consecutive_limit_up_days are tri-state (bool|None / int|None):
-    None means unknown, never treated as False. Currently every stock
-    hits this gap (see the warning logged below), so risk_quality_raw
-    is None for every stock unless that changes.
+    None means unknown, never treated as False. is_attention/
+    is_disposition are wired in as of rule-v1.2.0 (see run()'s Step
+    1d), so they resolve to True/False/None per candidate via
+    _resolve_regulatory_flags; is_managed and
+    consecutive_limit_up_days still always hit this gap (see the
+    warning logged below), so risk_quality_raw remains None for every
+    stock until those two are wired in as well.
     """
     logger.warning(
-        "RiskPolicy input gap: is_attention/is_disposition/is_managed have "
-        "no wired-in data source and are always None (unknown), not False; "
-        "consecutive_limit_up_days is always None (no reliable historical "
-        "reference-price source — see app.domain.risk_inputs's module "
-        "docstring for why this is not reconstructed from raw closes). "
-        "risk_quality_raw is None for every stock affected by this gap — "
-        "see build_risk_quality_raw()'s docstring."
+        "RiskPolicy input gap: is_managed has no wired-in data source and "
+        "is always None (unknown), not False; consecutive_limit_up_days is "
+        "always None (no reliable historical reference-price source — see "
+        "app.domain.risk_inputs's module docstring for why this is not "
+        "reconstructed from raw closes). is_attention/is_disposition ARE "
+        "wired in as of rule-v1.2.0, but a per-source fetch/parse failure "
+        "this run still leaves the affected market's candidates with those "
+        "two Unknown for this run — see _resolve_regulatory_flags. "
+        "risk_quality_raw is None for every stock affected by any of these "
+        "gaps — see build_risk_quality_raw()'s docstring."
     )
 
     if not candidates:
@@ -789,6 +804,7 @@ def build_stock_features(
             revenue_yoy=revenue_yoy,
             risk_quality_raw=risk_quality_raw,
             risk_flags=risk_flags,
+            risk_missing_inputs=assessment.missing_inputs,
         )
         features.append(stock_features)
 
@@ -807,7 +823,7 @@ def build_stock_features(
             stock_features.revenue_yoy,
             stock_features.risk_quality_raw,
             stock_features.risk_flags,
-            assessment.missing_inputs,
+            stock_features.risk_missing_inputs,
         )
 
     logger.info(
@@ -1432,10 +1448,12 @@ def run(
         candidates_by_stock_id = {
             candidate.stock.stock_id: candidate for candidate in candidates
         }
+        features_by_stock_id = {feature.stock_id: feature for feature in features}
         report_stocks = build_report_stocks(
             ranked_stocks=top_ranked,
             stock_master=stock_master,
             candidates=candidates_by_stock_id,
+            features_by_stock=features_by_stock_id,
             regulatory_by_stock=regulatory_by_stock,
         )
 
