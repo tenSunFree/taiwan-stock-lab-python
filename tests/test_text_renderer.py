@@ -1,3 +1,4 @@
+import dataclasses
 import datetime as dt
 from decimal import Decimal
 
@@ -191,24 +192,19 @@ def test_report_disposition_never_reproduces_full_legal_text():
     ReportStockView deliberately has no field for disposition_measure
     (the full legal-text paragraph, which can run several hundred
     characters in real TWSE/TPEx fixtures) — only the short
-    disposition_reason. This test guards against a future change
-    accidentally reintroducing the full text and risking the
-    5000-UTF16-unit LINE message limit on a day with several
-    disposition stocks.
+    disposition_reason. This asserts the STRUCTURAL invariant directly
+    (no such field exists on the view model) rather than checking
+    whether a string was reproduced in rendered output: the earlier
+    version of this test built a long_legal_text string but never
+    passed it into _make_stock_view, so the assertion held regardless
+    of renderer correctness and could never actually fail. Asserting
+    on the dataclass's own fields means this test fails the moment
+    someone adds disposition_measure back onto ReportStockView, which
+    is the change this test exists to catch — see the corresponding
+    CodeRabbit review comment on PR #27.
     """
-    long_legal_text = (
-        "以人工管制之撮合終端機執行撮合作業" * 20
-    )  # simulate a long paragraph
-    report = _render(
-        _make_stock_view(
-            risk_flags=("DISPOSITION_STOCK",),
-            disposition_start_date=dt.date(2026, 8, 24),
-            disposition_end_date=dt.date(2026, 8, 28),
-            disposition_reason="連續三次",
-        )
-    )
-    assert long_legal_text not in report  # was never passed in, sanity check
-    assert "以人工管制之撮合終端機執行撮合作業" not in report
+    field_names = {f.name for f in dataclasses.fields(ReportStockView)}
+    assert "disposition_measure" not in field_names
 
 
 def test_report_falls_back_to_plain_label_when_disposition_period_missing():

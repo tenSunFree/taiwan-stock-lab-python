@@ -44,7 +44,7 @@ a later phase (see [Roadmap](#roadmap)).
 ## Preview
 
 <p align="left">
-  <img src="https://i.postimg.cc/RF5LzJN6/Screenshot-20260824-234847.png" width="160"/>
+  <img src="docs/images/line-report-preview.png" alt="Sample daily limit-up ranking report as delivered via LINE" width="160"/>
 </p>
 
 ---
@@ -509,14 +509,14 @@ app/jobs/              Scheduled job entry points
 - Commit messages follow a structured, scope-prefixed summary format
   (`feat:`, `fix:`, `chore:`) so `git log` doubles as a changelog
 - Two GitHub Actions workflows:
-  - `tests.yml` — runs the full test suite on every push/PR, no
-    external credentials required; this is what the Tests badge above
-    reflects
-  - `daily-limit-up-ranking.yml` — runs the full pipeline on a
-    three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
-    `concurrency` group to prevent overlapping runs, plus a
-    `workflow_dispatch` input for manually backfilling a specific
-    trading date or testing in dry-run mode before going live
+    - `tests.yml` — runs the full test suite on every push/PR, no
+      external credentials required; this is what the Tests badge above
+      reflects
+    - `daily-limit-up-ranking.yml` — runs the full pipeline on a
+      three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
+      `concurrency` group to prevent overlapping runs, plus a
+      `workflow_dispatch` input for manually backfilling a specific
+      trading date or testing in dry-run mode before going live
 - Automated AI-assisted code review via CodeRabbit on every Pull
   Request to identify potential bugs, security concerns,
   maintainability issues, and consistency violations before merging

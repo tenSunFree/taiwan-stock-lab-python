@@ -74,7 +74,7 @@ _TPEX_PERIOD_RE = re.compile(r"^(\d{2,3}/\d{2}/\d{2})\s*~\s*(\d{2,3}/\d{2}/\d{2}
 
 def _parse_tpex_disposition_period(text: str) -> tuple[dt.date | None, dt.date | None]:
     """
-    Parses TPEx's 處置起訖時間 field, e.g. "115/08/24~115/08/28", into
+    Parses TPEx's 處置期間 field, e.g. "115/08/24~115/08/28", into
     (start, end) Gregorian dates. Returns (None, None) — not a
     zero-length or open-ended range — if the text doesn't match the
     expected shape; the caller treats that row as "cannot verify its
@@ -155,7 +155,7 @@ def build_tpex_attention_statuses(
     contains the SAME stock_id on multiple different announcement
     dates within the query window — confirmed via a real fixture:
     stock 30811 appeared on 115/08/21, 115/08/20, AND 115/08/19 in one
-    response, each with a different 累計 (cumulative count) and a
+    response, each with a different 次數 (cumulative count) and a
     different 注意交易資訊 reason text. "Was this stock flagged today"
     must only match today's own announcement row; using "latest
     available" semantics here would make yesterday's announcement
@@ -165,13 +165,21 @@ def build_tpex_attention_statuses(
     table = _extract_tpex_table(payload)
     field_index = _build_field_index(
         table["fields"],
-        required=("證券代號", "注意交易資訊", "公告日期"),
+        required=("公告日期", "注意交易資訊", "證券代號"),
     )
+    max_index = max(field_index.values())
 
     result: dict[str, RegulatoryRiskStatus] = {}
 
     for row in table["data"]:
         if not isinstance(row, list):
+            continue
+        if len(row) <= max_index:
+            # malformed row, fewer cells than the header promised —
+            # skip it rather than let a plain positional index raise
+            # IndexError and fail the whole source for this run (see
+            # app.ingestion.twse_regulatory_mapper's identical guard
+            # for the same reasoning).
             continue
 
         row_date = _tpex_bulletin_date_to_gregorian(str(row[field_index["公告日期"]]))
@@ -207,12 +215,17 @@ def build_tpex_disposition_statuses(
     (unlike build_tpex_attention_statuses's date handling above): a
     disposition is an ACTIVE PERIOD, not a point-in-time announcement.
     The announcement date and the period it governs are different
-    fields — note also the field name itself differs from attention's
-    ("公布日期" here vs "公告日期" there, confirmed via real fixtures
-    from both, not the same string). "Is this stock CURRENTLY under
-    disposition today" means checking whether today falls inside its
-    active period, not whether today happens to be the day it was
-    announced.
+    fields. "Is this stock CURRENTLY under disposition today" means
+    checking whether today falls inside its active period, not
+    whether today happens to be the day it was announced.
+
+    NOTE on field names: bulletin/disposal's column headers are NOT
+    the same strings as bulletin/attention's, even where the concept
+    is analogous — confirmed against real fixtures: disposal uses
+    公布日期 (not attention's 公告日期) for the announcement date, and
+    處置起訖時間/處置內容 (not 處置期間/處置措施) for the active period and
+    the measure description. Do not assume the two endpoints share a
+    naming convention just because they're both TPEx bulletins.
 
     If more than one row for the same stock_id has a period covering
     target_date (e.g. an overlapping renewal into a further
@@ -226,6 +239,7 @@ def build_tpex_disposition_statuses(
         table["fields"],
         required=("公布日期", "證券代號", "處置起訖時間", "處置原因", "處置內容"),
     )
+    max_index = max(field_index.values())
 
     # stock_id -> (announced_on, RegulatoryRiskStatus) — announced_on
     # is kept alongside the built status only to decide which row wins
@@ -235,6 +249,11 @@ def build_tpex_disposition_statuses(
 
     for row in table["data"]:
         if not isinstance(row, list):
+            continue
+        if len(row) <= max_index:
+            # malformed row, fewer cells than the header promised —
+            # skip it rather than let a plain positional index raise
+            # IndexError and fail the whole source for this run.
             continue
 
         announced_on = _tpex_bulletin_date_to_gregorian(

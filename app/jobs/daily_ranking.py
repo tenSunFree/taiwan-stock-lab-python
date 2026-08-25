@@ -251,14 +251,14 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # shape. This is a genuine format change (new possible line shapes),
 # not just different content flowing through the unchanged template.
 #
-# IMPORTANT — this sandbox's own text_renderer.py does not have the
-# "📌 功能進度" checklist section that a prior, separately-tracked
-# change (outside this session) added to the real project's copy and
-# bumped to "text-v4" for. If the real file is already at "text-v4",
-# bump it to "text-v5" for this change instead of reusing "text-v4" —
-# do not just copy this literal string without checking the real
-# file's current value first.
-MESSAGE_VERSION = "text-v4"
+# Confirmed against the real project's text_renderer.py: the
+# "📌 功能進度" checklist section already exists there, meaning that
+# earlier, separately-tracked change already bumped MESSAGE_VERSION to
+# text-v4. This rollout's disposition/attention detail rendering is a
+# further format change layered on top of that, so it bumps again to
+# text-v5 — matching what report_builder.py's own docstring already
+# says ("As of text-v5").
+MESSAGE_VERSION = "text-v5"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
