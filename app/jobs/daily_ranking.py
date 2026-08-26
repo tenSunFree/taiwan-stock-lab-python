@@ -260,13 +260,43 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # managed display instead of folding them into risk_flags bullets),
 # new "漲停結構" section (one-price-limit-up + 20-day volume ratio),
 # an explicit "今日排名：N / ranking_limit" line, and the risk_quality
-# gap sentence in "資料缺口" is now built dynamically from
+# gap sentence in "資料缺口" built dynamically from
 # ReportStockView.risk_missing_inputs instead of a single hardcoded
-# string — see text_renderer.py's _render_stock_block and
-# _risk_quality_missing_reason. This is a genuine format change (new
-# section shapes, new line semantics), not just different content
-# flowing through the unchanged template — bumps again from text-v5.
-MESSAGE_VERSION = "text-v6"
+# string.
+#
+# text-v7: display-semantics-only clarifications, NOT a scoring or
+# schema change (ReportStockView gained no new fields; RiskPolicy,
+# FACTOR_WEIGHTS, and bounded_momentum_score are all untouched):
+#   - "注意股：正常／注意中" → "今日公布注意：是／否／待確認" — attention
+#     is matched by EXACT announcement date (see
+#     twse_regulatory_mapper.build_twse_attention_statuses's own
+#     docstring), a per-day announcement, not a persistent state; the
+#     old wording implied a continuous "status" that doesn't actually
+#     exist for this data.
+#   - "處置股：正常／處置中" → "目前處置：是／否／待確認" — disposition
+#     is matched by an ACTIVE PERIOD (start <= target_date <= end, see
+#     build_twse_disposition_statuses), a genuinely different time
+#     semantics from attention's per-day announcement above. The old
+#     parallel wording made "✅ 注意股：正常" + "🚨 處置股：處置中" read
+#     as a contradiction when it is not one.
+#   - Disposition entries now add a closing line ("處置措施：請依交易
+#     所該次公告為準") instead of implying no further detail exists —
+#     concrete trading measures (matching mechanism, credit-trading
+#     restrictions, advance-deposit requirements) are deliberately
+#     never hardcoded here, since they vary by announcement round and
+#     by the exchange's own rule revisions.
+#   - Momentum's signal word now renders "漲多過熱" instead of the
+#     generic "偏弱" specifically when HIGH_FIVE_DAY_RETURN is also
+#     raised — bounded_momentum_score is intentionally non-monotonic
+#     (an already-extended rally is penalized, not rewarded), so a low
+#     momentum score can mean either genuinely weak recent momentum or
+#     an overheated one, and the old generic wording collapsed both
+#     into a misleading "weak" label. HIGH_FIVE_DAY_RETURN is reused
+#     here purely as a report-level display hint — it is NOT a new
+#     scoring factor and does not alter rule-v1.2.0 in any way.
+#   - Model explanation gained one sentence clarifying the "漲多過熱"
+#     wording so readers don't misread it as "no momentum."
+MESSAGE_VERSION = "text-v7"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST

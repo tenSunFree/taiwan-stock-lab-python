@@ -145,7 +145,6 @@ class ReportStockView:
     disposition_end_date: dt.date | None = None
     disposition_reason: str | None = None
 
-    # --- Phase A additions ---
     # Every factor's own 0-100 normalized score (or None when that
     # factor couldn't be scored) — same dict ScoredStock.factor_scores
     # carries. Drives the "訊號" block; deliberately the FULL dict, not
@@ -210,11 +209,48 @@ def _signal_word(score: float | None) -> str:
     return "偏弱"
 
 
-def _render_signal_lines(factor_scores: dict[str, float | None]) -> list[str]:
+def _momentum_signal_word(score: float | None, risk_flags: tuple[str, ...]) -> str:
+    """
+    Momentum is intentionally non-monotonic (see
+    app.domain.normalization.bounded_momentum_score's own docstring:
+    3%-15% cumulative 5-day return is the ideal/full-score band, and
+    the score is deliberately penalized above that — an already
+    extended rally is chase-in risk, not automatically a stronger
+    signal). A LOW momentum score can therefore mean either
+    (1) recent price momentum is genuinely weak, or (2) the stock has
+    already rallied too much and is being penalized for overheating —
+    these are very different situations for a reader to act on, and
+    the generic "偏弱" wording collapses them into one misleading label.
+
+    HIGH_FIVE_DAY_RETURN (RiskPolicy's own excessive-5-day-return flag,
+    threshold configurable via RiskPolicyConfig.excessive_return_5d) is
+    reused here purely as a REPORT-LEVEL display hint to distinguish
+    case (2) from case (1) — it is not introduced as a new scoring
+    factor, and does not change rule-v1.2.0's FACTOR_WEIGHTS or
+    bounded_momentum_score in any way. The two signals are correlated
+    but not identical (their thresholds don't line up exactly), so
+    this is a display-only proxy, not a formal redefinition of what
+    "momentum" measures.
+    """
+    if score is None:
+        return "資料不足"
+    if "HIGH_FIVE_DAY_RETURN" in risk_flags:
+        return "漲多過熱"
+    return _signal_word(score)
+
+
+def _render_signal_lines(
+    factor_scores: dict[str, float | None], risk_flags: tuple[str, ...]
+) -> list[str]:
     lines = ["訊號"]
     for key, label in _SIGNAL_FACTOR_ORDER:
         score = factor_scores.get(key)
-        lines.append(f"{_signal_emoji(score)} {label}：{_signal_word(score)}")
+        word = (
+            _momentum_signal_word(score, risk_flags)
+            if key == "momentum"
+            else _signal_word(score)
+        )
+        lines.append(f"{_signal_emoji(score)} {label}：{word}")
     return lines
 
 
@@ -226,18 +262,49 @@ def _is_risk_input_missing(stock: ReportStockView, name: str) -> bool:
 
 
 def _attention_status_line(stock: ReportStockView) -> str:
+    """
+    Labeled "今日公布注意" (announced TODAY), not "注意股：正常" —
+    attention is a per-day announcement (see
+    twse_regulatory_mapper.build_twse_attention_statuses's own
+    docstring: matched by EXACT announcement date, not an active
+    range), so the correct question this line answers is "was this
+    stock announced as an attention security today," not "is this
+    stock currently an attention stock" — the latter isn't even a
+    well-defined question for a per-day announcement. This wording
+    also prevents readers from misreading "今日公布注意：否" alongside
+    an active "🚨 目前處置：是" as a contradiction — the two lines
+    deliberately answer different-shaped questions (today's
+    announcement vs. an active period), so they can disagree without
+    either being wrong.
+    """
     if "ATTENTION_STOCK" in stock.risk_flags:
         if stock.attention_reason:
-            return f"⚠️ 注意股：注意中（{stock.attention_reason}）"
-        return "⚠️ 注意股：注意中"
+            return f"⚠️ 今日公布注意：是（{stock.attention_reason}）"
+        return "⚠️ 今日公布注意：是"
     if _is_risk_input_missing(stock, "is_attention"):
-        return "⚪ 注意股：待確認"
-    return "✅ 注意股：正常"
+        return "⚪ 今日公布注意：待確認"
+    return "✅ 今日公布注意：否"
 
 
 def _disposition_status_lines(stock: ReportStockView) -> list[str]:
+    """
+    Labeled "目前處置" (currently active), not "處置股：處置中" —
+    disposition is evaluated against an ACTIVE PERIOD (see
+    build_twse_disposition_statuses's own docstring: start <=
+    target_date <= end), a genuinely different time semantics from
+    attention's per-day announcement above. The concrete trading
+    measures (matching mechanism, credit-trading restrictions,
+    advance-deposit requirements) are deliberately NOT rendered here,
+    even though disposition_measure carries the full official text —
+    those measures vary by announcement round and by the exchange's
+    own rule revisions (e.g. TWSE's disposition-measure overhaul
+    effective 2026-08-10), so hardcoding any specific measure text
+    risks describing rules that no longer apply to this particular
+    announcement. Pointing the reader to the official announcement is
+    safer than a plausible-looking but potentially wrong summary.
+    """
     if "DISPOSITION_STOCK" in stock.risk_flags:
-        lines = ["🚨 處置股：處置中"]
+        lines = ["🚨 目前處置：是"]
         if stock.disposition_start_date and stock.disposition_end_date:
             lines.append(
                 "　處置期間："
@@ -246,10 +313,11 @@ def _disposition_status_lines(stock: ReportStockView) -> list[str]:
             )
         if stock.disposition_reason:
             lines.append(f"　處置原因：{stock.disposition_reason}")
+        lines.append("　處置措施：請依交易所該次公告為準")
         return lines
     if _is_risk_input_missing(stock, "is_disposition"):
-        return ["⚪ 處置股：待確認"]
-    return ["✅ 處置股：正常"]
+        return ["⚪ 目前處置：待確認"]
+    return ["✅ 目前處置：否"]
 
 
 def _managed_status_line(stock: ReportStockView) -> str:
@@ -349,7 +417,7 @@ def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[s
     lines.append("")
     lines.extend(_render_limit_up_structure_lines(stock))
     lines.append("")
-    lines.extend(_render_signal_lines(stock.factor_scores))
+    lines.extend(_render_signal_lines(stock.factor_scores, stock.risk_flags))
     lines.append("")
     lines.extend(_render_regulatory_status_lines(stock))
     lines.append("")
@@ -393,6 +461,7 @@ def render_daily_report(
         "✅ 估值：0 < P/E ≤ 20",
         "✅ 注意／處置有價證券官方風控",
         "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
+        "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
         "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
         "⬜ 技術面：低檔且具起漲訊號",
         "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
@@ -421,6 +490,11 @@ def render_daily_report(
             (
                 "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
                 "⚪ 代表該因子目前資料不足，並不代表負面訊號。"
+            ),
+            (
+                "動能因子採非單調評分；顯示「漲多過熱」時，"
+                "代表近期累積漲幅已達短線過熱門檻，"
+                "反映追價風險升高，並非代表近期沒有上漲動能。"
             ),
             (
                 "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
@@ -462,6 +536,7 @@ def render_no_qualified_stock_report(
             "✅ 估值：0 < P/E ≤ 20",
             "✅ 注意／處置有價證券官方風控",
             "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
+            "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
             "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
             "⬜ 技術面：低檔且具起漲訊號",
             "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
