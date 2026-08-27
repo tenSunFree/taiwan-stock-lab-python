@@ -274,6 +274,52 @@ def test_momentum_missing_data_still_shows_insufficient_even_with_flag():
     assert "🔴 動能：漲多過熱" not in report
 
 
+def test_high_momentum_with_flag_still_shows_strong_not_overheated():
+    """CodeRabbit review comment（PR #29）：RiskPolicyConfig.excessive_return_5d
+    是獨立於 bounded_momentum_score 門檻之外、可另外調整的設定值，所以
+    HIGH_FIVE_DAY_RETURN 完全可能在 momentum 分數依然是 70 分以上
+    （「強」）時被觸發（例如 excessive_return_5d 被調得比實際會讓分數
+    倒扣的漲幅門檻還低）。這種情況下動能其實是真的強，不該被「漲多
+    過熱」蓋掉——那樣反而是這個函式原本想避免的「誤導」本身。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": 75.0,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "🟢 動能：強" in report
+    assert "動能：漲多過熱" not in report
+
+
+def test_moderate_momentum_with_flag_still_shows_normal_not_overheated():
+    """同上一個 test 的分界情況：momentum=50.0 落在「普通」區間
+    （>= 40 且 < 70），即使 HIGH_FIVE_DAY_RETURN 同時被觸發，也不該
+    被覆寫成「漲多過熱」。過熱覆寫只在分數本身已經落入「偏弱」區間
+    （< 40，見 _WEAK_SIGNAL_THRESHOLD）時才有意義。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": 50.0,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "🟡 動能：普通" in report
+    assert "動能：漲多過熱" not in report
+
+
 # --- 監管狀態（tri-state：True 標記 / False 官方確認正常 / None 未知） ---------
 
 

@@ -199,12 +199,18 @@ def _signal_emoji(score: float | None) -> str:
     return "🔴"
 
 
+# The "normal/strong" boundary value for _signal_word. Overheat overwriting of _momentum_signal_word
+# Only takes effect when the score falls below this boundary value (i.e., in the range marked as "weak").
+# Therefore, the same constant is used in both places to avoid bugs caused by future modifications to the boundary.
+_WEAK_SIGNAL_THRESHOLD = 40
+
+
 def _signal_word(score: float | None) -> str:
     if score is None:
         return "資料不足"
     if score >= 70:
         return "強"
-    if score >= 40:
+    if score >= _WEAK_SIGNAL_THRESHOLD:
         return "普通"
     return "偏弱"
 
@@ -231,10 +237,22 @@ def _momentum_signal_word(score: float | None, risk_flags: tuple[str, ...]) -> s
     but not identical (their thresholds don't line up exactly), so
     this is a display-only proxy, not a formal redefinition of what
     "momentum" measures.
+
+    IMPORTANT — the override only fires when the score itself is
+    already in the "偏弱" range (score < _WEAK_SIGNAL_THRESHOLD).
+    RiskPolicyConfig.excessive_return_5d is independently configurable
+    from bounded_momentum_score's own thresholds, so HIGH_FIVE_DAY_RETURN
+    can in principle be raised on a stock whose momentum score is still
+    40+ ("普通") or even 70+ ("強") — e.g. if excessive_return_5d is
+    tuned lower than the return level that actually tanks the score.
+    In that case the momentum reading is genuinely fine and must keep
+    showing its real "普通"/"強" word; blindly overwriting a decent or
+    strong score with "漲多過熱" would itself be a misleading label,
+    which is the exact failure mode this function exists to avoid.
     """
     if score is None:
         return "資料不足"
-    if "HIGH_FIVE_DAY_RETURN" in risk_flags:
+    if score < _WEAK_SIGNAL_THRESHOLD and "HIGH_FIVE_DAY_RETURN" in risk_flags:
         return "漲多過熱"
     return _signal_word(score)
 
