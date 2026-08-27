@@ -983,11 +983,16 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
     test's job is to prove the regulatory data specifically reaches
     the final report text.
 
-    text-v6 update: disposition detail now renders inside the
-    "監管狀態" block as three separate lines (a "🚨 處置股：處置中"
-    status line, a "處置期間：…" line, and a "處置原因：…" line) instead
-    of the old text-v5 single-line "🚨 處置有價證券（處置期間：…）"
-    format — see text_renderer.py's _disposition_status_lines.
+    text-v7 update: disposition status label changed from "🚨 處置股：
+    處置中" (text-v6) to "🚨 目前處置：是" to clarify disposition is an
+    active-period status ("目前處置"), not a persistent "type" of
+    stock — attention and disposition answer genuinely different
+    time-axis questions (per-day announcement vs. active-period
+    match), so parallel wording like "注意股：正常" + "處置股：處置中"
+    could misleadingly read as a contradiction. A closing
+    "處置措施：請依交易所該次公告為準" line was also added — see
+    text_renderer.py's _disposition_status_lines docstring for why
+    concrete trading measures are deliberately never hardcoded here.
     """
     from unittest.mock import patch
 
@@ -1048,9 +1053,10 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
 
     assert result == 0
     captured = capsys.readouterr()
-    assert "🚨 處置股：處置中" in captured.out
+    assert "🚨 目前處置：是" in captured.out
     assert "處置期間：2026/08/07～2026/08/13" in captured.out
     assert "處置原因：連續三次" in captured.out
+    assert "處置措施：請依交易所該次公告為準" in captured.out
     # the full legal-text "處置內容" must never appear verbatim
     assert "依交易所公告執行撮合作業" not in captured.out
 
@@ -1996,7 +2002,11 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     text-v6 update: the per-stock "主要得分來源" section was replaced
     by the "訊號" block, which shows every factor as a 🟢/🟡/🔴/⚪ light
     instead of just the top 1-2 highest-scoring factor names — see
-    text_renderer.py's _render_signal_lines.
+    text_renderer.py's _render_signal_lines. This test's fixture uses
+    momentum=75.0 (>=70) and risk_flags=() (no HIGH_FIVE_DAY_RETURN),
+    so the text-v7 momentum-wording change doesn't affect this
+    particular assertion — it still renders the plain "強" word, not
+    "漲多過熱".
     """
     from unittest.mock import patch
 

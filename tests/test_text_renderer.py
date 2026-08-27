@@ -200,7 +200,11 @@ def test_report_shows_data_insufficient_when_volume_ratio_unavailable():
 
 def test_report_shows_signal_lights_including_volume_price():
     """regression test：volume_price 佔 20% 權重，不能在訊號區塊裡被
-    漏掉（Phase A 草稿曾經漏掉這個因子）。"""
+    漏掉（Phase A 草稿曾經漏掉這個因子）。這個 fixture 的 risk_flags
+    是空的（沒有 HIGH_FIVE_DAY_RETURN），所以 momentum=30.0 應該仍然
+    顯示一般的「偏弱」，不是「漲多過熱」——見下面
+    test_overheated_momentum_is_not_described_as_weak 測試「有觸發
+    旗標」的另一種情況。"""
     report = _render(
         _make_stock_view(
             factor_scores={
@@ -221,51 +225,146 @@ def test_report_shows_signal_lights_including_volume_price():
     assert "⚪ 風險品質：資料不足" in report
 
 
+def test_overheated_momentum_is_not_described_as_weak():
+    """
+    核心 regression test，直接對應「世紀* 5 日大漲 60.9%，但顯示
+    『動能：偏弱』」這個真實案例：bounded_momentum_score 是非單調
+    評分（累積漲幅過高會被扣分，不是自動更強），所以低分不代表動能
+    疲弱，也可能代表已經漲多過熱。當 HIGH_FIVE_DAY_RETURN 這個既有
+    風險旗標被觸發時，動能訊號的文字必須明確改成「漲多過熱」，不能
+    再用會誤導成「近期沒有動能」的通用「偏弱」字樣。
+    """
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": 20.0,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "🔴 動能：漲多過熱" in report
+    assert "🔴 動能：偏弱" not in report
+
+
+def test_momentum_missing_data_still_shows_insufficient_even_with_flag():
+    """即使 HIGH_FIVE_DAY_RETURN 被觸發，如果 momentum 分數本身是
+    None（真的沒有資料可算），也不能顯示「漲多過熱」——那是對一個不
+    存在的分數做出判斷。理論上這個組合不該發生（兩者都依賴同一個
+    return_5d 是否為 None），但顯式測試這個防禦順序，確保未來重構
+    不會不小心把判斷順序顛倒。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": None,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "⚪ 動能：資料不足" in report
+    assert "🔴 動能：漲多過熱" not in report
+
+
+def test_high_momentum_with_flag_still_shows_strong_not_overheated():
+    """CodeRabbit review comment（PR #29）：RiskPolicyConfig.excessive_return_5d
+    是獨立於 bounded_momentum_score 門檻之外、可另外調整的設定值，所以
+    HIGH_FIVE_DAY_RETURN 完全可能在 momentum 分數依然是 70 分以上
+    （「強」）時被觸發（例如 excessive_return_5d 被調得比實際會讓分數
+    倒扣的漲幅門檻還低）。這種情況下動能其實是真的強，不該被「漲多
+    過熱」蓋掉——那樣反而是這個函式原本想避免的「誤導」本身。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": 75.0,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "🟢 動能：強" in report
+    assert "動能：漲多過熱" not in report
+
+
+def test_moderate_momentum_with_flag_still_shows_normal_not_overheated():
+    """同上一個 test 的分界情況：momentum=50.0 落在「普通」區間
+    （>= 40 且 < 70），即使 HIGH_FIVE_DAY_RETURN 同時被觸發，也不該
+    被覆寫成「漲多過熱」。過熱覆寫只在分數本身已經落入「偏弱」區間
+    （< 40，見 _WEAK_SIGNAL_THRESHOLD）時才有意義。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 60.0,
+                "momentum": 50.0,
+                "institutional": 50.0,
+                "fundamental": 50.0,
+                "risk_quality": 80.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+        )
+    )
+    assert "🟡 動能：普通" in report
+    assert "動能：漲多過熱" not in report
+
+
 # --- 監管狀態（tri-state：True 標記 / False 官方確認正常 / None 未知） ---------
 
 
-def test_attention_confirmed_clean_shows_normal():
+def test_attention_confirmed_clean_shows_not_announced_today():
     report = _render(_make_stock_view(risk_flags=(), risk_missing_inputs=()))
-    assert "✅ 注意股：正常" in report
+    assert "✅ 今日公布注意：否" in report
 
 
-def test_attention_unknown_is_not_shown_as_normal():
+def test_attention_unknown_is_not_shown_as_confirmed_no():
     """最關鍵的語意測試：官方確認正常（False）跟根本不知道（None）
     絕對不能被顯示成同一件事。"""
     report = _render(
         _make_stock_view(risk_flags=(), risk_missing_inputs=("is_attention",))
     )
-    assert "⚪ 注意股：待確認" in report
-    assert "✅ 注意股：正常" not in report
+    assert "⚪ 今日公布注意：待確認" in report
+    assert "✅ 今日公布注意：否" not in report
 
 
 def test_attention_flagged_shows_reason():
     report = _render(
         _make_stock_view(risk_flags=("ATTENTION_STOCK",), attention_reason="近期異常")
     )
-    assert "⚠️ 注意股：注意中（近期異常）" in report
+    assert "⚠️ 今日公布注意：是（近期異常）" in report
 
 
 def test_attention_flagged_without_reason_falls_back_to_plain_label():
     report = _render(_make_stock_view(risk_flags=("ATTENTION_STOCK",)))
-    assert "⚠️ 注意股：注意中（" not in report
-    assert "⚠️ 注意股：注意中" in report
+    assert "⚠️ 今日公布注意：是（" not in report
+    assert "⚠️ 今日公布注意：是" in report
 
 
-def test_disposition_confirmed_clean_shows_normal():
+def test_disposition_confirmed_clean_shows_not_active():
     report = _render(_make_stock_view(risk_flags=(), risk_missing_inputs=()))
-    assert "✅ 處置股：正常" in report
+    assert "✅ 目前處置：否" in report
 
 
-def test_disposition_unknown_is_not_shown_as_normal():
+def test_disposition_unknown_is_not_shown_as_confirmed_no():
     report = _render(
         _make_stock_view(risk_flags=(), risk_missing_inputs=("is_disposition",))
     )
-    assert "⚪ 處置股：待確認" in report
-    assert "✅ 處置股：正常" not in report
+    assert "⚪ 目前處置：待確認" in report
+    assert "✅ 目前處置：否" not in report
 
 
-def test_disposition_flagged_shows_period_and_reason():
+def test_disposition_flagged_shows_period_reason_and_official_measure_notice():
     report = _render(
         _make_stock_view(
             risk_flags=("DISPOSITION_STOCK",),
@@ -274,9 +373,32 @@ def test_disposition_flagged_shows_period_and_reason():
             disposition_reason="連續三次",
         )
     )
-    assert "🚨 處置股：處置中" in report
+    assert "🚨 目前處置：是" in report
     assert "處置期間：2026/08/24～2026/08/28" in report
     assert "處置原因：連續三次" in report
+    assert "處置措施：請依交易所該次公告為準" in report
+
+
+def test_attention_and_disposition_can_have_different_time_semantics():
+    """
+    核心 UX regression test：直接把這次修正發現的 domain semantics
+    固定成測試案例。「今日公布注意：否」跟「目前處置：是」同時出現
+    完全合法、不是矛盾——注意股是逐日公告（今天有沒有被公布），
+    處置股是一段期間內的持續狀態（現在是否落在處置期間內），兩者
+    回答的是不同時間軸上的問題，本來就可能給出看似不一致、實則都
+    正確的答案。
+    """
+    report = _render(
+        _make_stock_view(
+            risk_flags=("DISPOSITION_STOCK",),
+            risk_missing_inputs=(),
+            disposition_start_date=dt.date(2026, 8, 20),
+            disposition_end_date=dt.date(2026, 8, 26),
+            disposition_reason="連續達注意交易標準",
+        )
+    )
+    assert "✅ 今日公布注意：否" in report
+    assert "🚨 目前處置：是" in report
 
 
 def test_managed_confirmed_clean_shows_no():
@@ -319,7 +441,7 @@ def test_primary_risks_do_not_duplicate_regulatory_flags():
     """ATTENTION_STOCK/DISPOSITION_STOCK/MANAGED_STOCK 已經在監管狀態
     區塊完整顯示，主要風險區塊不需要重複列出。"""
     report = _render(_make_stock_view(risk_flags=("DISPOSITION_STOCK",)))
-    assert "・處置股" not in report
+    assert "・目前處置" not in report
 
 
 # --- 模型說明 ------------------------------------------------------------------
@@ -331,6 +453,8 @@ def test_report_model_explanation_reflects_new_template():
     assert "rule-v1.2.0" in report
     assert "不代表預測報酬率、上漲機率或目標價" in report
     assert "「訊號」依各因子的標準化分數區間呈現" in report
+    assert "動能因子採非單調評分" in report
+    assert "並非代表近期沒有上漲動能" in report
     assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" in report
     # old text-v5 section is gone
     assert "「主要得分來源」" not in report

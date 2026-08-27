@@ -207,10 +207,10 @@ a later phase (see [Roadmap](#roadmap)).
   with explicit counts distinguishing "entered the candidate pool"
   from "cleared the completeness gate" — no field is named in a way
   that overstates what it actually measures
-- As of `text-v6`, each stock's block shows a **signal-light summary**
-  (🟢 strong / 🟡 moderate / 🔴 weak / ⚪ insufficient data) for all
-  six scoring factors — including `volume_price`, which the earlier
-  template never surfaced on its own — so a reader can scan relative
+- Each stock's block shows a **signal-light summary** (🟢 strong /
+  🟡 moderate / 🔴 weak / ⚪ insufficient data) for all six scoring
+  factors — including `volume_price`, which an earlier template
+  version never surfaced on its own — so a reader can scan relative
   strength across every factor at a glance, not just the top 1-2
   highest-scoring names
 - A **tri-state regulatory status display** (`✅` confirmed clean /
@@ -220,8 +220,31 @@ a later phase (see [Roadmap](#roadmap)).
   genuinely-unknown `None` (e.g. because that market's regulatory
   source failed to fetch this run) are never rendered as the same
   thing — this is the report-facing expression of the tri-state
-  design in Risk Policy above. Flagged disposition stocks additionally
-  show their active period and official reason text
+  design in Risk Policy above
+- As of `text-v7`, attention is labeled "今日公布注意" (announced
+  TODAY) and disposition is labeled "目前處置" (currently ACTIVE) —
+  reflecting the genuinely different time semantics of the two
+  official datasets: attention is matched by an EXACT announcement
+  date (see `twse_regulatory_mapper.build_twse_attention_statuses`'s
+  own docstring — a per-day announcement, not a persistent state),
+  while disposition is matched by an ACTIVE PERIOD (start <=
+  target_date <= end). The two can legitimately disagree — e.g. "今日
+  公布注意：否" alongside "🚨 目前處置：是" — without that being a
+  contradiction, since they answer different-shaped questions on
+  different time axes. A flagged disposition entry also closes with
+  "處置措施：請依交易所該次公告為準" — concrete trading measures
+  (matching mechanism, credit-trading restrictions, advance-deposit
+  requirements) are deliberately never hardcoded here, since they vary
+  by announcement round and by the exchange's own rule revisions
+- The momentum signal renders "漲多過熱" instead of a generic "偏弱"
+  specifically when `HIGH_FIVE_DAY_RETURN` is also raised, since
+  `bounded_momentum_score` is intentionally non-monotonic (an
+  already-extended rally is penalized, not rewarded) — a low momentum
+  score can therefore mean either genuinely weak recent momentum or an
+  overheated rally, and the generic wording collapsed both into a
+  potentially misleading label. This is a display-only distinction:
+  `HIGH_FIVE_DAY_RETURN` is reused purely as a report-level hint, and
+  `rule-v1.2.0`'s `FACTOR_WEIGHTS` and scoring logic are unchanged
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -258,11 +281,11 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v6`) — bumped whenever the
-  rendered template's shape changes (new sections, new line
-  semantics), independent of `STRATEGY_VERSION`'s scoring-logic
-  versioning, so a format-only change and a scoring-only change can
-  each be tracked and idempotency-keyed without conflating the two
+  `MESSAGE_VERSION` (currently `text-v7`) — bumped whenever the
+  rendered template's shape or line semantics change, independent of
+  `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
+  change and a scoring-only change can each be tracked and
+  idempotency-keyed without conflating the two
 - Two intentionally separate idempotency mechanisms:
   a SHA-256 **database idempotency key** (trading date + strategy
   version + delivery target/scope + message version) for
@@ -468,10 +491,14 @@ pytest -v
   score), and Top-N selection under a data-completeness floor
 - Signal-light and tri-state regulatory-status renderer tests covering
   all six factors' emoji/word mapping (including the "unconfirmed ≠
-  confirmed clean" distinction for attention/disposition/managed), and
-  a dynamic-missing-reason regression test guarding against the old
+  confirmed clean" distinction for attention/disposition/managed), a
+  dynamic-missing-reason regression test guarding against the old
   stale-hardcoded-sentence bug recurring once a previously-unwired
-  input gets wired in
+  input gets wired in, attention-vs-disposition time-semantics
+  regression tests confirming the two can disagree without being a
+  contradiction, and a momentum-overheating regression test confirming
+  a low momentum score paired with `HIGH_FIVE_DAY_RETURN` renders "漲
+  多過熱" rather than the generic "weak" label
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, and that a
@@ -536,9 +563,11 @@ app/reports/           Report rendering
                             factor_scores, volume_ratio_20d, and
                             risk_missing_inputs
   text_renderer.py            Fixed-template LINE-compatible text output:
-                            per-factor signal lights, tri-state regulatory
-                            status, limit-up structure, and a dynamically
-                            built risk_quality gap explanation
+                            per-factor signal lights (with a momentum-
+                            overheating override), tri-state regulatory
+                            status with distinct per-day-announcement vs
+                            active-period wording, limit-up structure, and
+                            a dynamically built risk_quality gap explanation
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
