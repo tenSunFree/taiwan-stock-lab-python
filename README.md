@@ -132,7 +132,12 @@ a later phase (see [Roadmap](#roadmap)).
   cumulative return, computed only from sessions strictly before the
   target date
 - 5-day trailing institutional net-buy ratio, reusing the same volume
-  data already fetched for price-history enrichment
+  data already fetched for price-history enrichment, plus an
+  independent 3-day cumulative institutional net-buy sign check
+  (`bool | None`, strictly `> 0`) computed from the same fetched data
+  — used purely as a report display signal (see Report Rendering
+  below), never as a scoring factor, and never changing the 5-day
+  ratio's own value or meaning
 - Monthly revenue year-over-year, gated on FinMind's `create_time`
   field (not the calendar month alone) so a revenue figure is only
   used once its own disclosure date has actually passed — avoids
@@ -245,6 +250,16 @@ a later phase (see [Roadmap](#roadmap)).
   potentially misleading label. This is a display-only distinction:
   `HIGH_FIVE_DAY_RETURN` is reused purely as a report-level hint, and
   `rule-v1.2.0`'s `FACTOR_WEIGHTS` and scoring logic are unchanged
+- As of `text-v8`, a **法人籌碼 (institutional net-buy) tri-state
+  section** shows whether cumulative institutional net-buy over the
+  trailing 3 sessions is strictly positive (`✅` yes / `❌` no / `⚪`
+  insufficient data). This is a display signal independent of the
+  "institutional" scoring factor already shown in the signal-light
+  summary above — a different window (3 sessions vs. 5) and a
+  different calculation (a plain sign check vs. a normalized
+  net-buy/volume ratio) — so the two can legitimately show different
+  results for the same stock without that being a contradiction, and
+  are never conflated or allowed to influence one another
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -281,7 +296,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v7`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v8`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -470,10 +485,15 @@ pytest -v
   before target" date-matching policy (including the staleness ceiling
   that catches a genuinely stalled valuation source)
 - Enrichment tests covering independent fail-soft behavior across
-  price-history, institutional-flow, and monthly-revenue fetches, and
-  a look-ahead-bias regression test for revenue YoY (a figure is only
+  price-history, institutional-flow, and monthly-revenue fetches, a
+  look-ahead-bias regression test for revenue YoY (a figure is only
   usable once its own disclosure date has passed, not just once its
-  calendar month has)
+  calendar month has), and dedicated tests for the 3-day institutional
+  net-buy sign check (`build_institutional_net_buy_positive`)
+  confirming it uses a strict `> 0` comparison, returns `None` rather
+  than a partial answer when any required session lacks data, and can
+  legitimately disagree with the 5-day scoring ratio for the same
+  stock without that being a bug
 - Regulatory-mapper tests (TWSE HTML via `twse_regulatory_mapper.py`,
   TPEx JSON via `regulatory_mapper.py`) covering exact-announcement-date
   matching for attention data vs active-period matching for
@@ -496,9 +516,11 @@ pytest -v
   stale-hardcoded-sentence bug recurring once a previously-unwired
   input gets wired in, attention-vs-disposition time-semantics
   regression tests confirming the two can disagree without being a
-  contradiction, and a momentum-overheating regression test confirming
-  a low momentum score paired with `HIGH_FIVE_DAY_RETURN` renders "漲
-  多過熱" rather than the generic "weak" label
+  contradiction, a momentum-overheating regression test confirming a
+  low momentum score paired with `HIGH_FIVE_DAY_RETURN` renders "漲多
+  過熱" rather than the generic "weak" label, and a 法人籌碼 tri-state
+  rendering test confirming it stays independent of the
+  "institutional" signal-light score for the same stock
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, and that a
@@ -532,12 +554,15 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                             RegulatoryRiskStatus, decoupled from any
                             data source
   features.py               StockFeatures, including risk_missing_inputs
-                            (carried through from RiskAssessment)
+                            (carried through from RiskAssessment) and
+                            institutional_net_buy_3d_positive (display-only)
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
   institutional_flow_builder.py
-                             Institutional net-buy ratio (look-ahead-safe)
+                             Institutional net-buy ratio (5-day, scoring
+                             factor) and net-buy positive sign check
+                             (3-day, display-only) — both look-ahead-safe
   monthly_revenue_builder.py
                              Revenue YoY (look-ahead-safe via available_at)
   risk_inputs.py             Reliable/heuristic RiskPolicy input reconstruction
@@ -560,14 +585,17 @@ app/ingestion/        Data source integration
 app/reports/           Report rendering
   report_builder.py         ScoredStock + StockFeatures -> ReportStockView
                             adaptation, merging in official regulatory detail,
-                            factor_scores, volume_ratio_20d, and
+                            factor_scores, volume_ratio_20d,
+                            institutional_net_buy_3d_positive, and
                             risk_missing_inputs
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
                             overheating override), tri-state regulatory
                             status with distinct per-day-announcement vs
-                            active-period wording, limit-up structure, and
-                            a dynamically built risk_quality gap explanation
+                            active-period wording, a 法人籌碼 tri-state
+                            institutional net-buy display, limit-up
+                            structure, and a dynamically built
+                            risk_quality gap explanation
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client

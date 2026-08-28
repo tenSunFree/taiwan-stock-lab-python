@@ -37,6 +37,12 @@ never silently dropped or defaulted. This is what supplies
 volume_ratio_20d for the "漲停結構" block, and factor_scores /
 risk_missing_inputs are carried straight through from ScoredStock to
 drive the "訊號" and "監管狀態" blocks.
+
+As of text-v8, also carries StockFeatures.institutional_net_buy_3d_positive
+through to ReportStockView so the report can render the "法人籌碼"
+block (see app.reports.text_renderer). This is a display-only signal,
+independent of the "institutional" scoring factor already carried via
+factor_scores above.
 """
 
 from __future__ import annotations
@@ -167,6 +173,9 @@ def build_report_stocks(
                 ),
                 factor_scores=dict(scored.factor_scores),
                 volume_ratio_20d=features.volume_ratio_20d,
+                institutional_net_buy_3d_positive=(
+                    features.institutional_net_buy_3d_positive
+                ),
                 risk_missing_inputs=scored.risk_missing_inputs,
             )
         )

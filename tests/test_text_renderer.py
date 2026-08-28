@@ -320,6 +320,52 @@ def test_moderate_momentum_with_flag_still_shows_normal_not_overheated():
     assert "動能：漲多過熱" not in report
 
 
+# --- 法人籌碼（display-only tri-state，獨立於 institutional 評分因子） --------
+
+
+def test_institutional_net_buy_positive_shows_yes():
+    report = _render(_make_stock_view(institutional_net_buy_3d_positive=True))
+    assert "✅ 近 3 個交易日累積買超 > 0：是" in report
+
+
+def test_institutional_net_buy_non_positive_shows_no():
+    report = _render(_make_stock_view(institutional_net_buy_3d_positive=False))
+    assert "❌ 近 3 個交易日累積買超 > 0：否" in report
+
+
+def test_institutional_net_buy_unknown_shows_insufficient_data():
+    """預設值（未提供時）與明確傳入 None 都必須顯示「資料不足」，
+    不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——這是
+    這個 tri-state 欄位存在的原因，混淆兩者會讓「不知道」被誤報成
+    「確認沒有買超」。"""
+    report = _render(_make_stock_view(institutional_net_buy_3d_positive=None))
+    assert "⚪ 近 3 個交易日累積買超 > 0：資料不足" in report
+    assert "✅ 近 3 個交易日累積買超" not in report
+    assert "❌ 近 3 個交易日累積買超" not in report
+
+
+def test_institutional_net_buy_is_independent_of_institutional_score():
+    """法人籌碼區塊的 True/False 與「訊號」區塊裡 institutional 因子
+    的分數是兩件獨立的事：即使 institutional 評分因子偏低（🔴 偏弱），
+    近 3 日累積買超一樣可能是正的，兩者不應互相覆蓋或矛盾地被合併
+    顯示。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 20.0,
+                "fundamental": 50.0,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_3d_positive=True,
+        )
+    )
+    assert "🔴 籌碼：偏弱" in report
+    assert "✅ 近 3 個交易日累積買超 > 0：是" in report
+
+
 # --- 監管狀態（tri-state：True 標記 / False 官方確認正常 / None 未知） ---------
 
 
@@ -455,6 +501,7 @@ def test_report_model_explanation_reflects_new_template():
     assert "「訊號」依各因子的標準化分數區間呈現" in report
     assert "動能因子採非單調評分" in report
     assert "並非代表近期沒有上漲動能" in report
+    assert "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0" in report
     assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" in report
     # old text-v5 section is gone
     assert "「主要得分來源」" not in report
