@@ -130,7 +130,9 @@ a later phase (see [Roadmap](#roadmap)).
 
 - Trailing 20-day average turnover, 20-day volume ratio, and 5/20-day
   cumulative return, computed only from sessions strictly before the
-  target date
+  target date, plus an independent "low position + early rally"
+  technical display signal (`bool | None`) computed from the same
+  trailing history — see Report Rendering below
 - 5-day trailing institutional net-buy ratio, reusing the same volume
   data already fetched for price-history enrichment, plus an
   independent 3-day cumulative institutional net-buy sign check
@@ -212,6 +214,17 @@ a later phase (see [Roadmap](#roadmap)).
   with explicit counts distinguishing "entered the candidate pool"
   from "cleared the completeness gate" — no field is named in a way
   that overstates what it actually measures
+- Each stock's per-line "今日排名：N / M" denominator (`M`) is the
+  number of stocks ACTUALLY appearing in today's report
+  (`len(ranked_stocks)`), not the configured `ranking_limit` ("Top N"
+  display cap) — the two legitimately differ whenever fewer stocks
+  clear the completeness gate than `ranking_limit` allows for (e.g.
+  only 5 stocks qualified even though `ranking_limit` is 10); showing
+  "1 / 10" next to a 5-stock list would read as a contradiction, since
+  there's no stock ranked 6th–10th anywhere in the report to justify
+  that denominator. The "顯示 Top N" checklist line and "展示範圍：
+  綜合分數 Top N" line are unaffected by this and still describe the
+  configured cap itself
 - Each stock's block shows a **signal-light summary** (🟢 strong /
   🟡 moderate / 🔴 weak / ⚪ insufficient data) for all six scoring
   factors — including `volume_price`, which an earlier template
@@ -260,6 +273,19 @@ a later phase (see [Roadmap](#roadmap)).
   net-buy/volume ratio) — so the two can legitimately show different
   results for the same stock without that being a contradiction, and
   are never conflated or allowed to influence one another
+- As of `text-v9`, a **技術面 (low-position + early-rally) tri-state
+  section** shows whether today's close is both (a) within the bottom
+  30% of its own trailing 20-session closing-price range and (b) just
+  crossed above its own 5-session moving average today — a bullish
+  crossover check (previous close at/below its MA5, today's close
+  above today's MA5), not a "currently sitting above MA5" snapshot, so
+  a stock that has been strong for weeks doesn't get relabeled as
+  "just starting to rise." This is a display signal independent of
+  the "momentum" scoring factor already shown in the signal-light
+  summary above — a completely different calculation (a price-range
+  position plus a moving-average crossover, vs. 5-day/20-day
+  cumulative returns) — so the two can legitimately disagree for the
+  same stock without that being a contradiction
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -296,7 +322,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v8`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v9`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -488,12 +514,19 @@ pytest -v
   price-history, institutional-flow, and monthly-revenue fetches, a
   look-ahead-bias regression test for revenue YoY (a figure is only
   usable once its own disclosure date has passed, not just once its
-  calendar month has), and dedicated tests for the 3-day institutional
+  calendar month has), dedicated tests for the 3-day institutional
   net-buy sign check (`build_institutional_net_buy_positive`)
   confirming it uses a strict `> 0` comparison, returns `None` rather
   than a partial answer when any required session lacks data, and can
   legitimately disagree with the 5-day scoring ratio for the same
-  stock without that being a bug
+  stock without that being a bug, and dedicated tests for the
+  low-position/early-rally technical signal
+  (`build_low_with_rising_signal`) confirming the 20-session range
+  position and the 5-day moving-average crossover are each evaluated
+  independently, that a stock already sitting above its MA5 for a
+  while is correctly distinguished from one just crossing above it
+  today, and that a degenerate flat trading range never triggers a
+  division-by-zero
 - Regulatory-mapper tests (TWSE HTML via `twse_regulatory_mapper.py`,
   TPEx JSON via `regulatory_mapper.py`) covering exact-announcement-date
   matching for attention data vs active-period matching for
@@ -518,14 +551,20 @@ pytest -v
   regression tests confirming the two can disagree without being a
   contradiction, a momentum-overheating regression test confirming a
   low momentum score paired with `HIGH_FIVE_DAY_RETURN` renders "漲多
-  過熱" rather than the generic "weak" label, and a 法人籌碼 tri-state
+  過熱" rather than the generic "weak" label, a 法人籌碼 tri-state
   rendering test confirming it stays independent of the
-  "institutional" signal-light score for the same stock
+  "institutional" signal-light score for the same stock, and a 技術面
+  tri-state rendering test confirming it stays independent of the
+  "momentum" signal-light score for the same stock
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
-  candidate/eligible counts are labeled accurately, and that a
+  candidate/eligible counts are labeled accurately, that a
   disposition stock's rendered period/reason never leaks the full
-  legal-text description
+  legal-text description, and a regression test confirming each
+  stock's "今日排名" denominator matches the actual number of stocks
+  listed that day rather than the configured `ranking_limit` (while
+  the "顯示 Top N" / "展示範圍" lines still correctly reflect
+  `ranking_limit` itself)
 - LINE client tests using `httpx.MockTransport` to simulate 200 / 409
   / 429 / 500 responses for both Push and Broadcast endpoints,
   verifying retry-key propagation, duplicate handling, and
@@ -554,11 +593,16 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                             RegulatoryRiskStatus, decoupled from any
                             data source
   features.py               StockFeatures, including risk_missing_inputs
-                            (carried through from RiskAssessment) and
-                            institutional_net_buy_3d_positive (display-only)
+                            (carried through from RiskAssessment),
+                            institutional_net_buy_3d_positive, and
+                            technical_low_with_rising_signal (both display-only)
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
+  technical_signal_builder.py
+                             Low-position (20-session range) + early-rally
+                             (5-session MA crossover) display signal —
+                             look-ahead-safe, not a scoring factor
   institutional_flow_builder.py
                              Institutional net-buy ratio (5-day, scoring
                              factor) and net-buy positive sign check
@@ -586,15 +630,17 @@ app/reports/           Report rendering
   report_builder.py         ScoredStock + StockFeatures -> ReportStockView
                             adaptation, merging in official regulatory detail,
                             factor_scores, volume_ratio_20d,
-                            institutional_net_buy_3d_positive, and
+                            institutional_net_buy_3d_positive,
+                            technical_low_with_rising_signal, and
                             risk_missing_inputs
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
                             overheating override), tri-state regulatory
                             status with distinct per-day-announcement vs
                             active-period wording, a 法人籌碼 tri-state
-                            institutional net-buy display, limit-up
-                            structure, and a dynamically built
+                            institutional net-buy display, a 技術面
+                            tri-state low-position/early-rally display,
+                            limit-up structure, and a dynamically built
                             risk_quality gap explanation
 
 app/clients/           External API clients

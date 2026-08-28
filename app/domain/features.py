@@ -51,6 +51,21 @@ class StockFeatures:
     # defaulted one to also have a default.
     institutional_net_buy_3d_positive: bool | None = None
 
+    # technical / price-structure — ANOTHER DISPLAY-ONLY signal,
+    # independent of both institutional_net_buy_3d_positive above and
+    # the "momentum" scoring factor (return_5d/return_20d-derived):
+    # whether today's close is both (a) near the low end of its own
+    # trailing 20-session trading range, AND (b) just crossed above
+    # its own 5-session moving average today (see
+    # app.domain.technical_signal_builder.build_low_with_rising_signal
+    # for the exact thresholds and crossover definition). None means
+    # insufficient trailing history to compute the 20-session range at
+    # all, same tri-state convention as every other optional signal in
+    # this dataclass. Also listed after risk_quality_raw for the same
+    # dataclass-field-ordering reason as institutional_net_buy_3d_positive
+    # above, not because it's thematically related to risk quality.
+    technical_low_with_rising_signal: bool | None = None
+
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
 
     # RiskAssessment.missing_inputs (see app.domain.risk_policy), carried

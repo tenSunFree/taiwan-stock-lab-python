@@ -124,12 +124,37 @@ def test_report_omits_price_lines_when_unavailable():
 # --- 今日排名 / 資料完整度 --------------------------------------------------
 
 
-def test_report_shows_daily_rank_against_ranking_limit():
-    """今日排名的分母直接用 render_daily_report 的 ranking_limit 參數，
-    不是 ReportStockView 自己另外帶一份 —— 避免出現兩份 source of
-    truth 互相不同步的狀況。"""
+def test_report_shows_daily_rank_against_actual_stock_count():
+    """今日排名的分母是「今天實際入榜的股票數」（len(ranked_stocks)），
+    不是 render_daily_report 的 ranking_limit 參數本身——這兩個數字
+    在「符合門檻的股票數 < ranking_limit」時會不一樣（例如今天只有 5
+    檔符合門檻，即使 ranking_limit 設定為 10），分母必須反映讀者眼前
+    這份清單實際的股票數，不能顯示一個清單裡根本找不到對應排名的分母
+    （例如清單只有 5 檔，卻寫「1 / 10」，讀者會找不到 6~10 名在哪）。"""
     report = _render(_make_stock_view(rank=1), ranking_limit=10)
-    assert "今日排名：1 / 10" in report
+    assert "今日排名：1 / 1" in report
+
+
+def test_report_shows_daily_rank_denominator_matches_stocks_actually_listed():
+    """更貼近真實情境的回歸測試：即使 ranking_limit 設定為 10，只要
+    今天實際只有 5 檔股票符合門檻進入 ranked_stocks，每一檔的「今日
+    排名」分母都必須是 5，不是 10——這正是使用者回報過的真實案例
+    （通過資料完整度門檻：5 檔，但排名卻顯示 1 / 10 的落差）。"""
+    stocks = [_make_stock_view(rank=i) for i in range(1, 6)]
+    report = _render(*stocks, ranking_limit=10)
+    for rank in range(1, 6):
+        assert f"今日排名：{rank} / 5" in report
+    assert "/ 10" not in report
+
+
+def test_report_top_display_line_still_reflects_configured_ranking_limit():
+    """「顯示 Top N」與「展示範圍：綜合分數 Top N」這兩行描述的是設定
+    的顯示上限本身，跟今天實際入榜幾檔無關，不應該被上面那個分母的
+    修正影響。"""
+    stocks = [_make_stock_view(rank=i) for i in range(1, 6)]
+    report = _render(*stocks, ranking_limit=10)
+    assert "✅ 顯示 Top 10" in report
+    assert "展示範圍：綜合分數 Top 10" in report
 
 
 def test_report_always_shows_data_completeness():
@@ -366,6 +391,52 @@ def test_institutional_net_buy_is_independent_of_institutional_score():
     assert "✅ 近 3 個交易日累積買超 > 0：是" in report
 
 
+# --- 技術面（display-only tri-state，獨立於 momentum 評分因子） --------------
+
+
+def test_technical_signal_shows_yes():
+    report = _render(_make_stock_view(technical_low_with_rising_signal=True))
+    assert "✅ 低檔且具起漲訊號：是" in report
+
+
+def test_technical_signal_shows_no():
+    report = _render(_make_stock_view(technical_low_with_rising_signal=False))
+    assert "❌ 低檔且具起漲訊號：否" in report
+
+
+def test_technical_signal_shows_insufficient_data():
+    """預設值（未提供時）與明確傳入 None 都必須顯示「資料不足」，
+    不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——理由跟
+    法人籌碼那個 tri-state 欄位完全一樣。"""
+    report = _render(_make_stock_view(technical_low_with_rising_signal=None))
+    assert "⚪ 低檔且具起漲訊號：資料不足" in report
+    assert "✅ 低檔且具起漲訊號" not in report
+    assert "❌ 低檔且具起漲訊號" not in report
+
+
+def test_technical_signal_is_independent_of_momentum_score():
+    """技術面區塊的 True/False 與「訊號」區塊裡 momentum 因子的分數是
+    兩件獨立的事：即使 momentum 評分因子顯示「漲多過熱」（近期漲幅已
+    過熱、分數偏低），技術面訊號本身仍是用完全不同的價格區間／均線
+    計算方式得出，兩者不應互相覆蓋或矛盾地被合併顯示。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 20.0,
+                "institutional": 60.0,
+                "fundamental": 50.0,
+                "risk_quality": 90.0,
+            },
+            risk_flags=("HIGH_FIVE_DAY_RETURN",),
+            technical_low_with_rising_signal=True,
+        )
+    )
+    assert "動能：漲多過熱" in report
+    assert "✅ 低檔且具起漲訊號：是" in report
+
+
 # --- 監管狀態（tri-state：True 標記 / False 官方確認正常 / None 未知） ---------
 
 
@@ -502,6 +573,7 @@ def test_report_model_explanation_reflects_new_template():
     assert "動能因子採非單調評分" in report
     assert "並非代表近期沒有上漲動能" in report
     assert "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0" in report
+    assert "「技術面」區塊顯示今日收盤是否同時符合" in report
     assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" in report
     # old text-v5 section is gone
     assert "「主要得分來源」" not in report

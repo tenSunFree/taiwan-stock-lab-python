@@ -43,6 +43,12 @@ through to ReportStockView so the report can render the "法人籌碼"
 block (see app.reports.text_renderer). This is a display-only signal,
 independent of the "institutional" scoring factor already carried via
 factor_scores above.
+
+As of text-v9, also carries StockFeatures.technical_low_with_rising_signal
+through to ReportStockView so the report can render the "技術面" block
+(see app.reports.text_renderer). Same display-only convention as
+institutional_net_buy_3d_positive above — independent of the
+"momentum" scoring factor already carried via factor_scores.
 """
 
 from __future__ import annotations
@@ -175,6 +181,9 @@ def build_report_stocks(
                 volume_ratio_20d=features.volume_ratio_20d,
                 institutional_net_buy_3d_positive=(
                     features.institutional_net_buy_3d_positive
+                ),
+                technical_low_with_rising_signal=(
+                    features.technical_low_with_rising_signal
                 ),
                 risk_missing_inputs=scored.risk_missing_inputs,
             )
