@@ -408,3 +408,53 @@ def test_build_report_stocks_populates_volume_ratio_and_factor_scores_from_featu
         "is_managed",
         "consecutive_limit_up_days",
     )
+
+
+def test_build_report_stocks_carries_institutional_net_buy_3d_positive():
+    """text-v8：features_by_stock 的 institutional_net_buy_3d_positive
+    必須原封不動地帶到 ReportStockView，供「法人籌碼」區塊使用——這是
+    獨立於 factor_scores 裡 institutional 評分因子之外的顯示訊號，見
+    app.domain.institutional_flow_builder 的模組說明。"""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features("1101", institutional_net_buy_3d_positive=True)
+        },
+    )
+
+    assert result[0].institutional_net_buy_3d_positive is True
+
+
+def test_build_report_stocks_institutional_net_buy_3d_positive_defaults_to_none():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].institutional_net_buy_3d_positive is None

@@ -158,6 +158,19 @@ class ReportStockView:
     # omitted (see _render_limit_up_structure_lines).
     volume_ratio_20d: float | None = None
 
+    # From StockFeatures — DISPLAY-ONLY signal for the "法人籌碼"
+    # block: whether cumulative institutional net-buy shares over the
+    # trailing 3 sessions is strictly positive (see
+    # app.domain.institutional_flow_builder.build_institutional_net_buy_positive).
+    # Tri-state: True/False are confirmed answers, None means
+    # insufficient data — always rendered explicitly (never silently
+    # omitted), matching this module's convention for every other
+    # optional signal. Independent of the "institutional" scoring
+    # factor already carried via factor_scores above (a different
+    # window and a different calculation — see that module's
+    # docstring for why the two must not be conflated).
+    institutional_net_buy_3d_positive: bool | None = None
+
     # RiskAssessment.missing_inputs, carried all the way through
     # StockFeatures -> ScoredStock -> here. This is what lets the
     # renderer distinguish "officially confirmed clean" (False, not in
@@ -199,9 +212,9 @@ def _signal_emoji(score: float | None) -> str:
     return "🔴"
 
 
-# The "normal/strong" boundary value for _signal_word. Overheat overwriting of _momentum_signal_word
-# Only takes effect when the score falls below this boundary value (i.e., in the range marked as "weak").
-# Therefore, the same constant is used in both places to avoid bugs caused by future modifications to the boundary.
+# _signal_word 的「普通／強」分界值。_momentum_signal_word 的過熱覆寫
+# 只在分數落在這個分界值以下（即會被標成「偏弱」的區間）時才生效，
+# 所以兩處共用同一個常數，避免未來各自改動、產生分界不一致的 bug。
 _WEAK_SIGNAL_THRESHOLD = 40
 
 
@@ -353,6 +366,29 @@ def _render_regulatory_status_lines(stock: ReportStockView) -> list[str]:
     return lines
 
 
+# --- 法人籌碼 (institutional net-buy, display-only tri-state) ------------------
+#
+# This is intentionally NOT the same thing as the "institutional"
+# entry in factor_scores/訊號 above: that is a 0-100 normalized score
+# built from a 5-session net-buy/volume ratio, used in the weighted
+# total score. This block instead answers a much narrower, literal
+# question — "did institutions net-buy in aggregate over the last 3
+# sessions" — as a plain yes/no/unknown fact, independent of scoring.
+# See app.domain.institutional_flow_builder.build_institutional_net_buy_positive
+# for the calculation and its no-look-ahead / strict-window rules.
+
+
+def _render_institutional_flow_lines(stock: ReportStockView) -> list[str]:
+    value = stock.institutional_net_buy_3d_positive
+    if value is None:
+        line = "⚪ 近 3 個交易日累積買超 > 0：資料不足"
+    elif value:
+        line = "✅ 近 3 個交易日累積買超 > 0：是"
+    else:
+        line = "❌ 近 3 個交易日累積買超 > 0：否"
+    return ["法人籌碼", line]
+
+
 # --- 漲停結構 (Phase A subset — no intraday data yet) --------------------------
 
 
@@ -439,6 +475,8 @@ def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[s
     lines.append("")
     lines.extend(_render_regulatory_status_lines(stock))
     lines.append("")
+    lines.extend(_render_institutional_flow_lines(stock))
+    lines.append("")
     lines.extend(_render_primary_risk_lines(stock))
     lines.append("")
 
@@ -480,7 +518,7 @@ def render_daily_report(
         "✅ 注意／處置有價證券官方風控",
         "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
         "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
-        "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
+        "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
         "⬜ 技術面：低檔且具起漲訊號",
         "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
         "⬜ 產業題材：電子業且具 AI 相關性",
@@ -513,6 +551,11 @@ def render_daily_report(
                 "動能因子採非單調評分；顯示「漲多過熱」時，"
                 "代表近期累積漲幅已達短線過熱門檻，"
                 "反映追價風險升高，並非代表近期沒有上漲動能。"
+            ),
+            (
+                "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
+                "為獨立於綜合分數之外的參考訊號，"
+                "不會改變「訊號」區塊中籌碼因子的評分結果。"
             ),
             (
                 "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
@@ -555,7 +598,7 @@ def render_no_qualified_stock_report(
             "✅ 注意／處置有價證券官方風控",
             "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
             "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
-            "⬜ 法人籌碼：近 3 個交易日累積買超 > 0",
+            "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
             "⬜ 技術面：低檔且具起漲訊號",
             "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
             "⬜ 產業題材：電子業且具 AI 相關性",

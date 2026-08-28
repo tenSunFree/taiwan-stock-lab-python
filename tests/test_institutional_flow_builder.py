@@ -4,6 +4,7 @@ import pytest
 
 from app.domain.institutional_flow_builder import (
     InstitutionalFlowPoint,
+    build_institutional_net_buy_positive,
     build_institutional_net_buy_ratio,
 )
 
@@ -165,3 +166,123 @@ def test_missing_recent_flow_session_does_not_fall_back_to_older_flow():
     )
 
     assert ratio is None
+
+
+# --- build_institutional_net_buy_positive (3-session display signal) ---------
+#
+# Separate function, separate window (3, not 5), separate return type
+# (bool | None, not a ratio) — see the module docstring for why this
+# must not be conflated with build_institutional_net_buy_ratio above.
+
+
+def test_positive_true_when_cumulative_net_buy_is_positive():
+    points = make_points(3, net_shares=1000)
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE,
+        flow_points=points,
+        volume_by_date=make_volume_map(points),
+    )
+    assert result is True
+
+
+def test_positive_false_when_cumulative_net_buy_is_negative():
+    points = make_points(3, net_shares=-500)
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE,
+        flow_points=points,
+        volume_by_date=make_volume_map(points),
+    )
+    assert result is False
+
+
+def test_positive_false_when_cumulative_net_buy_is_exactly_zero():
+    """> 0 是嚴格大於，累積淨買超剛好等於 0（例如三天分別是
+    +1000/-1000/0）不算「有買超」，必須回傳 False，不是 True。"""
+    points = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 10), net_shares=1000),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 11), net_shares=-1000),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 12), net_shares=0),
+    ]
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE,
+        flow_points=points,
+        volume_by_date=make_volume_map(points),
+    )
+    assert result is False
+
+
+def test_positive_none_when_window_incomplete():
+    points = make_points(2, net_shares=1000)
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE,
+        flow_points=points,
+        volume_by_date=make_volume_map(points),
+    )
+    assert result is None
+
+
+def test_positive_none_when_a_day_in_window_is_missing_flow_data():
+    price_dates = [
+        dt.date(2026, 8, 10),
+        dt.date(2026, 8, 11),
+        dt.date(2026, 8, 12),
+    ]
+    flow_points = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 10), net_shares=1000),
+        # 2026-08-11 intentionally missing from flow_points.
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 12), net_shares=1000),
+    ]
+    volume_by_date = {trading_date: 100_000.0 for trading_date in price_dates}
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE,
+        flow_points=flow_points,
+        volume_by_date=volume_by_date,
+    )
+    assert result is None
+
+
+def test_positive_target_date_row_is_defensively_excluded():
+    points = make_points(3, net_shares=1000)
+    points.append(InstitutionalFlowPoint(trading_date=TARGET_DATE, net_shares=-999_999))
+    volume_map = make_volume_map(points)
+    volume_map[TARGET_DATE] = 100_000.0
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE, flow_points=points, volume_by_date=volume_map
+    )
+    assert result is True
+
+
+def test_positive_uses_latest_three_sessions_only():
+    """5 天視窗（build_institutional_net_buy_ratio 用的）裡，只有最舊
+    的 2 天是正的、最近 3 天是負的，兩個函式應該給出不同答案——這正是
+    兩者窗口大小不同、必須分開驗證的原因。"""
+    older_positive = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 3), net_shares=5000),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 4), net_shares=5000),
+    ]
+    recent_negative = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 10), net_shares=-100),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 11), net_shares=-100),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 12), net_shares=-100),
+    ]
+    points = [*older_positive, *recent_negative]
+    volume_by_date = make_volume_map(points)
+
+    result = build_institutional_net_buy_positive(
+        target_date=TARGET_DATE, flow_points=points, volume_by_date=volume_by_date
+    )
+    assert result is False
+
+    ratio = build_institutional_net_buy_ratio(
+        target_date=TARGET_DATE, flow_points=points, volume_by_date=volume_by_date
+    )
+    # 5-day ratio still nets out positive: (5000+5000-100-100-100)/(volume*5)
+    assert ratio is not None
+    assert ratio > 0
+
+
+def test_positive_rejects_non_positive_window():
+    with pytest.raises(ValueError, match="window must be positive"):
+        build_institutional_net_buy_positive(
+            target_date=TARGET_DATE, flow_points=[], volume_by_date={}, window=0
+        )

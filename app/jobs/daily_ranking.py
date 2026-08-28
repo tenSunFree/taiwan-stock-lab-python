@@ -142,7 +142,10 @@ from app.clients.line_client import LineMessagingClient
 from app.db.delivery_repository import DeliveryRepository
 from app.db.models import MessageDelivery
 from app.delivery.service import DeliveryService
-from app.domain.institutional_flow_builder import build_institutional_net_buy_ratio
+from app.domain.institutional_flow_builder import (
+    build_institutional_net_buy_positive,
+    build_institutional_net_buy_ratio,
+)
 from app.domain.models import Market, RegulatoryRiskStatus, StockMaster, StockValuation
 from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
@@ -296,7 +299,19 @@ STRATEGY_VERSION = "rule-v1.2.0"
 #     scoring factor and does not alter rule-v1.2.0 in any way.
 #   - Model explanation gained one sentence clarifying the "漲多過熱"
 #     wording so readers don't misread it as "no momentum."
-MESSAGE_VERSION = "text-v7"
+#
+# text-v8: adds the "法人籌碼" report block — whether cumulative
+# institutional net-buy shares over the trailing 3 sessions is
+# strictly positive (see
+# app.domain.institutional_flow_builder.build_institutional_net_buy_positive).
+# This IS a new field on both StockFeatures and ReportStockView
+# (institutional_net_buy_3d_positive), but it is DISPLAY-ONLY: it does
+# not participate in FACTOR_WEIGHTS, does not change the existing
+# "institutional" scoring factor (still the 5-session net-buy/volume
+# ratio), and does not alter RiskPolicy or bounded_momentum_score.
+# Tri-state (True/False/None) rendered explicitly, same convention as
+# every other optional signal in this report.
+MESSAGE_VERSION = "text-v8"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -676,6 +691,14 @@ def build_stock_features(
 
         # --- Independent block 2: institutional net-buy ratio ---
         institutional_net_buy_ratio_5d = None
+        # DISPLAY-ONLY signal for the report's "法人籌碼" block — see
+        # app.domain.institutional_flow_builder.build_institutional_net_buy_positive
+        # for why this is a separate calculation from the ratio above
+        # (different window, not a scoring factor). Computed from the
+        # same flow_points/volume_by_date as the ratio, so it shares
+        # the ratio's failure handling below rather than needing its
+        # own separate counters.
+        institutional_net_buy_3d_positive = None
 
         try:
             institutional_payload = finmind_client.fetch_stock_institutional_investors(
@@ -702,6 +725,13 @@ def build_stock_features(
                     target_date=target_date,
                     flow_points=flow_points,
                     volume_by_date=volume_by_date,
+                )
+                institutional_net_buy_3d_positive = (
+                    build_institutional_net_buy_positive(
+                        target_date=target_date,
+                        flow_points=flow_points,
+                        volume_by_date=volume_by_date,
+                    )
                 )
                 if institutional_net_buy_ratio_5d is None:
                     institutional_none_count += 1
@@ -831,6 +861,7 @@ def build_stock_features(
             return_5d=return_5d,
             return_20d=return_20d,
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
+            institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             revenue_yoy=revenue_yoy,
             risk_quality_raw=risk_quality_raw,
             risk_flags=risk_flags,
@@ -841,7 +872,8 @@ def build_stock_features(
         logger.info(
             "features stock_id=%s turnover=%s avg_turnover_20d=%s "
             "volume_ratio_20d=%s return_5d=%s return_20d=%s "
-            "institutional_net_buy_ratio_5d=%s revenue_yoy=%s "
+            "institutional_net_buy_ratio_5d=%s "
+            "institutional_net_buy_3d_positive=%s revenue_yoy=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
             stock_features.turnover,
@@ -850,6 +882,7 @@ def build_stock_features(
             stock_features.return_5d,
             stock_features.return_20d,
             stock_features.institutional_net_buy_ratio_5d,
+            stock_features.institutional_net_buy_3d_positive,
             stock_features.revenue_yoy,
             stock_features.risk_quality_raw,
             stock_features.risk_flags,

@@ -37,6 +37,20 @@ class StockFeatures:
     # simplified here to a 0~1 score, where 1 means best risk quality, no flags)
     risk_quality_raw: float | None
 
+    # institutional / ownership flow — DISPLAY-ONLY signal, distinct
+    # from institutional_net_buy_ratio_5d above: whether cumulative
+    # institutional net-buy shares over the trailing 3 sessions is
+    # strictly positive (see
+    # app.domain.institutional_flow_builder.build_institutional_net_buy_positive).
+    # None means "insufficient/missing data for the window", same
+    # tri-state convention as the regulatory status fields below.
+    # Defaults to None (and is listed after risk_quality_raw, not next
+    # to institutional_net_buy_ratio_5d above) purely so existing
+    # StockFeatures(...) call sites that don't set it explicitly keep
+    # working — dataclasses require every field after the first
+    # defaulted one to also have a default.
+    institutional_net_buy_3d_positive: bool | None = None
+
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
 
     # RiskAssessment.missing_inputs (see app.domain.risk_policy), carried

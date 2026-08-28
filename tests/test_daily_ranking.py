@@ -1451,6 +1451,7 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     assert feature.return_5d is not None
     assert feature.return_20d is not None
     assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.institutional_net_buy_3d_positive is True
     assert feature.revenue_yoy is not None
     assert feature.revenue_yoy == pytest.approx(0.30)  # 1,300,000,000/1,000,000,000-1
     assert client.calls == ["1101"]
@@ -1549,6 +1550,7 @@ def test_build_stock_features_institutional_failure_does_not_clear_price_factors
     assert feature.return_5d is not None
     # institutional factor is None because ITS OWN fetch failed
     assert feature.institutional_net_buy_ratio_5d is None
+    assert feature.institutional_net_buy_3d_positive is None
 
 
 def test_build_stock_features_price_failure_does_not_prevent_institutional_attempt():
@@ -1587,6 +1589,9 @@ def test_build_stock_features_price_failure_does_not_prevent_institutional_attem
     assert (
         features[0].institutional_net_buy_ratio_5d is None
     )  # no volume data to divide by
+    assert (
+        features[0].institutional_net_buy_3d_positive is None
+    )  # same reason — no volume data to establish the 3-session window
 
 
 def test_build_stock_features_revenue_failure_does_not_clear_other_factors():
@@ -1621,6 +1626,7 @@ def test_build_stock_features_revenue_failure_does_not_clear_other_factors():
     feature = features[0]
     assert feature.average_turnover_20d is not None
     assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.institutional_net_buy_3d_positive is True
     assert feature.revenue_yoy is None  # 只有 revenue 這個 block 失敗
     assert client.calls == ["1101"]
     assert client.institutional_calls == ["1101"]
@@ -1646,6 +1652,41 @@ def test_build_stock_features_revenue_empty_rows_leaves_revenue_yoy_none():
 
     assert features[0].revenue_yoy is None
     assert client.revenue_calls == ["1101"]
+
+
+def test_build_stock_features_institutional_net_buy_3d_positive_is_false_when_negative():
+    """近 3 個交易日累積買超為負（或加總 <= 0）時，
+    institutional_net_buy_3d_positive 必須是 False，不是 None——
+    這條路徑資料是齊全的，只是賣超，跟「資料不足」是完全不同的狀態，
+    不能混為一談。"""
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20, close="100", volume="1000000")},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=200, sell=1000
+            )
+        },
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    # 5-day ratio factor is still computed (still real data, just negative)
+    assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.institutional_net_buy_ratio_5d < 0
+    assert feature.institutional_net_buy_3d_positive is False
 
 
 # --- Risk assessment (Step 2) ---
