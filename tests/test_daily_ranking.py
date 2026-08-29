@@ -1452,6 +1452,12 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     assert feature.return_20d is not None
     assert feature.institutional_net_buy_ratio_5d is not None
     assert feature.institutional_net_buy_3d_positive is True
+    # history fixture is a flat close=100 series; today's close (44.65)
+    # sits at the bottom of that (degenerate) range, so the "低檔" half
+    # holds, but today's close is nowhere near above a MA5 dominated by
+    # the flat 100 history — the "起漲" crossover half does not hold,
+    # so the combined signal must be False, not True.
+    assert feature.technical_low_with_rising_signal is False
     assert feature.revenue_yoy is not None
     assert feature.revenue_yoy == pytest.approx(0.30)  # 1,300,000,000/1,000,000,000-1
     assert client.calls == ["1101"]
@@ -1491,6 +1497,7 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
     assert by_stock["2330"].volume_ratio_20d is None
     assert by_stock["2330"].return_5d is None
     assert by_stock["2330"].return_20d is None
+    assert by_stock["2330"].technical_low_with_rising_signal is None
     # turnover itself still comes from today's real TWSE/TPEx data,
     # unaffected by the FinMind history failure
     assert by_stock["2330"].turnover == 100000000.0
@@ -1516,6 +1523,7 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
 
     assert features[0].average_turnover_20d is None
     assert features[0].return_5d is None
+    assert features[0].technical_low_with_rising_signal is None
 
 
 def test_build_stock_features_institutional_failure_does_not_clear_price_factors():

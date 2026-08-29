@@ -171,6 +171,18 @@ class ReportStockView:
     # docstring for why the two must not be conflated).
     institutional_net_buy_3d_positive: bool | None = None
 
+    # From StockFeatures — ANOTHER DISPLAY-ONLY signal, for the
+    # "技術面" block: whether today's close is both near the low end
+    # of its own trailing 20-session trading range AND just crossed
+    # above its own 5-session moving average today (see
+    # app.domain.technical_signal_builder.build_low_with_rising_signal
+    # for the exact thresholds and crossover definition). Tri-state,
+    # same rendering convention as institutional_net_buy_3d_positive
+    # above. Independent of the "momentum" scoring factor already
+    # carried via factor_scores (a completely different calculation —
+    # a price-range/moving-average check, not a return-based one).
+    technical_low_with_rising_signal: bool | None = None
+
     # RiskAssessment.missing_inputs, carried all the way through
     # StockFeatures -> ScoredStock -> here. This is what lets the
     # renderer distinguish "officially confirmed clean" (False, not in
@@ -389,6 +401,31 @@ def _render_institutional_flow_lines(stock: ReportStockView) -> list[str]:
     return ["法人籌碼", line]
 
 
+# --- 技術面 (low-position + early-rally, display-only tri-state) --------------
+#
+# This is intentionally NOT the same thing as the "momentum" entry in
+# factor_scores/訊號 above: that is a 0-100 normalized score built from
+# 5-day/20-day cumulative RETURNS, used in the weighted total score.
+# This block instead answers a much narrower, literal question — "is
+# today's close both near the bottom of its own recent trading range
+# AND has it just crossed above its own 5-day moving average today" —
+# as a plain yes/no/unknown fact, independent of scoring. See
+# app.domain.technical_signal_builder.build_low_with_rising_signal for
+# the exact thresholds, crossover definition, and no-look-ahead /
+# strict-window rules.
+
+
+def _render_technical_signal_lines(stock: ReportStockView) -> list[str]:
+    value = stock.technical_low_with_rising_signal
+    if value is None:
+        line = "⚪ 低檔且具起漲訊號：資料不足"
+    elif value:
+        line = "✅ 低檔且具起漲訊號：是"
+    else:
+        line = "❌ 低檔且具起漲訊號：否"
+    return ["技術面", line]
+
+
 # --- 漲停結構 (Phase A subset — no intraday data yet) --------------------------
 
 
@@ -450,7 +487,7 @@ def _render_data_gap_line(stock: ReportStockView) -> str | None:
 # --- Per-stock block ------------------------------------------------------------
 
 
-def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[str]:
+def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str]:
     lines = [
         f"{stock.rank}. {stock.stock_name}（{stock.stock_id}）",
     ]
@@ -461,7 +498,16 @@ def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[s
         lines.append(f"漲幅：{stock.change_percent:+.2f}%")
 
     lines.append(f"綜合分數：{stock.total_score:.2f}")
-    lines.append(f"今日排名：{stock.rank} / {ranking_limit}")
+    # Denominator is the number of stocks ACTUALLY appearing in today's
+    # report (len(ranked_stocks) at the call site), not the configured
+    # ranking_limit ("Top N" display cap) — those are two different
+    # numbers. If fewer stocks cleared the completeness gate than
+    # ranking_limit allows for, today's list is shorter than the cap,
+    # and the rank line must reflect the list the reader is actually
+    # looking at (e.g. "1 / 5" when only 5 stocks qualified), not the
+    # unrelated configured maximum (e.g. "1 / 10"), which would read as
+    # a contradiction next to a 5-stock list.
+    lines.append(f"今日排名：{stock.rank} / {total_shown}")
     lines.append(f"資料完整度：{stock.data_completeness:.0%}")
 
     gap_line = _render_data_gap_line(stock)
@@ -476,6 +522,8 @@ def _render_stock_block(stock: ReportStockView, *, ranking_limit: int) -> list[s
     lines.extend(_render_regulatory_status_lines(stock))
     lines.append("")
     lines.extend(_render_institutional_flow_lines(stock))
+    lines.append("")
+    lines.extend(_render_technical_signal_lines(stock))
     lines.append("")
     lines.extend(_render_primary_risk_lines(stock))
     lines.append("")
@@ -503,11 +551,20 @@ def render_daily_report(
         (data_completeness >= minimum_data_completeness), i.e. how
         many were actually eligible to be considered for the ranking.
     ranking_limit: how many stocks select_top_n() was asked to return
-        at most — used both for the "展示範圍" display line and as
-        the denominator in each stock's "今日排名：N / ranking_limit"
-        line, so there is exactly ONE source of truth for this number
-        (never a separate per-stock field that could drift out of
-        sync with it).
+        AT MOST — used for the "顯示 Top N" checklist line and the
+        "展示範圍：綜合分數 Top N" line, both of which describe the
+        CONFIGURED display cap, not how many stocks actually made the
+        list today.
+
+        Deliberately NOT used as the denominator in each stock's
+        "今日排名：N / ?" line — that denominator is len(ranked_stocks)
+        instead, i.e. how many stocks are ACTUALLY in today's report.
+        The two numbers legitimately differ whenever fewer stocks
+        clear the completeness gate than ranking_limit allows for
+        (e.g. only 5 stocks qualified today even though ranking_limit
+        is 10): showing "1 / 10" next to a 5-stock list would read as
+        a contradiction, since there is no stock ranked 6th through
+        10th anywhere in the report to justify that denominator.
     """
     lines = [
         f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
@@ -519,7 +576,7 @@ def render_daily_report(
         "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
         "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
         "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
-        "⬜ 技術面：低檔且具起漲訊號",
+        "✅ 技術面：低檔且具起漲訊號",
         "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
@@ -532,8 +589,9 @@ def render_daily_report(
         "",
     ]
 
+    total_shown = len(ranked_stocks)
     for stock in ranked_stocks:
-        lines.extend(_render_stock_block(stock, ranking_limit=ranking_limit))
+        lines.extend(_render_stock_block(stock, total_shown=total_shown))
 
     lines.extend(
         [
@@ -556,6 +614,13 @@ def render_daily_report(
                 "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
                 "為獨立於綜合分數之外的參考訊號，"
                 "不會改變「訊號」區塊中籌碼因子的評分結果。"
+            ),
+            (
+                "「技術面」區塊顯示今日收盤是否同時符合"
+                "「位於近 20 個交易日價格區間下緣」及"
+                "「今日剛站上 5 日均線」兩項條件，"
+                "同樣為獨立於綜合分數之外的參考訊號，"
+                "不會改變「訊號」區塊中動能因子的評分結果。"
             ),
             (
                 "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
@@ -599,7 +664,7 @@ def render_no_qualified_stock_report(
             "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
             "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
             "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
-            "⬜ 技術面：低檔且具起漲訊號",
+            "✅ 技術面：低檔且具起漲訊號",
             "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",

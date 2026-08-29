@@ -151,6 +151,7 @@ from app.domain.monthly_revenue_builder import build_revenue_yoy
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.domain.scoring import ScoredStock, score_candidates, select_top_n
+from app.domain.technical_signal_builder import build_low_with_rising_signal
 from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
@@ -311,7 +312,22 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # ratio), and does not alter RiskPolicy or bounded_momentum_score.
 # Tri-state (True/False/None) rendered explicitly, same convention as
 # every other optional signal in this report.
-MESSAGE_VERSION = "text-v8"
+#
+# text-v9: adds the "技術面" report block — whether today's close is
+# both (a) near the low end of its own trailing 20-session trading
+# range and (b) just crossed above its own 5-session moving average
+# today (see
+# app.domain.technical_signal_builder.build_low_with_rising_signal).
+# This IS a new field on both StockFeatures and ReportStockView
+# (technical_low_with_rising_signal), but it is DISPLAY-ONLY, same as
+# institutional_net_buy_3d_positive above — it does not participate in
+# FACTOR_WEIGHTS, does not touch the existing "momentum" scoring
+# factor (still return_5d/return_20d-derived), and does not alter
+# RiskPolicy. Computed from the same history_points/today_close
+# already fetched for block 1's price-features calculation — no
+# second FinMind call. Tri-state, rendered explicitly, same convention
+# as every other optional signal in this report.
+MESSAGE_VERSION = "text-v9"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -645,6 +661,13 @@ def build_stock_features(
         return_5d = None
         return_20d = None
         volume_by_date: dict[dt.date, float] = {}
+        # DISPLAY-ONLY signal for the report's "技術面" block — see
+        # app.domain.technical_signal_builder.build_low_with_rising_signal.
+        # Computed from the same history_points/today_close already
+        # fetched for the price-features calculation above, so it
+        # shares this block's try/except and success/failure counters
+        # rather than needing its own.
+        technical_low_with_rising_signal = None
 
         try:
             history_payload = finmind_client.fetch_stock_price_history(
@@ -679,6 +702,11 @@ def build_stock_features(
                 volume_ratio_20d = price_features.volume_ratio_20d
                 return_5d = price_features.return_5d
                 return_20d = price_features.return_20d
+                technical_low_with_rising_signal = build_low_with_rising_signal(
+                    target_date=target_date,
+                    today_close=float(today_close),
+                    history=history_points,
+                )
                 price_success_count += 1
 
         except Exception:
@@ -862,6 +890,7 @@ def build_stock_features(
             return_20d=return_20d,
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
+            technical_low_with_rising_signal=technical_low_with_rising_signal,
             revenue_yoy=revenue_yoy,
             risk_quality_raw=risk_quality_raw,
             risk_flags=risk_flags,
@@ -873,7 +902,8 @@ def build_stock_features(
             "features stock_id=%s turnover=%s avg_turnover_20d=%s "
             "volume_ratio_20d=%s return_5d=%s return_20d=%s "
             "institutional_net_buy_ratio_5d=%s "
-            "institutional_net_buy_3d_positive=%s revenue_yoy=%s "
+            "institutional_net_buy_3d_positive=%s "
+            "technical_low_with_rising_signal=%s revenue_yoy=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
             stock_features.turnover,
@@ -883,6 +913,7 @@ def build_stock_features(
             stock_features.return_20d,
             stock_features.institutional_net_buy_ratio_5d,
             stock_features.institutional_net_buy_3d_positive,
+            stock_features.technical_low_with_rising_signal,
             stock_features.revenue_yoy,
             stock_features.risk_quality_raw,
             stock_features.risk_flags,
