@@ -342,6 +342,66 @@ def test_none_when_today_close_is_negative():
     assert result is None
 
 
+# --- duplicate trading dates (CodeRabbit review on PR #31) ----------------------
+
+
+def test_none_when_row_count_reaches_range_window_only_via_duplicate_dates():
+    """RANGE_WINDOW 檢查的必須是「不重複的交易日數」，不是單純的
+    row 數量。20 筆歷史資料裡如果其中一天被重複列了兩次，代表背後
+    只有 19 個真正不同的交易日，不能靠重複那一天湊滿 20 筆就當作
+    「資料齊全」去硬算區間與均線——必須回傳 None，理由跟
+    app.domain.institutional_flow_builder 對重複日期的防禦邏輯一致。"""
+    history = _make_history(
+        [100, 98, 96, 94, 92, 90, 88, 86, 84, 82, 80, 80, 80, 80, 80, 80, 80, 80, 79]
+    )
+    # Duplicate the last date instead of adding a genuinely new
+    # trading day — 20 rows total, but only 19 distinct dates.
+    duplicate_last_date = HistoricalPricePoint(
+        trading_date=history[-1].trading_date,
+        close=79.0,
+        volume=1000.0,
+        turnover=1000.0,
+    )
+    history_with_duplicate = history + [duplicate_last_date]
+
+    result = build_low_with_rising_signal(
+        target_date=TARGET_DATE, today_close=83.0, history=history_with_duplicate
+    )
+    assert result is None
+
+
+def test_true_when_the_same_20_distinct_dates_have_no_duplicates():
+    """對照組：確保上面的修正沒有誤傷正常情況——20 筆資料、20 個真正
+    不同的交易日，且無重複，仍應正常算出結果（沿用既有的低檔+翻多
+    交叉 happy path 案例）。"""
+    closes = [
+        100,
+        98,
+        96,
+        94,
+        92,
+        90,
+        88,
+        86,
+        84,
+        82,
+        80,
+        80,
+        80,
+        80,
+        80,
+        80,
+        80,
+        80,
+        79,
+        79,
+    ]
+    result = build_low_with_rising_signal(
+        target_date=TARGET_DATE, today_close=83, history=_make_history(closes)
+    )
+    assert result is True
+
+
 # --- constants sanity (guards against accidental drift) -------------------------
 
 

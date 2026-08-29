@@ -77,6 +77,13 @@ def build_low_with_rising_signal(
     Same no-look-ahead defensiveness as build_price_features(): rows
     on or after target_date are discarded even if the caller included
     them by mistake, and only positive closes are considered valid.
+    A duplicate trading_date in the input is ALSO treated as invalid
+    (returns None) rather than silently letting it count twice toward
+    RANGE_WINDOW — mirroring
+    app.domain.institutional_flow_builder's own duplicate-date
+    defense, since counting rows instead of distinct sessions could
+    otherwise let a diluted/incorrect window pass the "enough data"
+    gate.
 
     DEFENSIVE, not just caller-trusting: a non-positive today_close
     also returns None immediately, even though CandidateBuilder should
@@ -90,13 +97,27 @@ def build_low_with_rising_signal(
     if today_close <= 0:
         return None
 
+    # Reject duplicate trading dates BEFORE counting toward
+    # RANGE_WINDOW, mirroring
+    # app.domain.institutional_flow_builder's own duplicate-date
+    # defense. A raw history feed that (due to an upstream data
+    # issue) contains two rows for the same trading_date would
+    # otherwise let len(valid_history) reach RANGE_WINDOW while
+    # representing FEWER than RANGE_WINDOW distinct trading sessions
+    # — silently computing the range/MA5 crossover from a diluted,
+    # incorrect window instead of returning None for "not enough real
+    # sessions." One row per date is required; a duplicate date is
+    # treated the same as any other invalid domain input.
+    valid_history_by_date: dict[dt.date, HistoricalPricePoint] = {}
+    for point in history:
+        if point.trading_date >= target_date or point.close <= 0:
+            continue
+        if point.trading_date in valid_history_by_date:
+            return None
+        valid_history_by_date[point.trading_date] = point
+
     valid_history = sorted(
-        (
-            point
-            for point in history
-            if point.trading_date < target_date and point.close > 0
-        ),
-        key=lambda point: point.trading_date,
+        valid_history_by_date.values(), key=lambda point: point.trading_date
     )
 
     if len(valid_history) < RANGE_WINDOW:
