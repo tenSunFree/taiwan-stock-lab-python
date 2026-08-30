@@ -183,6 +183,21 @@ class ReportStockView:
     # a price-range/moving-average check, not a return-based one).
     technical_low_with_rising_signal: bool | None = None
 
+    # From StockFeatures — ANOTHER DISPLAY-ONLY signal, for the
+    # "基本面" block: whether monthly revenue YoY growth has been
+    # sustained over the trailing 3 known-available calendar months
+    # (latest month >= 10% AND at least 2 of the last 3 months >= 10%;
+    # see
+    # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
+    # for the exact rule). Tri-state, same rendering convention as
+    # institutional_net_buy_3d_positive/technical_low_with_rising_signal
+    # above. Independent of the "fundamental" scoring factor already
+    # carried via factor_scores (that factor is built from a single
+    # newest-month revenue_yoy value; this signal looks at a 3-month
+    # window instead). v1 scope is revenue only — EPS is a known data
+    # gap, not folded into this field yet.
+    fundamental_growth_sustained: bool | None = None
+
     # RiskAssessment.missing_inputs, carried all the way through
     # StockFeatures -> ScoredStock -> here. This is what lets the
     # renderer distinguish "officially confirmed clean" (False, not in
@@ -426,6 +441,34 @@ def _render_technical_signal_lines(stock: ReportStockView) -> list[str]:
     return ["技術面", line]
 
 
+# --- 基本面 (revenue-growth-sustained, display-only tri-state) ----------------
+#
+# This is intentionally NOT the same thing as the "fundamental" entry
+# in factor_scores/訊號 above: that is a 0-100 normalized score built
+# from the SINGLE newest month's revenue_yoy, used in the weighted
+# total score. This block instead answers a narrower, literal
+# question — "has revenue YoY growth of >= 10% been sustained over the
+# last 3 known-available months (latest month included, allowing at
+# most 1 soft month elsewhere in the window)" — as a plain yes/no/
+# unknown fact, independent of scoring. v1 scope is revenue only; EPS
+# is a known data gap (see StockFeatures.fundamental_growth_sustained
+# and app.domain.monthly_revenue_builder's module docstring). See
+# app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
+# for the exact threshold, window, and no-look-ahead / no-best-effort
+# rules.
+
+
+def _render_fundamental_growth_lines(stock: ReportStockView) -> list[str]:
+    value = stock.fundamental_growth_sustained
+    if value is None:
+        line = "⚪ 營收 YoY ≥ 10%，且具持續性：資料不足"
+    elif value:
+        line = "✅ 營收 YoY ≥ 10%，且具持續性：是"
+    else:
+        line = "❌ 營收 YoY ≥ 10%，且具持續性：否"
+    return ["基本面", line]
+
+
 # --- 漲停結構 (Phase A subset — no intraday data yet) --------------------------
 
 
@@ -525,6 +568,8 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
     lines.append("")
     lines.extend(_render_technical_signal_lines(stock))
     lines.append("")
+    lines.extend(_render_fundamental_growth_lines(stock))
+    lines.append("")
     lines.extend(_render_primary_risk_lines(stock))
     lines.append("")
 
@@ -577,7 +622,7 @@ def render_daily_report(
         "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
         "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
         "✅ 技術面：低檔且具起漲訊號",
-        "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+        "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
         "資料概況",
@@ -623,6 +668,14 @@ def render_daily_report(
                 "不會改變「訊號」區塊中動能因子的評分結果。"
             ),
             (
+                "「基本面」區塊顯示最近 3 個已公布月營收中，"
+                "最新月 YoY 是否 ≥ 10%，且至少 2 個月 YoY ≥ 10%，"
+                "用以判斷成長是否具持續性；"
+                "目前僅採用月營收資料，EPS／財報資料尚未串接，"
+                "為獨立於綜合分數之外的參考訊號，"
+                "不會改變「訊號」區塊中基本面因子的評分結果。"
+            ),
+            (
                 "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
                 "待累積足夠歷史樣本及建立回測流程後提供。"
             ),
@@ -665,7 +718,7 @@ def render_no_qualified_stock_report(
             "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
             "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
             "✅ 技術面：低檔且具起漲訊號",
-            "⬜ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+            "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
             "資料概況",

@@ -144,6 +144,19 @@ a later phase (see [Roadmap](#roadmap)).
   field (not the calendar month alone) so a revenue figure is only
   used once its own disclosure date has actually passed — avoids
   look-ahead bias
+- An independent revenue-growth-sustained display signal
+  (`bool | None`): whether the latest known-available calendar
+  month's YoY is `>= 10%` AND at least 2 of the trailing 3 STRICTLY
+  CONSECUTIVE calendar months clear that same bar — computed from the
+  same monthly-revenue points already fetched for revenue YoY above,
+  never a second FinMind call. The 3-month window is built by walking
+  backward one calendar month at a time from the latest available
+  month (never "whichever 3 calendar months happen to have data"), so
+  a gap inside the window (a missing calendar month) is never silently
+  bridged by an older month — it makes the whole signal `None` rather
+  than a partial-window guess. v1 scope is revenue only —
+  EPS/financial-statement data is not yet ingested (see Roadmap's
+  Known data gaps)
 - Each enrichment type (price history, institutional flow, monthly
   revenue) fails **independently**: one FinMind endpoint being briefly
   unavailable never clears factors already computed from another
@@ -286,6 +299,20 @@ a later phase (see [Roadmap](#roadmap)).
   position plus a moving-average crossover, vs. 5-day/20-day
   cumulative returns) — so the two can legitimately disagree for the
   same stock without that being a contradiction
+- As of `text-v10`, a **基本面 (revenue-growth-sustained) tri-state
+  section** shows whether monthly revenue YoY growth has been
+  sustained over the trailing 3 known-available calendar months (`✅`
+  yes / `❌` no / `⚪` insufficient data). This is a display signal
+  independent of the "fundamental" scoring factor already shown in
+  the signal-light summary above — that factor is built from a single
+  newest-month YoY value, while this signal requires persistence
+  (latest month `>= 10%` AND at least 2 of the trailing 3 strictly
+  consecutive calendar months `>= 10%`) — so the two can legitimately
+  disagree for the same stock (e.g. a strong single-month YoY that
+  hasn't yet been sustained, or vice versa) without that being a
+  contradiction. v1 scope is revenue only; the functional-progress
+  checklist line explicitly notes "（EPS 尚未串接）" so readers aren't
+  misled into thinking EPS is already factored into this signal
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -322,7 +349,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v9`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v10`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -379,7 +406,13 @@ a later phase (see [Roadmap](#roadmap)).
   `consecutive_limit_up_days` still has no reliable historical
   reference-price source and is not reconstructed from raw closing
   prices, since doing so would violate this project's own rule
-  against inferring limit-up status via "previous close × 1.10." Both
+  against inferring limit-up status via "previous close × 1.10."
+  EPS/financial-statement data (FinMind's income-statement dataset) is
+  not yet ingested, so `fundamental_growth_sustained` currently
+  measures revenue-growth persistence only, not the originally
+  intended "revenue OR EPS" condition — the report's functional-
+  progress checklist explicitly marks this as "（EPS 尚未串接）" rather
+  than silently treating revenue-only as the complete rule. All
   remaining gaps are logged as an explicit warning on every run rather
   than silently assumed fixed, and are reflected per-stock in the
   report's dynamic "資料缺口" line (see Report Rendering above).
@@ -527,6 +560,23 @@ pytest -v
   while is correctly distinguished from one just crossing above it
   today, and that a degenerate flat trading range never triggers a
   division-by-zero
+- Revenue-growth-sustained signal tests
+  (`build_revenue_growth_sustained_signal`) confirming the 3-month
+  window is built from STRICTLY CONSECUTIVE calendar months walking
+  backward from the latest available month — never "whichever 3
+  months happen to have data" — including a dedicated regression test
+  for a gap month inside the window (a missing calendar month must
+  not be silently bridged by an older month, which would otherwise
+  produce a false "sustained" reading) and a calendar year-boundary
+  test (December → January rollover). Also covered: the requirement
+  that the LATEST month individually clear the threshold even when
+  older months in the window pass, a single soft (non-passing) month
+  elsewhere in the window not by itself breaking an otherwise-
+  sustained trend, and the same no-look-ahead / no-best-effort
+  philosophy as `build_revenue_yoy` — any single unresolvable required
+  month (missing current-side point, or missing/non-positive
+  previous-year denominator) makes the whole signal `None` rather than
+  a partial-window guess
 - Regulatory-mapper tests (TWSE HTML via `twse_regulatory_mapper.py`,
   TPEx JSON via `regulatory_mapper.py`) covering exact-announcement-date
   matching for attention data vs active-period matching for
@@ -553,9 +603,14 @@ pytest -v
   low momentum score paired with `HIGH_FIVE_DAY_RETURN` renders "漲多
   過熱" rather than the generic "weak" label, a 法人籌碼 tri-state
   rendering test confirming it stays independent of the
-  "institutional" signal-light score for the same stock, and a 技術面
+  "institutional" signal-light score for the same stock, a 技術面
   tri-state rendering test confirming it stays independent of the
-  "momentum" signal-light score for the same stock
+  "momentum" signal-light score for the same stock, and a 基本面
+  tri-state rendering test confirming it stays independent of the
+  "fundamental" signal-light score for the same stock (including a
+  progress-checklist regression test confirming the "基本面" line
+  correctly flips from ⬜ to ✅ with its "（EPS 尚未串接）" scope
+  annotation intact)
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, that a
@@ -594,8 +649,9 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                             data source
   features.py               StockFeatures, including risk_missing_inputs
                             (carried through from RiskAssessment),
-                            institutional_net_buy_3d_positive, and
-                            technical_low_with_rising_signal (both display-only)
+                            institutional_net_buy_3d_positive,
+                            technical_low_with_rising_signal, and
+                            fundamental_growth_sustained (all display-only)
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
@@ -608,7 +664,15 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                              factor) and net-buy positive sign check
                              (3-day, display-only) — both look-ahead-safe
   monthly_revenue_builder.py
-                             Revenue YoY (look-ahead-safe via available_at)
+                             Revenue YoY (look-ahead-safe via available_at,
+                             scoring factor) and an independent
+                             revenue-growth-sustained display signal
+                             (latest month >= 10% AND at least 2 of the
+                             trailing 3 STRICTLY CONSECUTIVE calendar
+                             months >= 10%; a gap month inside the window
+                             is never bridged by an older month) — both
+                             computed from the same fetched monthly-
+                             revenue points, no second API call
   risk_inputs.py             Reliable/heuristic RiskPolicy input reconstruction
   risk_policy.py              Tri-state hard exclusion + soft risk flagging,
                               configurable allow/exclude per official flag
@@ -631,7 +695,8 @@ app/reports/           Report rendering
                             adaptation, merging in official regulatory detail,
                             factor_scores, volume_ratio_20d,
                             institutional_net_buy_3d_positive,
-                            technical_low_with_rising_signal, and
+                            technical_low_with_rising_signal,
+                            fundamental_growth_sustained, and
                             risk_missing_inputs
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
@@ -639,9 +704,10 @@ app/reports/           Report rendering
                             status with distinct per-day-announcement vs
                             active-period wording, a 法人籌碼 tri-state
                             institutional net-buy display, a 技術面
-                            tri-state low-position/early-rally display,
-                            limit-up structure, and a dynamically built
-                            risk_quality gap explanation
+                            tri-state low-position/early-rally display, a
+                            基本面 tri-state revenue-growth-sustained
+                            display, limit-up structure, and a
+                            dynamically built risk_quality gap explanation
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client

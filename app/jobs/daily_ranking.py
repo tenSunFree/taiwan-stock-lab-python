@@ -147,7 +147,10 @@ from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_ratio,
 )
 from app.domain.models import Market, RegulatoryRiskStatus, StockMaster, StockValuation
-from app.domain.monthly_revenue_builder import build_revenue_yoy
+from app.domain.monthly_revenue_builder import (
+    build_revenue_growth_sustained_signal,
+    build_revenue_yoy,
+)
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.domain.scoring import ScoredStock, score_candidates, select_top_n
@@ -776,6 +779,12 @@ def build_stock_features(
 
         # --- Independent block 3: monthly revenue YoY ---
         revenue_yoy = None
+        # DISPLAY-ONLY signal for the report's "基本面" block — see
+        # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal.
+        # Computed from the same revenue_points fetched for revenue_yoy
+        # above, so it shares this block's try/except and
+        # success/failure counters rather than needing its own.
+        fundamental_growth_sustained = None
 
         try:
             revenue_payload = finmind_client.fetch_stock_monthly_revenue(
@@ -799,6 +808,9 @@ def build_stock_features(
                     revenue_rows, expected_stock_id=stock_id
                 )
                 revenue_yoy = build_revenue_yoy(
+                    target_date=target_date, points=revenue_points
+                )
+                fundamental_growth_sustained = build_revenue_growth_sustained_signal(
                     target_date=target_date, points=revenue_points
                 )
                 if revenue_yoy is None:
@@ -892,6 +904,7 @@ def build_stock_features(
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             revenue_yoy=revenue_yoy,
+            fundamental_growth_sustained=fundamental_growth_sustained,
             risk_quality_raw=risk_quality_raw,
             risk_flags=risk_flags,
             risk_missing_inputs=assessment.missing_inputs,
@@ -904,6 +917,7 @@ def build_stock_features(
             "institutional_net_buy_ratio_5d=%s "
             "institutional_net_buy_3d_positive=%s "
             "technical_low_with_rising_signal=%s revenue_yoy=%s "
+            "fundamental_growth_sustained=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
             stock_features.turnover,
@@ -915,6 +929,7 @@ def build_stock_features(
             stock_features.institutional_net_buy_3d_positive,
             stock_features.technical_low_with_rising_signal,
             stock_features.revenue_yoy,
+            stock_features.fundamental_growth_sustained,
             stock_features.risk_quality_raw,
             stock_features.risk_flags,
             stock_features.risk_missing_inputs,
