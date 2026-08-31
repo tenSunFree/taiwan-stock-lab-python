@@ -49,6 +49,14 @@ through to ReportStockView so the report can render the "技術面" block
 (see app.reports.text_renderer). Same display-only convention as
 institutional_net_buy_3d_positive above — independent of the
 "momentum" scoring factor already carried via factor_scores.
+
+As of text-v10, also carries StockFeatures.fundamental_growth_sustained
+through to ReportStockView so the report can render the "基本面" block
+(see app.reports.text_renderer). Same display-only convention as
+institutional_net_buy_3d_positive/technical_low_with_rising_signal
+above — independent of the "fundamental" scoring factor already
+carried via factor_scores (that factor is built from the single
+newest revenue_yoy value; this signal looks at a 3-month window).
 """
 
 from __future__ import annotations
@@ -185,6 +193,7 @@ def build_report_stocks(
                 technical_low_with_rising_signal=(
                     features.technical_low_with_rising_signal
                 ),
+                fundamental_growth_sustained=(features.fundamental_growth_sustained),
                 risk_missing_inputs=scored.risk_missing_inputs,
             )
         )

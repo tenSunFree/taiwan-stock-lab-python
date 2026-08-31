@@ -66,6 +66,23 @@ class StockFeatures:
     # above, not because it's thematically related to risk quality.
     technical_low_with_rising_signal: bool | None = None
 
+    # fundamentals — ANOTHER DISPLAY-ONLY signal, for the "基本面"
+    # block: whether monthly revenue YoY growth has been sustained over
+    # the trailing 3 known-available calendar months (see
+    # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
+    # for the exact rule). Independent of revenue_yoy above, which
+    # feeds the "fundamental" SCORING FACTOR and only looks at the
+    # single newest month. v1 scope is revenue only — EPS/financial-
+    # statement data is a known gap (FinMind's income-statement
+    # dataset is not yet ingested in this project); when EPS is added,
+    # this field's OR-condition with an eps_growth_sustained signal is
+    # expected to live in the report/job layer, not by silently
+    # redefining this field's meaning. None means insufficient trailing
+    # revenue history to complete the 3-month window, same tri-state
+    # convention as institutional_net_buy_3d_positive and
+    # technical_low_with_rising_signal above.
+    fundamental_growth_sustained: bool | None = None
+
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
 
     # RiskAssessment.missing_inputs (see app.domain.risk_policy), carried

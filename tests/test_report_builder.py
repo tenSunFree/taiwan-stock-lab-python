@@ -508,3 +508,53 @@ def test_build_report_stocks_technical_low_with_rising_signal_defaults_to_none()
     )
 
     assert result[0].technical_low_with_rising_signal is None
+
+
+def test_build_report_stocks_carries_fundamental_growth_sustained():
+    """text-v10：features_by_stock 的 fundamental_growth_sustained
+    必須原封不動地帶到 ReportStockView，供「基本面」區塊使用——這是
+    獨立於 factor_scores 裡 fundamental 評分因子之外的顯示訊號，見
+    app.domain.monthly_revenue_builder 的模組說明。"""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features("1101", fundamental_growth_sustained=True)
+        },
+    )
+
+    assert result[0].fundamental_growth_sustained is True
+
+
+def test_build_report_stocks_fundamental_growth_sustained_defaults_to_none():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].fundamental_growth_sustained is None

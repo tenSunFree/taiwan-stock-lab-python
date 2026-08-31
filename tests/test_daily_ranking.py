@@ -1400,6 +1400,43 @@ def _make_monthly_revenue_rows(
     ]
 
 
+def _make_three_month_sustained_revenue_rows(
+    *,
+    stock_id: str = "1101",
+):
+    """3 個已公布月份（5/6/7 月）都相對去年同月成長 >= 10%，
+    用於驗證 build_revenue_growth_sustained_signal 在真實 daily_ranking
+    pipeline 中被正確接上、算出 True。每個月的 create_time 都早於
+    TARGET_DATE（2026-08-07），去年同月則沒有 create_time（合法的
+    「只能當分母用」舊資料）。"""
+    rows = []
+    months = [
+        (5, 1_180_000_000, 1_000_000_000, "2026-06-05 09:00:00"),  # +18%
+        (6, 1_120_000_000, 1_000_000_000, "2026-07-05 09:00:00"),  # +12%
+        (7, 1_150_000_000, 1_000_000_000, "2026-08-05 09:00:00"),  # +15%
+    ]
+    for month, current_revenue, previous_revenue, create_time in months:
+        rows.append(
+            {
+                "stock_id": stock_id,
+                "revenue_year": 2026,
+                "revenue_month": month,
+                "revenue": current_revenue,
+                "create_time": create_time,
+            }
+        )
+        rows.append(
+            {
+                "stock_id": stock_id,
+                "revenue_year": 2025,
+                "revenue_month": month,
+                "revenue": previous_revenue,
+                "create_time": "",
+            }
+        )
+    return rows
+
+
 def test_build_stock_features_empty_candidates_makes_no_finmind_calls():
     from app.jobs.daily_ranking import build_stock_features
 
@@ -1460,6 +1497,10 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     assert feature.technical_low_with_rising_signal is False
     assert feature.revenue_yoy is not None
     assert feature.revenue_yoy == pytest.approx(0.30)  # 1,300,000,000/1,000,000,000-1
+    # Only one calendar month (July) is eligible in this fixture — the
+    # sustained-growth window needs 3 distinct months, so this must be
+    # None ("data insufficient"), not silently False.
+    assert feature.fundamental_growth_sustained is None
     assert client.calls == ["1101"]
     assert client.institutional_calls == ["1101"]
     assert client.revenue_calls == ["1101"]
@@ -1636,6 +1677,7 @@ def test_build_stock_features_revenue_failure_does_not_clear_other_factors():
     assert feature.institutional_net_buy_ratio_5d is not None
     assert feature.institutional_net_buy_3d_positive is True
     assert feature.revenue_yoy is None  # 只有 revenue 這個 block 失敗
+    assert feature.fundamental_growth_sustained is None  # 同一個 block 失敗
     assert client.calls == ["1101"]
     assert client.institutional_calls == ["1101"]
     assert client.revenue_calls == ["1101"]
@@ -1660,6 +1702,58 @@ def test_build_stock_features_revenue_empty_rows_leaves_revenue_yoy_none():
 
     assert features[0].revenue_yoy is None
     assert client.revenue_calls == ["1101"]
+
+
+def test_build_stock_features_fundamental_growth_sustained_true_on_three_month_growth():
+    """3 個已公布月份（5/6/7 月）YoY 都 >= 10%，且最新月份（7 月）也
+    >= 10% —— 必須算出 fundamental_growth_sustained=True，且不影響
+    revenue_yoy（仍然只看最新一個月）。"""
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20)},
+        revenue_rows_by_stock={
+            "1101": _make_three_month_sustained_revenue_rows(stock_id="1101")
+        },
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    assert feature.revenue_yoy == pytest.approx(0.15)  # 最新月（7月）：+15%
+    assert feature.fundamental_growth_sustained is True
+
+
+def test_build_stock_features_fundamental_growth_sustained_none_with_fewer_than_three_months():
+    """只有單月營收資料（既有 _make_monthly_revenue_rows fixture）不足
+    以構成 3 個月的持續性判斷窗口，必須回傳 None，不能因為那一個月
+    剛好 >= 10% 就誤判為 True。"""
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20)},
+        revenue_rows_by_stock={"1101": _make_monthly_revenue_rows(stock_id="1101")},
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert features[0].revenue_yoy is not None
+    assert features[0].fundamental_growth_sustained is None
 
 
 def test_build_stock_features_institutional_net_buy_3d_positive_is_false_when_negative():

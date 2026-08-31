@@ -437,6 +437,60 @@ def test_technical_signal_is_independent_of_momentum_score():
     assert "✅ 低檔且具起漲訊號：是" in report
 
 
+# --- 基本面（display-only tri-state，獨立於 fundamental 評分因子） -----------
+
+
+def test_fundamental_growth_sustained_shows_yes():
+    report = _render(_make_stock_view(fundamental_growth_sustained=True))
+    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+
+
+def test_fundamental_growth_not_sustained_shows_no():
+    report = _render(_make_stock_view(fundamental_growth_sustained=False))
+    assert "❌ 營收 YoY ≥ 10%，且具持續性：否" in report
+
+
+def test_fundamental_growth_sustained_unknown_shows_insufficient_data():
+    """預設值（未提供時）與明確傳入 None 都必須顯示「資料不足」，
+    不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——理由跟
+    法人籌碼／技術面那兩個 tri-state 欄位完全一樣。"""
+    report = _render(_make_stock_view(fundamental_growth_sustained=None))
+    assert "⚪ 營收 YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "✅ 營收 YoY ≥ 10%，且具持續性" not in report
+    assert "❌ 營收 YoY ≥ 10%，且具持續性" not in report
+
+
+def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
+    """基本面區塊的 True/False 與「訊號」區塊裡 fundamental 因子的分數
+    是兩件獨立的事：即使 fundamental 評分因子（單月最新 YoY）偏低，
+    3 個月的持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被合併
+    顯示。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 60.0,
+                "fundamental": 20.0,
+                "risk_quality": 90.0,
+            },
+            fundamental_growth_sustained=True,
+        )
+    )
+    assert "🔴 基本面：偏弱" in report
+    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+
+
+def test_progress_checklist_shows_fundamental_growth_as_done():
+    """功能上線後，「📌 功能進度」清單裡的「基本面」項目要從 ⬜ 改成 ✅，
+    並且要清楚標註 v1 範圍僅涵蓋營收、EPS 尚未串接，避免讀者誤以為
+    已經含 EPS 判斷。"""
+    report = _render(_make_stock_view())
+    assert "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）" in report
+    assert "⬜ 基本面" not in report
+
+
 # --- 監管狀態（tri-state：True 標記 / False 官方確認正常 / None 未知） ---------
 
 
