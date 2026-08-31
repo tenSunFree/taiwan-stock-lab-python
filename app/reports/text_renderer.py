@@ -185,17 +185,22 @@ class ReportStockView:
 
     # From StockFeatures — ANOTHER DISPLAY-ONLY signal, for the
     # "基本面" block: whether monthly revenue YoY growth has been
-    # sustained over the trailing 3 known-available calendar months
-    # (latest month >= 10% AND at least 2 of the last 3 months >= 10%;
+    # sustained over the trailing 3 STRICTLY CONSECUTIVE calendar
+    # months ending at the latest known-available month (latest month
+    # >= 10% AND at least 2 of those 3 consecutive months >= 10%) —
     # see
     # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
-    # for the exact rule). Tri-state, same rendering convention as
+    # for the exact rule. NOT "whichever 3 months happen to have
+    # data": a gap month inside the window is never bridged by an
+    # older month — it makes this field None ("資料不足" in the
+    # rendered report), the same tri-state rendering convention as
     # institutional_net_buy_3d_positive/technical_low_with_rising_signal
     # above. Independent of the "fundamental" scoring factor already
     # carried via factor_scores (that factor is built from a single
-    # newest-month revenue_yoy value; this signal looks at a 3-month
-    # window instead). v1 scope is revenue only — EPS is a known data
-    # gap, not folded into this field yet.
+    # newest-month revenue_yoy value; this signal looks at a
+    # strictly-consecutive 3-month window instead). v1 scope is
+    # revenue only — EPS is a known data gap, not folded into this
+    # field yet.
     fundamental_growth_sustained: bool | None = None
 
     # RiskAssessment.missing_inputs, carried all the way through
@@ -448,10 +453,15 @@ def _render_technical_signal_lines(stock: ReportStockView) -> list[str]:
 # from the SINGLE newest month's revenue_yoy, used in the weighted
 # total score. This block instead answers a narrower, literal
 # question — "has revenue YoY growth of >= 10% been sustained over the
-# last 3 known-available months (latest month included, allowing at
-# most 1 soft month elsewhere in the window)" — as a plain yes/no/
-# unknown fact, independent of scoring. v1 scope is revenue only; EPS
-# is a known data gap (see StockFeatures.fundamental_growth_sustained
+# trailing 3 STRICTLY CONSECUTIVE calendar months ending at the latest
+# known-available month, with the latest month itself required to
+# clear 10% and at most 1 soft month elsewhere in the window" — as a
+# plain yes/no/unknown fact, independent of scoring. "Strictly
+# consecutive" means a gap month inside the window (a required
+# calendar month with no resolvable data) is NEVER bridged by reaching
+# further back to an older month — it renders as "資料不足" (None)
+# below, not a guess from a partial window. v1 scope is revenue only;
+# EPS is a known data gap (see StockFeatures.fundamental_growth_sustained
 # and app.domain.monthly_revenue_builder's module docstring). See
 # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
 # for the exact threshold, window, and no-look-ahead / no-best-effort
@@ -668,9 +678,10 @@ def render_daily_report(
                 "不會改變「訊號」區塊中動能因子的評分結果。"
             ),
             (
-                "「基本面」區塊顯示最近 3 個已公布月營收中，"
+                "「基本面」區塊顯示最近連續 3 個曆月的已公布月營收中，"
                 "最新月 YoY 是否 ≥ 10%，且至少 2 個月 YoY ≥ 10%，"
-                "用以判斷成長是否具持續性；"
+                "用以判斷成長是否具持續性；若其中任一月缺漏或無法計算，"
+                "則顯示「資料不足」，不會以較早的月份遞補湊滿 3 個月。"
                 "目前僅採用月營收資料，EPS／財報資料尚未串接，"
                 "為獨立於綜合分數之外的參考訊號，"
                 "不會改變「訊號」區塊中基本面因子的評分結果。"

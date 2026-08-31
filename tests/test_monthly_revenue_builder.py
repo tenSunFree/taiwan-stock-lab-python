@@ -124,6 +124,67 @@ def test_legacy_row_without_availability_usable_only_as_denominator():
     )
 
 
+def test_future_dated_denominator_revision_excluded():
+    """
+    Regression test (CodeRabbit review, PR #32): a DATED previous-year
+    row (available_at is not None) must still respect the
+    available_at <= target_date rule, exactly like the current-side
+    row does. FinMind can publish a REVISION to a prior-year figure
+    whose own available_at falls after target_date; using it anyway
+    would use data that genuinely didn't exist yet as of target_date,
+    the same look-ahead bias this module exists to prevent on the
+    numerator side.
+
+    Here the only previous-year (2025/07) row is dated AFTER
+    TARGET_DATE, so it must be excluded — leaving no usable
+    denominator at all, and therefore None, even though a naive "any
+    row with the right year/month" filter would have found it.
+    """
+    points = [
+        MonthlyRevenuePoint(
+            revenue_year=2025,
+            revenue_month=7,
+            revenue=100.0,
+            available_at=dt.date(2026, 9, 1),  # after TARGET_DATE (2026-08-15)
+        ),
+        MonthlyRevenuePoint(
+            revenue_year=2026,
+            revenue_month=7,
+            revenue=130.0,
+            available_at=dt.date(2026, 8, 10),
+        ),
+    ]
+    assert build_revenue_yoy(target_date=TARGET_DATE, points=points) is None
+
+
+def test_dated_denominator_at_or_before_target_date_is_still_usable():
+    """
+    Companion to the regression above: a DATED previous-year row is
+    perfectly usable as a denominator as long as its own
+    available_at <= target_date — the fix only excludes FUTURE-dated
+    revisions, it does not blanket-exclude every dated denominator row
+    (that would wrongly break the ordinary case where a prior-year
+    figure happens to carry a normal, already-past create_time).
+    """
+    points = [
+        MonthlyRevenuePoint(
+            revenue_year=2025,
+            revenue_month=7,
+            revenue=100.0,
+            available_at=dt.date(2025, 8, 10),  # on/before TARGET_DATE
+        ),
+        MonthlyRevenuePoint(
+            revenue_year=2026,
+            revenue_month=7,
+            revenue=130.0,
+            available_at=dt.date(2026, 8, 10),
+        ),
+    ]
+    assert build_revenue_yoy(target_date=TARGET_DATE, points=points) == pytest.approx(
+        0.30
+    )
+
+
 # --- build_revenue_growth_sustained_signal ----------------------------------
 
 
@@ -315,3 +376,33 @@ def test_sustained_invalid_min_pass_months_raises():
         build_revenue_growth_sustained_signal(
             target_date=TARGET_DATE, points=[], min_pass_months=4
         )
+
+
+def test_sustained_future_dated_denominator_revision_excluded():
+    """
+    Regression test (CodeRabbit review, PR #32), sustained-signal
+    counterpart to test_future_dated_denominator_revision_excluded
+    above: a DATED previous-year row for one of the required months
+    must respect available_at <= target_date, or the whole signal is
+    None — not silently computed against a future-dated revision.
+
+    July's previous-year (2025/07) denominator here is dated AFTER
+    target_date, so July's YoY can't be resolved, which makes the
+    whole 3-month window None — even though June and May would
+    otherwise both resolve fine and pass.
+    """
+    points = [
+        _point(2025, 5, 100.0, None),
+        _point(2026, 5, 118.0, dt.date(2026, 6, 10)),
+        _point(2025, 6, 100.0, None),
+        _point(2026, 6, 112.0, dt.date(2026, 7, 10)),
+        # 2025/07 denominator dated AFTER target_date (2026-08-07)
+        _point(2025, 7, 100.0, dt.date(2026, 9, 1)),
+        _point(2026, 7, 115.0, dt.date(2026, 8, 5)),
+    ]
+    assert (
+        build_revenue_growth_sustained_signal(
+            target_date=dt.date(2026, 8, 7), points=points
+        )
+        is None
+    )

@@ -13,14 +13,21 @@ revenue on 2026/08/12 must not have that figure used for a
 target_date of 2026/08/10, even though "July" itself already ended.
 
 DESIGN DECISION — previous-year denominator: the comparison year's
-same-month revenue is, in practice, always already disclosed by the
-time this pipeline looks at it (it refers to a period well over a
-year old). Rows without availability metadata (legacy rows predating
-create_time) are therefore allowed as the DENOMINATOR only, never as
-the numerator — using them as the "current" figure would risk
-look-ahead bias for figures we genuinely cannot date; using them as
-the "previous year" figure carries no such risk given how old they
-necessarily are.
+same-month revenue is, in practice, almost always already disclosed
+by the time this pipeline looks at it (it refers to a period well
+over a year old). Rows without availability metadata (legacy rows
+predating create_time) are therefore allowed as the DENOMINATOR only,
+never as the numerator — using them as the "current" figure would
+risk look-ahead bias for figures we genuinely cannot date; using them
+as the "previous year" figure carries no such risk given how old they
+necessarily are. HOWEVER, a dated denominator row (available_at is
+NOT None) is still subject to the same available_at <= target_date
+rule as the numerator: FinMind can publish a REVISION to a prior-year
+figure, and that revision's own available_at can fall after
+target_date. A denominator row is therefore usable only when its
+available_at is None (undated legacy row, the documented fallback
+above) OR available_at <= target_date — never an unconditionally
+newest revision regardless of date.
 
 DESIGN DECISION — build_revenue_growth_sustained_signal(): this is a
 SEPARATE, DISPLAY-ONLY signal from build_revenue_yoy() above, for the
@@ -117,6 +124,7 @@ def build_revenue_yoy(
         if point.revenue_year == current.revenue_year - 1
         and point.revenue_month == current.revenue_month
         and point.revenue >= 0
+        and (point.available_at is None or point.available_at <= target_date)
     ]
 
     if not previous_year_points:
@@ -182,6 +190,15 @@ def _resolve_month_yoy(
     per required calendar month, not just for the single newest month,
     so a required month with no eligible current-side point resolves
     to None here rather than silently being skipped by the caller.
+
+    The denominator (previous-year same-month revenue) is subject to
+    the same no-look-ahead rule as build_revenue_yoy: a dated row
+    (available_at is not None) is only usable when
+    available_at <= target_date, since FinMind can publish a revision
+    to a prior-year figure whose own available_at falls after
+    target_date. Only an undated legacy row (available_at is None,
+    predating create_time) is exempt, per this module's documented
+    "denominator-only" fallback.
     """
     current_points = [
         point
@@ -203,6 +220,7 @@ def _resolve_month_yoy(
         if point.revenue_year == revenue_year - 1
         and point.revenue_month == revenue_month
         and point.revenue >= 0
+        and (point.available_at is None or point.available_at <= target_date)
     ]
     if not previous_year_points:
         return None
