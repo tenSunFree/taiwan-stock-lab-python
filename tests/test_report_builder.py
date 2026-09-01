@@ -558,3 +558,59 @@ def test_build_report_stocks_fundamental_growth_sustained_defaults_to_none():
     )
 
     assert result[0].fundamental_growth_sustained is None
+
+
+def test_build_report_stocks_carries_eps_growth_sustained():
+    """text-v11：features_by_stock 的 eps_growth_sustained 必須原封不動
+    地帶到 ReportStockView，跟 fundamental_growth_sustained（營收）分開
+    傳遞，不在這一層合併——合併是 text_renderer 在渲染時才做的事，見
+    app.domain.eps_growth_builder.combine_fundamental_growth_signal。"""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features(
+                "1101", fundamental_growth_sustained=False, eps_growth_sustained=True
+            )
+        },
+    )
+
+    # Both components pass through independently — eps_growth_sustained
+    # being True must not silently overwrite fundamental_growth_sustained's
+    # own False value or vice versa.
+    assert result[0].eps_growth_sustained is True
+    assert result[0].fundamental_growth_sustained is False
+
+
+def test_build_report_stocks_eps_growth_sustained_defaults_to_none():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].eps_growth_sustained is None

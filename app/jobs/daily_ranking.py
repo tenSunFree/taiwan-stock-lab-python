@@ -76,6 +76,59 @@ impractical without a paid tier):
         ended — see app.domain.monthly_revenue_builder's module
         docstring for the full look-ahead rationale.
 
+    FinancialStatementClient (TWSE t187ap06_L_ci + TPEx t187ap06_O_ci)
+        Whole-market general-industry quarterly comprehensive-income-
+        statement open data — see app.ingestion.financial_statement_client's
+        module docstring. Parsed via parse_twse_json_rows/
+        parse_tpex_csv_rows -> eps_mapper.build_raw_cumulative_eps_points
+        into RawCumulativeEps, grouped per stock_id (Step 1e), then
+        turned into a look-ahead-safe, revision-safe
+        eps_growth_sustained signal per candidate in build_stock_features
+        (independent block 4) via EpsObservationRepository ->
+        eps_availability_resolver -> eps_period_converter ->
+        eps_growth_builder. See "EPS OBSERVATION DB LIFECYCLE" below for
+        why this is the one enrichment source in this file that touches
+        a real (not in-memory) database.
+
+EPS OBSERVATION DB LIFECYCLE (deliberately scoped narrowly):
+
+    Unlike every other raw snapshot in this file (still funneled
+    through InMemoryRawPayloadRepository, a documented placeholder —
+    see that class's own docstring), EpsObservationRepository's entire
+    purpose is a PERMANENT, revision-safe record of when this
+    pipeline first observed each distinct cumulative EPS figure (see
+    app.db.models.EpsCumulativeObservation's docstring). That record
+    cannot be reconstructed later from an in-memory stand-in, so this
+    is the first enrichment source in this file that opens a real
+    SQLAlchemy Session against DATABASE_URL rather than deferring
+    persistence to "someday."
+
+    This is intentionally NOT the start of migrating
+    InMemoryRawPayloadRepository / raw_source_payloads to Postgres —
+    that remains separate, larger, unrelated work. Only two tables are
+    touched here: ingestion_runs (a row is created for THIS run,
+    something no other code path in this file does yet) and
+    eps_cumulative_observations.
+
+    Same injectable-dependency pattern as delivery_repository/
+    line_client below: pass eps_observation_repository=... (e.g. a
+    Session against an in-memory SQLite engine) to skip the real
+    DATABASE_URL/engine/session setup entirely — this is how tests
+    exercise the EPS block without a real Postgres instance. See
+    tests/test_daily_ranking.py's EPS tests for the exact pattern.
+
+    Graceful degradation when DATABASE_URL is not set at all (e.g. a
+    local dry run): eps_observation_repository stays None, and
+    build_stock_features() falls back to passing first_seen_at=None
+    into build_resolved_cumulative_eps_point() for every point — which
+    is NOT a hack, it is
+    app.ingestion.eps_availability_resolver.resolve_eps_availability's
+    own designed second-priority path (batch_report_date), a real,
+    observed date, never a synthetic one. The signal keeps working,
+    just with coarser (dataset-batch-level rather than
+    first-truly-seen) availability dating until DATABASE_URL is
+    configured.
+
 KNOWN LIMITATIONS in this checkpoint:
 
     - Both TWSE's STOCK_DAY_ALL and TPEx's daily close quotes only
@@ -92,16 +145,21 @@ KNOWN LIMITATIONS in this checkpoint:
       rather than silently falling back to TWSE-only candidates (and
       vice versa) — an incomplete whole-market scan should never be
       treated as a complete one.
-    - A single candidate's historical-price, institutional-flow, or
-      monthly-revenue enrichment failing does NOT fail the whole run
-      — that stock's corresponding factor(s) simply stay None. All
-      three enrichment types fail INDEPENDENTLY of each other (see
-      build_stock_features() docstring): a failure in one must never
-      clear factors already computed by the others for the same
+    - A single candidate's historical-price, institutional-flow,
+      monthly-revenue, or EPS-growth enrichment failing does NOT fail
+      the whole run — that stock's corresponding factor(s) simply stay
+      None. All four enrichment types fail INDEPENDENTLY of each other
+      (see build_stock_features() docstring): a failure in one must
+      never clear factors already computed by the others for the same
       stock. This is deliberately different from the TWSE/TPEx
       whole-market failure policy above: one missing stock's
-      history/flow/revenue is ordinary incompleteness; an entire
-      market's data being unavailable is not.
+      history/flow/revenue/EPS is ordinary incompleteness; an entire
+      market's price data being unavailable is not. The whole-market
+      EPS fetch (Step 1e) follows the SAME non-fatal policy as Step
+      1d's regulatory sources, not Step 1a/1b/1c's price/valuation
+      policy — a failed EPS fetch just leaves every candidate's
+      eps_growth_sustained None for this run, since EPS growth is a
+      display/scoring-additive signal, not an eligibility gate.
     - RiskPolicy's is_managed input and consecutive_limit_up_days are
       still always None (unknown) — no wired-in official data source
       exists for full-cash-delivery status, and no reliable historical
@@ -140,8 +198,10 @@ from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.clients.line_client import LineMessagingClient
 from app.db.delivery_repository import DeliveryRepository
-from app.db.models import MessageDelivery
+from app.db.eps_observation_repository import EpsObservationRepository
+from app.db.models import EpsCumulativeObservation, IngestionRun, MessageDelivery
 from app.delivery.service import DeliveryService
+from app.domain.eps_growth_builder import build_eps_growth_sustained_signal
 from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_positive,
     build_institutional_net_buy_ratio,
@@ -162,6 +222,14 @@ from app.reports.text_renderer import (
     render_daily_report,
     render_no_qualified_stock_report,
     utf16_length,
+)
+from app.ingestion.eps_availability_resolver import build_resolved_cumulative_eps_point
+from app.ingestion.eps_mapper import RawCumulativeEps, build_raw_cumulative_eps_points
+from app.ingestion.eps_period_converter import build_standalone_eps_points
+from app.ingestion.financial_statement_client import (
+    FinancialStatementClient,
+    parse_tpex_csv_rows,
+    parse_twse_json_rows,
 )
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
@@ -330,7 +398,23 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # already fetched for block 1's price-features calculation — no
 # second FinMind call. Tri-state, rendered explicitly, same convention
 # as every other optional signal in this report.
-MESSAGE_VERSION = "text-v9"
+# text-v10: fundamental_growth_sustained's report display ("基本面"
+# block, revenue-only at this point) — this entry predates the EPS
+# work below; kept here for a complete version history.
+#
+# text-v11: adds EPS to the "基本面" block — StockFeatures.
+# eps_growth_sustained now flows through to ReportStockView and is
+# combined with fundamental_growth_sustained (revenue) at render time
+# via combine_fundamental_growth_signal's tri-state OR (see
+# app.reports.text_renderer._render_fundamental_growth_lines), so the
+# headline now answers the ORIGINAL spec: "營收或 EPS YoY >= 10%，且具
+# 持續性". Both components are still shown as their own sub-lines so a
+# reader can see which one actually drove the combined result. This is
+# a real, visible change to rendered report content for the same
+# StockFeatures inputs, so it needs its own message_version per this
+# file's own idempotency rule — the "功能進度" checklist line and the
+# model-explanation paragraph for 基本面 both changed wording too.
+MESSAGE_VERSION = "text-v11"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -395,6 +479,20 @@ def ensure_delivery_table(engine) -> None:
     application startup silently creating tables.
     """
     MessageDelivery.__table__.create(engine, checkfirst=True)
+
+
+def ensure_eps_observation_tables(engine) -> None:
+    """Same temporary-bootstrap status as ensure_delivery_table above
+    — no real migration workflow exists yet. Creates BOTH tables
+    EpsObservationRepository's FK actually needs: ingestion_runs (this
+    is the ONLY code path in this file that persists a real
+    IngestionRun row — everything else still goes through
+    InMemoryRawPayloadRepository) and eps_cumulative_observations.
+    Deliberately does NOT create raw_source_payloads or any other
+    table — see this module's "EPS OBSERVATION DB LIFECYCLE" docstring
+    section for why that migration is out of scope here."""
+    IngestionRun.__table__.create(engine, checkfirst=True)
+    EpsCumulativeObservation.__table__.create(engine, checkfirst=True)
 
 
 def resolve_target_date() -> dt.date:
@@ -558,26 +656,31 @@ def build_stock_features(
     twse_disposition_ok: bool = False,
     tpex_attention_ok: bool = False,
     tpex_disposition_ok: bool = False,
+    raw_eps_by_stock: dict[str, list[RawCumulativeEps]] | None = None,
+    eps_observation_repository: EpsObservationRepository | None = None,
 ) -> list[StockFeatures]:
     """
     Enrich candidate stocks with trailing historical price features,
-    institutional net-buy ratio, monthly revenue YoY, and a risk
-    assessment.
+    institutional net-buy ratio, monthly revenue YoY, EPS growth
+    sustained, and a risk assessment.
 
     Today's close / volume / turnover always come from the already
     validated TWSE / TPEx candidate data. FinMind is queried only for
     sessions strictly before target_date, for price history,
-    institutional flow, and monthly revenue alike.
+    institutional flow, and monthly revenue alike. EPS data itself was
+    already fetched whole-market in run()'s Step 1e — this function
+    only consumes raw_eps_by_stock, it makes no HTTP calls of its own
+    for EPS.
 
     Failure policy — deliberately INDEPENDENT per data source:
-        Price-history enrichment, institutional-flow enrichment, and
-        monthly-revenue enrichment each have their OWN try/except
-        block. A failure in one must never clear factors already
-        successfully computed by the others — e.g. FinMind's
-        institutional endpoint being briefly unavailable must not
-        wipe out average_turnover_20d/return_5d that were already
-        computed from a successful price-history fetch for the same
-        stock, and vice versa for revenue.
+        Price-history enrichment, institutional-flow enrichment,
+        monthly-revenue enrichment, and EPS-growth enrichment each
+        have their OWN try/except block. A failure in one must never
+        clear factors already successfully computed by the others —
+        e.g. FinMind's institutional endpoint being briefly
+        unavailable must not wipe out average_turnover_20d/return_5d
+        that were already computed from a successful price-history
+        fetch for the same stock, and vice versa for revenue/EPS.
 
         Institutional net-buy ratio reuses the volume data already
         fetched for price-history enrichment (see
@@ -588,20 +691,28 @@ def build_stock_features(
         coordination logic is needed between the two blocks for that
         case.
 
+        EPS-growth enrichment additionally depends on
+        eps_observation_repository (see run()'s "EPS OBSERVATION DB
+        LIFECYCLE" docstring section): when it's None (DATABASE_URL
+        not configured), first_seen_at is passed as None into
+        build_resolved_cumulative_eps_point for every point, which is
+        that function's own designed fallback to batch_report_date —
+        not a failure, and not counted as one.
+
         Missing core candidate data (today's close/volume/turnover)
         is different: CandidateBuilder should already have rejected
         such a record, so seeing it here indicates an internal
         invariant violation, not ordinary enrichment-data absence —
         that raises immediately rather than being silently patched.
 
-    Risk assessment (block 4) is deliberately NOT part of the same
-    fail-soft family as blocks 1-3 — see the inline comment at that
-    block for why. is_attention/is_disposition/is_managed and
-    consecutive_limit_up_days are tri-state (bool|None / int|None):
-    None means unknown, never treated as False. is_attention/
-    is_disposition are wired in as of rule-v1.2.0 (see run()'s Step
-    1d), so they resolve to True/False/None per candidate via
-    _resolve_regulatory_flags; is_managed and
+    Risk assessment (final block) is deliberately NOT part of the same
+    fail-soft family as the enrichment blocks above — see the inline
+    comment at that block for why. is_attention/is_disposition/
+    is_managed and consecutive_limit_up_days are tri-state (bool|None
+    / int|None): None means unknown, never treated as False. is_
+    attention/is_disposition are wired in as of rule-v1.2.0 (see
+    run()'s Step 1d), so they resolve to True/False/None per candidate
+    via _resolve_regulatory_flags; is_managed and
     consecutive_limit_up_days still always hit this gap (see the
     warning logged below), so risk_quality_raw remains None for every
     stock until those two are wired in as well.
@@ -629,6 +740,8 @@ def build_stock_features(
     revenue_start_date = target_date - dt.timedelta(days=REVENUE_LOOKBACK_CALENDAR_DAYS)
     revenue_end_date = target_date - dt.timedelta(days=1)
 
+    raw_eps_by_stock = raw_eps_by_stock or {}
+
     features: list[StockFeatures] = []
     price_success_count = 0
     price_empty_count = 0
@@ -639,6 +752,9 @@ def build_stock_features(
     revenue_success_count = 0
     revenue_none_count = 0
     revenue_failure_count = 0
+    eps_success_count = 0
+    eps_none_count = 0
+    eps_failure_count = 0
     risk_excluded_count = 0
     risk_flagged_count = 0
     risk_clean_count = 0
@@ -781,9 +897,10 @@ def build_stock_features(
         revenue_yoy = None
         # DISPLAY-ONLY signal for the report's "基本面" block — see
         # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal.
-        # Computed from the same revenue_points fetched for revenue_yoy
-        # above, so it shares this block's try/except and
-        # success/failure counters rather than needing its own.
+        # REVENUE ONLY — see StockFeatures.fundamental_growth_sustained's
+        # own docstring for why this stays narrowly scoped to revenue
+        # rather than being silently redefined now that a sibling
+        # eps_growth_sustained field exists (block 4 below).
         fundamental_growth_sustained = None
 
         try:
@@ -826,12 +943,79 @@ def build_stock_features(
                 stock_id,
             )
 
-        # --- Block 4: risk assessment (hard exclusion + soft flags) ---
-        # Deliberately NOT symmetric with blocks 1-3: those fail-soft
-        # (leave a factor None, keep the stock). Risk assessment can
-        # hard-exclude a stock entirely (disposition/managed status),
-        # which is a "should this candidate exist at all" decision,
-        # not a "this one factor is missing" decision.
+        # --- Independent block 4: EPS growth sustained (revision-safe) ---
+        # No HTTP call here — TWSE/TPEx's whole-market financial-
+        # statement snapshot was already fetched once in run()'s Step
+        # 1e, not per-candidate (see this project's earlier discussion
+        # of FinMind's per-stock rate-limit constraints; TWSE/TPEx's
+        # own OpenAPI endpoints have no such per-stock limit, so
+        # fetching once for the whole market up front, like Steps
+        # 1a-1d, is strictly better than repeating it per candidate
+        # here). Deliberately stored as StockFeatures.eps_growth_sustained
+        # on its OWN, not OR-combined into fundamental_growth_sustained
+        # here — see that field's own docstring for why the combination
+        # belongs at the report-rendering layer instead (Step 15), not
+        # this enrichment step.
+        eps_growth_sustained = None
+        stock_raw_eps_points = raw_eps_by_stock.get(stock_id, [])
+
+        if not stock_raw_eps_points:
+            eps_none_count += 1
+        else:
+            try:
+                resolved_points = []
+                for raw_point in stock_raw_eps_points:
+                    if eps_observation_repository is not None:
+                        observation_result = eps_observation_repository.observe(
+                            stock_id=raw_point.stock_id,
+                            market=candidate.stock.market.value.lower(),
+                            fiscal_year=raw_point.fiscal_year,
+                            quarter=raw_point.quarter,
+                            cumulative_eps=raw_point.cumulative_eps,
+                            batch_report_date=raw_point.batch_report_date,
+                            first_seen_at=target_date,
+                            ingestion_run_id=ingestion_run_id,
+                        )
+                        first_seen_at = observation_result.observation.first_seen_at
+                    else:
+                        # DATABASE_URL not configured this run — fall
+                        # back to eps_availability_resolver's own
+                        # second-priority signal (batch_report_date).
+                        # See run()'s "EPS OBSERVATION DB LIFECYCLE"
+                        # docstring section.
+                        first_seen_at = None
+
+                    resolved_points.append(
+                        build_resolved_cumulative_eps_point(
+                            raw=raw_point, first_seen_at=first_seen_at
+                        )
+                    )
+
+                standalone_points = build_standalone_eps_points(
+                    cumulative_points=resolved_points
+                )
+                eps_growth_sustained = build_eps_growth_sustained_signal(
+                    target_date=target_date, points=standalone_points
+                )
+                if eps_growth_sustained is None:
+                    eps_none_count += 1
+                else:
+                    eps_success_count += 1
+
+            except Exception:
+                eps_failure_count += 1
+                logger.exception(
+                    "EPS-growth enrichment failed for stock_id=%s; "
+                    "eps_growth_sustained remains None",
+                    stock_id,
+                )
+
+        # --- Final block: risk assessment (hard exclusion + soft flags) ---
+        # Deliberately NOT symmetric with the enrichment blocks above:
+        # those fail-soft (leave a factor None, keep the stock). Risk
+        # assessment can hard-exclude a stock entirely (disposition/
+        # managed status), which is a "should this candidate exist at
+        # all" decision, not a "this one factor is missing" decision.
         try:
             one_price = is_one_price_limit_up(
                 price=candidate.price, limit_up_price=candidate.limit_up.limit_up_price
@@ -905,6 +1089,7 @@ def build_stock_features(
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             revenue_yoy=revenue_yoy,
             fundamental_growth_sustained=fundamental_growth_sustained,
+            eps_growth_sustained=eps_growth_sustained,
             risk_quality_raw=risk_quality_raw,
             risk_flags=risk_flags,
             risk_missing_inputs=assessment.missing_inputs,
@@ -917,7 +1102,7 @@ def build_stock_features(
             "institutional_net_buy_ratio_5d=%s "
             "institutional_net_buy_3d_positive=%s "
             "technical_low_with_rising_signal=%s revenue_yoy=%s "
-            "fundamental_growth_sustained=%s "
+            "fundamental_growth_sustained=%s eps_growth_sustained=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
             stock_features.turnover,
@@ -930,6 +1115,7 @@ def build_stock_features(
             stock_features.technical_low_with_rising_signal,
             stock_features.revenue_yoy,
             stock_features.fundamental_growth_sustained,
+            stock_features.eps_growth_sustained,
             stock_features.risk_quality_raw,
             stock_features.risk_flags,
             stock_features.risk_missing_inputs,
@@ -957,6 +1143,15 @@ def build_stock_features(
         revenue_failure_count,
     )
     logger.info(
+        "EPS-growth enrichment: candidates=%d success=%d none=%d failed=%d "
+        "db_backed=%s",
+        len(candidates),
+        eps_success_count,
+        eps_none_count,
+        eps_failure_count,
+        eps_observation_repository is not None,
+    )
+    logger.info(
         "Risk assessment: candidates=%d excluded=%d flagged=%d clean=%d "
         "incomplete=%d assessment_failed=%d",
         len(candidates),
@@ -975,6 +1170,7 @@ def _validate_shared_repository(
     twse_client: TwseClient | None,
     tpex_client: TpexClient | None,
     finmind_client: FinMindClient | None,
+    financial_statement_client: FinancialStatementClient | None,
 ) -> None:
     """
     A caller could pass repository=A but hand run() a client that was
@@ -987,6 +1183,7 @@ def _validate_shared_repository(
         ("twse_client", twse_client),
         ("tpex_client", tpex_client),
         ("finmind_client", finmind_client),
+        ("financial_statement_client", financial_statement_client),
     ):
         if client is not None and client.repository is not repository:
             raise ValueError(
@@ -1003,18 +1200,24 @@ def run(
     twse_client: TwseClient | None = None,
     tpex_client: TpexClient | None = None,
     finmind_client: FinMindClient | None = None,
+    financial_statement_client: FinancialStatementClient | None = None,
+    eps_observation_repository: EpsObservationRepository | None = None,
     delivery_repository: DeliveryRepository | None = None,
     line_client: LineMessagingClient | None = None,
 ) -> int:
     if (
-        twse_client is not None or tpex_client is not None or finmind_client is not None
+        twse_client is not None
+        or tpex_client is not None
+        or finmind_client is not None
+        or financial_statement_client is not None
     ) and repository is None:
         raise ValueError(
-            "repository must be provided whenever twse_client, tpex_client, or "
-            "finmind_client is injected, otherwise raw-snapshot bookkeeping (the "
-            "'raw snapshots' count in the completion log) can silently under-count. "
-            "Pass all injected clients together with repository, or none of them "
-            "for production behavior."
+            "repository must be provided whenever twse_client, tpex_client, "
+            "finmind_client, or financial_statement_client is injected, "
+            "otherwise raw-snapshot bookkeeping (the 'raw snapshots' count in "
+            "the completion log) can silently under-count. Pass all injected "
+            "clients together with repository, or none of them for "
+            "production behavior."
         )
 
     if repository is not None:
@@ -1023,6 +1226,7 @@ def run(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     target_date = resolve_target_date()
@@ -1036,8 +1240,12 @@ def run(
     logger.info("ingestion_run_id=%s target_date=%s", ingestion_run_id, target_date)
 
     # One repository per ingestion run — production uses this same
-    # repository for all three providers so every raw source snapshot
-    # belonging to the run is collected together.
+    # repository for all providers so every raw source snapshot
+    # belonging to the run is collected together. NOTE: this is a
+    # SEPARATE, still-provisional (in-memory) concern from the EPS
+    # observation DB session set up below — see this module's "EPS
+    # OBSERVATION DB LIFECYCLE" docstring section for why the two are
+    # deliberately not unified in this checkpoint.
     repo = repository or InMemoryRawPayloadRepository()
 
     if twse_client is None:
@@ -1046,6 +1254,9 @@ def run(
     if tpex_client is None:
         tpex_client = TpexClient(repo)
 
+    if financial_statement_client is None:
+        financial_statement_client = FinancialStatementClient(repo)
+
     if finmind_client is None:
         api_token = os.environ.get("FINMIND_TOKEN", "").strip()
         if not api_token:
@@ -1053,6 +1264,96 @@ def run(
             return 1
         finmind_client = FinMindClient(repo, api_token=api_token)
 
+    # --- EPS observation DB lifecycle setup (see module docstring) ---
+    # Deliberately happens early (before any early-return branch below
+    # would otherwise skip it) so that eps_engine/eps_session are
+    # always defined for the cleanup at the bottom of this function,
+    # regardless of which return path is taken.
+    eps_engine = None
+    eps_session = None
+    if eps_observation_repository is None:
+        database_url = os.environ.get("DATABASE_URL", "").strip()
+        if not database_url:
+            logger.warning(
+                "DATABASE_URL not set — EPS growth signal will be computed "
+                "without first_seen_at persistence this run. This is NOT a "
+                "look-ahead-safety regression: eps_availability_resolver "
+                "falls back to batch_report_date, its own designed second-"
+                "priority signal (a real, observed date), never a "
+                "synthetic one — see build_stock_features()'s docstring."
+            )
+        else:
+            try:
+                eps_engine = create_engine(database_url)
+                ensure_eps_observation_tables(eps_engine)
+                eps_session = Session(eps_engine)
+                eps_session.add(
+                    IngestionRun(
+                        ingestion_run_id=ingestion_run_id,
+                        target_date=target_date,
+                        started_at=dt.datetime.now(dt.timezone.utc),
+                        status="RUNNING",
+                    )
+                )
+                eps_session.commit()
+                eps_observation_repository = EpsObservationRepository(eps_session)
+            except Exception:
+                # Non-fatal: same reasoning as the DATABASE_URL-not-set
+                # branch above — EPS growth degrades gracefully to the
+                # batch_report_date fallback rather than failing the
+                # whole run over a DB connectivity problem for a
+                # display/scoring-additive signal.
+                logger.exception(
+                    "EPS observation DB setup failed — EPS growth signal will "
+                    "fall back to batch_report_date for this run (see above)"
+                )
+                if eps_session is not None:
+                    eps_session.close()
+                if eps_engine is not None:
+                    eps_engine.dispose()
+                eps_engine = None
+                eps_session = None
+                eps_observation_repository = None
+
+    try:
+        return _run_pipeline(
+            repo=repo,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
+            eps_observation_repository=eps_observation_repository,
+            delivery_repository=delivery_repository,
+            line_client=line_client,
+            target_date=target_date,
+            ingestion_run_id=ingestion_run_id,
+        )
+    finally:
+        if eps_session is not None:
+            eps_session.close()
+        if eps_engine is not None:
+            eps_engine.dispose()
+
+
+def _run_pipeline(
+    *,
+    repo: InMemoryRawPayloadRepository,
+    twse_client: TwseClient,
+    tpex_client: TpexClient,
+    finmind_client: FinMindClient,
+    financial_statement_client: FinancialStatementClient,
+    eps_observation_repository: EpsObservationRepository | None,
+    delivery_repository: DeliveryRepository | None,
+    line_client: LineMessagingClient | None,
+    target_date: dt.date,
+    ingestion_run_id: str,
+) -> int:
+    """
+    The actual pipeline body, factored out of run() so that run()
+    itself can guarantee the EPS observation Session/engine (if any)
+    are always closed via a single try/finally, regardless of which of
+    this function's several early `return` statements is hit.
+    """
     # --- Step 1a: today's whole-market price data from TWSE ---
     try:
         twse_price_payload = twse_client.fetch_daily_price(
@@ -1410,6 +1711,59 @@ def run(
         len(regulatory_by_stock),
     )
 
+    # --- Step 1e: whole-market EPS financial-statement snapshot (TWSE + TPEx) ---
+    # Same non-fatal failure policy as Step 1d above, NOT Step 1c's
+    # hard-fail policy — see this module's docstring "KNOWN LIMITATIONS"
+    # entry for why: EPS growth is a display/scoring-additive signal, not
+    # an eligibility gate, so a fetch/parse failure here just leaves every
+    # candidate's eps_growth_sustained None for this run (via
+    # raw_eps_by_stock.get(stock_id, []) coming back empty in
+    # build_stock_features), never a reason to abort the whole ranking.
+    raw_eps_points: list[RawCumulativeEps] = []
+
+    twse_eps_ok = False
+    try:
+        twse_fs_payload = financial_statement_client.fetch_twse_financial_statement(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        twse_fs_rows = parse_twse_json_rows(twse_fs_payload.raw_payload)
+        raw_eps_points.extend(build_raw_cumulative_eps_points(rows=twse_fs_rows))
+        twse_eps_ok = True
+    except Exception:
+        logger.exception(
+            "TWSE t187ap06_L_ci fetch/parse failed — eps_growth_sustained "
+            "will be None for every TWSE candidate this run, not assumed "
+            "unavailable-forever"
+        )
+
+    tpex_eps_ok = False
+    try:
+        tpex_fs_payload = financial_statement_client.fetch_tpex_financial_statement(
+            ingestion_run_id=ingestion_run_id, target_date=target_date
+        )
+        tpex_fs_rows = parse_tpex_csv_rows(tpex_fs_payload.raw_payload)
+        raw_eps_points.extend(build_raw_cumulative_eps_points(rows=tpex_fs_rows))
+        tpex_eps_ok = True
+    except Exception:
+        logger.exception(
+            "TPEx t187ap06_O_ci fetch/parse failed — eps_growth_sustained "
+            "will be None for every TPEx candidate this run, not assumed "
+            "unavailable-forever"
+        )
+
+    raw_eps_by_stock: dict[str, list[RawCumulativeEps]] = {}
+    for point in raw_eps_points:
+        raw_eps_by_stock.setdefault(point.stock_id, []).append(point)
+
+    logger.info(
+        "EPS financial-statement snapshot: twse_ok=%s tpex_ok=%s "
+        "raw_points=%d distinct_stocks=%d",
+        twse_eps_ok,
+        tpex_eps_ok,
+        len(raw_eps_points),
+        len(raw_eps_by_stock),
+    )
+
     # --- Step 2: stock master reference data from FinMind ---
     try:
         stock_info_payload = finmind_client.fetch_stock_info(
@@ -1490,7 +1844,7 @@ def run(
         MAXIMUM_PE_RATIO,
     )
 
-    # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue + risk) ---
+    # --- Step 5: per-candidate enrichment (price history + institutional flow + monthly revenue + EPS growth + risk) ---
     risk_policy = RiskPolicy()  # matches config/strategy-v1.yaml by hand for now
     features = build_stock_features(
         candidates=candidates,
@@ -1503,6 +1857,8 @@ def run(
         twse_disposition_ok=twse_disposition_ok,
         tpex_attention_ok=tpex_attention_ok,
         tpex_disposition_ok=tpex_disposition_ok,
+        raw_eps_by_stock=raw_eps_by_stock,
+        eps_observation_repository=eps_observation_repository,
     )
     logger.info(
         "Built StockFeatures for %d of %d candidates after RiskPolicy",

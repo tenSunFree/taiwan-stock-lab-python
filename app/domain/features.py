@@ -72,16 +72,43 @@ class StockFeatures:
     # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
     # for the exact rule). Independent of revenue_yoy above, which
     # feeds the "fundamental" SCORING FACTOR and only looks at the
-    # single newest month. v1 scope is revenue only — EPS/financial-
-    # statement data is a known gap (FinMind's income-statement
-    # dataset is not yet ingested in this project); when EPS is added,
-    # this field's OR-condition with an eps_growth_sustained signal is
-    # expected to live in the report/job layer, not by silently
-    # redefining this field's meaning. None means insufficient trailing
-    # revenue history to complete the 3-month window, same tri-state
-    # convention as institutional_net_buy_3d_positive and
+    # single newest month. REVENUE ONLY — deliberately NOT redefined to
+    # an OR-condition now that eps_growth_sustained (below) exists;
+    # see that field's own docstring for where the OR-combination
+    # actually lives (app.domain.eps_growth_builder.combine_fundamental_growth_signal,
+    # called at the report-rendering layer, not baked into either
+    # field here). None means insufficient trailing revenue history to
+    # complete the 3-month window, same tri-state convention as
+    # institutional_net_buy_3d_positive and
     # technical_low_with_rising_signal above.
     fundamental_growth_sustained: bool | None = None
+
+    # fundamentals — SIBLING of fundamental_growth_sustained above, one
+    # more DISPLAY-ONLY signal: whether quarterly EPS YoY growth has
+    # been sustained over the trailing window (see
+    # app.domain.eps_growth_builder.build_eps_growth_sustained_signal).
+    # Sourced from TWSE/TPEx's t187ap06_{L,O}_ci general-industry
+    # comprehensive-income-statement open data (see
+    # app.ingestion.financial_statement_client), NOT FinMind — this
+    # project's disclosure-date-attributed EPS source, distinct from
+    # revenue's FinMind TaiwanStockMonthRevenue pipeline.
+    #
+    # Deliberately kept as its OWN field rather than merged into
+    # fundamental_growth_sustained: the ORIGINAL spec this pair of
+    # fields exists for is "營收或 EPS YoY >= 10%，且具持續性" (revenue
+    # OR EPS), but per fundamental_growth_sustained's own docstring
+    # above, that OR-combination belongs at the report-rendering
+    # layer (via combine_fundamental_growth_signal's tri-state OR),
+    # computed from these two independent fields on demand — never by
+    # silently overwriting either field's own, narrower meaning. This
+    # keeps both components independently inspectable (e.g. "was this
+    # candidate flagged because of revenue, EPS, or both?") instead of
+    # collapsing that distinction the moment either one becomes True.
+    # None means insufficient trailing EPS history (fewer than the
+    # required trailing quarters, or a missing previous-year-same-
+    # quarter denominator) — same tri-state convention as every other
+    # optional signal in this dataclass, never guessed at as False.
+    eps_growth_sustained: bool | None = None
 
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
 

@@ -3,6 +3,7 @@ import datetime as dt
 import httpx
 import pytest
 
+from app.ingestion.financial_statement_client import FinancialStatementClient
 from app.ingestion.market_data_client import (
     FinMindClient,
     RawSourcePayload,
@@ -316,6 +317,36 @@ def make_finmind_client(
     )
 
 
+def make_financial_statement_client(
+    repository: InMemoryRawPayloadRepository,
+    *,
+    twse_rows: list[dict] | None = None,
+    tpex_csv: str | None = None,
+) -> FinancialStatementClient:
+    """
+    Defaults to an EMPTY TWSE JSON array / TPEx CSV (header row only,
+    zero data rows) — this project's EPS growth signal is additive
+    (eps_growth_sustained simply stays None for a stock with no
+    matching raw_eps_by_stock entry, same as "no data" for
+    institutional/revenue), so tests that don't care about EPS don't
+    need to construct real financial-statement fixtures by hand. Pass
+    real rows/csv to exercise the EPS path specifically.
+    """
+    if twse_rows is None:
+        twse_rows = []
+    if tpex_csv is None:
+        tpex_csv = "出表日期,公司代號,公司名稱,年度,季別,基本每股盈餘（元）\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "openapi.twse.com.tw":
+            return httpx.Response(200, json=twse_rows)
+        return httpx.Response(200, text=tpex_csv)
+
+    return FinancialStatementClient(
+        repository, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+
 def make_all_clients(
     *,
     repository: InMemoryRawPayloadRepository,
@@ -328,7 +359,9 @@ def make_all_clients(
     twse_disposition_html: str | None = None,
     tpex_attention_payload: dict | None = None,
     tpex_disposition_payload: dict | None = None,
-) -> tuple[TwseClient, TpexClient, FinMindClient]:
+    twse_financial_statement_rows: list[dict] | None = None,
+    tpex_financial_statement_csv: str | None = None,
+) -> tuple[TwseClient, TpexClient, FinMindClient, FinancialStatementClient]:
     return (
         make_twse_client(
             repository,
@@ -345,6 +378,11 @@ def make_all_clients(
             disposition_payload=tpex_disposition_payload,
         ),
         make_finmind_client(repository, stock_info_data),
+        make_financial_statement_client(
+            repository,
+            twse_rows=twse_financial_statement_rows,
+            tpex_csv=tpex_financial_statement_csv,
+        ),
     )
 
 
@@ -410,11 +448,13 @@ def test_run_reports_waiting_for_data_when_twse_date_does_not_match(monkeypatch)
 
     repository = InMemoryRawPayloadRepository()
     stale_csv = TWSE_CSV_NON_LIMIT_UP.replace("1150807", "1150806")
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=stale_csv,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=FINMIND_STOCK_INFO_TSMC,
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=stale_csv,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=FINMIND_STOCK_INFO_TSMC,
+        )
     )
 
     result = run(
@@ -422,6 +462,7 @@ def test_run_reports_waiting_for_data_when_twse_date_does_not_match(monkeypatch)
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 2
@@ -436,11 +477,13 @@ def test_run_reports_waiting_for_data_when_tpex_date_does_not_match(monkeypatch)
 
     repository = InMemoryRawPayloadRepository()
     stale_tpex_rows = [{**row, "Date": "1150806"} for row in TPEX_JSON_NON_LIMIT_UP]
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_NON_LIMIT_UP,
-        tpex_rows=stale_tpex_rows,
-        stock_info_data=FINMIND_STOCK_INFO_TSMC,
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_NON_LIMIT_UP,
+            tpex_rows=stale_tpex_rows,
+            stock_info_data=FINMIND_STOCK_INFO_TSMC,
+        )
     )
 
     result = run(
@@ -448,6 +491,7 @@ def test_run_reports_waiting_for_data_when_tpex_date_does_not_match(monkeypatch)
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 2
@@ -509,12 +553,19 @@ def test_run_reports_waiting_for_data_when_tpex_rows_are_all_filtered_out_by_map
     ]
     tpex_client = make_tpex_client(repository, tpex_rows_missing_code)
     finmind_client = make_finmind_client(repository, FINMIND_STOCK_INFO_LIMIT_UP)
+    # This test's flow reaches past Step 1d into Step 1e (the mapper
+    # failure that ultimately produces result==2 only fires at Step 3)
+    # — without this, Step 1e would fall back to a real,
+    # network-backed FinancialStatementClient (non-fatal, but a real
+    # HTTP attempt has no place in a unit test).
+    financial_statement_client = make_financial_statement_client(repository)
 
     result = run(
         repository=repository,
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 2
@@ -524,13 +575,15 @@ def test_run_produces_zero_candidates_when_no_stock_is_limit_up(monkeypatch, cap
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_NON_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_TSMC, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_NON_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_TSMC, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -539,16 +592,23 @@ def test_run_produces_zero_candidates_when_no_stock_is_limit_up(monkeypatch, cap
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
     assert "CandidateBuilder produced 0 provisional candidates" in caplog.text
     assert "twse=1, tpex=1" in caplog.text
-    # 9 base snapshots: twse price + tpex price + twse valuation +
+    # 11 base snapshots: twse price + tpex price + twse valuation +
     # tpex valuation + twse attention + twse disposition + tpex
-    # attention + tpex disposition + finmind stock_info.
-    assert len(repository.saved) == 9
-    assert {p.source for p in repository.saved} == {"twse", "tpex", "finmind"}
+    # attention + tpex disposition + twse financial statement + tpex
+    # financial statement + finmind stock_info.
+    assert len(repository.saved) == 11
+    assert {p.source for p in repository.saved} == {
+        "twse",
+        "tpex",
+        "finmind",
+        "financial_statement",
+    }
 
 
 def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
@@ -563,13 +623,15 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -578,18 +640,22 @@ def test_run_produces_limit_up_candidate_from_twse_with_tpex_also_present(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "stock_id=1101" in caplog.text
-    # 9 base snapshots (twse price + tpex price + twse valuation +
+    # 11 base snapshots (twse price + tpex price + twse valuation +
     # tpex valuation + twse attention + twse disposition + tpex
-    # attention + tpex disposition + finmind stock_info) + 3
-    # per-candidate FinMind enrichment snapshots (price history +
-    # institutional + monthly revenue; this test has exactly 1
-    # candidate) = 12.
-    assert len(repository.saved) == 12
+    # attention + tpex disposition + twse financial statement + tpex
+    # financial statement + finmind stock_info) + 3 per-candidate
+    # FinMind enrichment snapshots (price history + institutional +
+    # monthly revenue; this test has exactly 1 candidate) = 14. EPS's
+    # own enrichment (Step 5, independent block 4) makes NO additional
+    # HTTP calls of its own — see build_stock_features()'s docstring —
+    # so it doesn't add to this per-candidate count.
+    assert len(repository.saved) == 14
     assert "Built StockFeatures for 1 of 1 candidates after RiskPolicy" in caplog.text
 
 
@@ -610,16 +676,20 @@ def test_run_excludes_candidate_with_pe_above_maximum_before_finmind_enrichment(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # override the default permissive P/E: stock 1101 gets 25.00,
-        # which must fail the 0 < P/E <= 20 rule
-        twse_valuation_rows=[{"Date": "1150807", "Code": "1101", "PEratio": "25.00"}],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # override the default permissive P/E: stock 1101 gets 25.00,
+            # which must fail the 0 < P/E <= 20 rule
+            twse_valuation_rows=[
+                {"Date": "1150807", "Code": "1101", "PEratio": "25.00"}
+            ],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -628,16 +698,17 @@ def test_run_excludes_candidate_with_pe_above_maximum_before_finmind_enrichment(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
     assert "CandidateBuilder produced 1 provisional candidates" in caplog.text
     assert "P/E eligibility filter: before=1 after=0" in caplog.text
     assert "Built StockFeatures for 0 of 0 candidates after RiskPolicy" in caplog.text
-    # Exactly the 9 base snapshots — zero per-candidate FinMind
+    # Exactly the 11 base snapshots — zero per-candidate FinMind
     # enrichment snapshots, proving the excluded candidate never
     # reached Step 5 at all.
-    assert len(repository.saved) == 9
+    assert len(repository.saved) == 11
 
 
 def test_run_keeps_candidate_with_pe_exactly_at_maximum(monkeypatch, caplog):
@@ -646,14 +717,16 @@ def test_run_keeps_candidate_with_pe_exactly_at_maximum(monkeypatch, caplog):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        twse_valuation_rows=[{"Date": "1150807", "Code": "1101", "PEratio": "20"}],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            twse_valuation_rows=[{"Date": "1150807", "Code": "1101", "PEratio": "20"}],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -662,6 +735,7 @@ def test_run_keeps_candidate_with_pe_exactly_at_maximum(monkeypatch, caplog):
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -677,15 +751,17 @@ def test_run_excludes_candidate_with_no_pe_available(monkeypatch, caplog):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # stock 1101 has no valuation row at all
-        twse_valuation_rows=[],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # stock 1101 has no valuation row at all
+            twse_valuation_rows=[],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -694,6 +770,7 @@ def test_run_excludes_candidate_with_no_pe_available(monkeypatch, caplog):
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     # No usable TWSE valuation rows at all -> WAITING_FOR_DATA, per
@@ -725,16 +802,18 @@ def test_run_waits_for_data_when_valuation_snapshot_is_implausibly_stale(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # target_date is 2026-08-07; this valuation row is dated
-        # 2026-07-28 (ROC 1150728) — 10 calendar days behind.
-        twse_valuation_rows=[{"Date": "1150728", "Code": "1101", "PEratio": "15"}],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # target_date is 2026-08-07; this valuation row is dated
+            # 2026-07-28 (ROC 1150728) — 10 calendar days behind.
+            twse_valuation_rows=[{"Date": "1150728", "Code": "1101", "PEratio": "15"}],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -743,6 +822,7 @@ def test_run_waits_for_data_when_valuation_snapshot_is_implausibly_stale(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 2
@@ -758,15 +838,17 @@ def test_run_accepts_valuation_snapshot_within_staleness_bound(monkeypatch, capl
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # 2026-08-02 (ROC 1150802) is exactly 5 days before 2026-08-07.
-        twse_valuation_rows=[{"Date": "1150802", "Code": "1101", "PEratio": "15"}],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # 2026-08-02 (ROC 1150802) is exactly 5 days before 2026-08-07.
+            twse_valuation_rows=[{"Date": "1150802", "Code": "1101", "PEratio": "15"}],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -775,6 +857,7 @@ def test_run_accepts_valuation_snapshot_within_staleness_bound(monkeypatch, capl
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -792,15 +875,17 @@ def test_run_excludes_single_stock_missing_from_an_otherwise_populated_snapshot(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # valuation snapshot has data, just not for stock 1101
-        twse_valuation_rows=[{"Date": "1150807", "Code": "9999", "PEratio": "12"}],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # valuation snapshot has data, just not for stock 1101
+            twse_valuation_rows=[{"Date": "1150807", "Code": "9999", "PEratio": "12"}],
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -809,6 +894,7 @@ def test_run_excludes_single_stock_missing_from_an_otherwise_populated_snapshot(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -827,6 +913,15 @@ def test_strategy_version_bumped_to_rule_v1_2_0():
     tuning, create a new strategy_version instead of overwriting this
     one") each require their own version rather than reusing a prior
     one.
+
+    NOTE: EPS-growth wiring (Step 5's independent block 4,
+    StockFeatures.eps_growth_sustained) deliberately does NOT bump
+    STRATEGY_VERSION — it's a DISPLAY-ONLY field, same status as
+    institutional_net_buy_3d_positive/technical_low_with_rising_signal,
+    and does not touch FACTOR_WEIGHTS, RiskPolicy, or candidate
+    eligibility. See StockFeatures.eps_growth_sustained's own docstring
+    for why it's kept independent from fundamental_growth_sustained
+    rather than silently redefining that field's meaning.
 
     Asserted directly on the constant rather than via a run()+caplog
     round trip: STRATEGY_VERSION is only ever logged when
@@ -884,18 +979,20 @@ def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypa
     }
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=twse_csv_two_candidates,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            finmind_stock_info_two_candidates, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        # 1101 passes (P/E 15 <= 20), 2330 fails (P/E 25 > 20)
-        twse_valuation_rows=[
-            {"Date": "1150807", "Code": "1101", "PEratio": "15"},
-            {"Date": "1150807", "Code": "2330", "PEratio": "25"},
-        ],
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=twse_csv_two_candidates,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                finmind_stock_info_two_candidates, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            # 1101 passes (P/E 15 <= 20), 2330 fails (P/E 25 > 20)
+            twse_valuation_rows=[
+                {"Date": "1150807", "Code": "1101", "PEratio": "15"},
+                {"Date": "1150807", "Code": "2330", "PEratio": "25"},
+            ],
+        )
     )
 
     result = run(
@@ -903,6 +1000,7 @@ def test_run_report_candidate_count_reflects_pre_pe_filter_pool(capsys, monkeypa
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 0
@@ -945,14 +1043,16 @@ def test_run_surfaces_twse_attention_flag_through_the_whole_pipeline(
     )
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        twse_attention_html=attention_html,
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            twse_attention_html=attention_html,
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -961,6 +1061,7 @@ def test_run_surfaces_twse_attention_flag_through_the_whole_pipeline(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -1016,14 +1117,16 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
     )
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        twse_disposition_html=disposition_html,
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            twse_disposition_html=disposition_html,
+        )
     )
 
     fake_scored = [
@@ -1049,6 +1152,7 @@ def test_run_surfaces_twse_disposition_period_in_the_rendered_report(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -1074,14 +1178,16 @@ def test_run_treats_regulatory_source_failure_as_non_fatal(monkeypatch, caplog):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
-        twse_attention_html="<html><body>not a valid report table</body></html>",
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            twse_attention_html="<html><body>not a valid report table</body></html>",
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -1090,6 +1196,7 @@ def test_run_treats_regulatory_source_failure_as_non_fatal(monkeypatch, caplog):
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     # The run must still succeed overall (0), not fail (1) or wait (2).
@@ -1102,11 +1209,13 @@ def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_NON_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data={"data": []},
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_NON_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data={"data": []},
+        )
     )
 
     result = run(
@@ -1114,14 +1223,16 @@ def test_run_returns_1_when_stock_info_has_no_usable_rows(monkeypatch):
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 1
-    # 9 base snapshots: twse price + tpex price + twse valuation +
+    # 11 base snapshots: twse price + tpex price + twse valuation +
     # tpex valuation + twse attention + twse disposition + tpex
-    # attention + tpex disposition + finmind stock_info (saved even
-    # though its rows turned out unusable — "save raw, parse later").
-    assert len(repository.saved) == 9
+    # attention + tpex disposition + twse financial statement + tpex
+    # financial statement + finmind stock_info (saved even though its
+    # rows turned out unusable — "save raw, parse later").
+    assert len(repository.saved) == 11
 
 
 def test_run_returns_1_when_twse_fetch_raises(monkeypatch):
@@ -1756,6 +1867,206 @@ def test_build_stock_features_fundamental_growth_sustained_none_with_fewer_than_
     assert features[0].fundamental_growth_sustained is None
 
 
+# --- EPS growth sustained (Step 5, independent block 4) ---
+
+
+def _make_raw_eps_points_sustained(*, stock_id: str = "1101"):
+    """
+    Standalone EPS: Q1(2025)=1.0, Q2(2025)=1.2, Q1(2026)=1.3 (+30%),
+    Q2(2026)=1.5 (+25%) — both trailing quarters clear the 10%
+    threshold, matching build_eps_growth_sustained_signal's default
+    2-of-2 window. Expressed here as CUMULATIVE figures the way
+    eps_mapper.RawCumulativeEps actually represents them (Q2 cumulative
+    = Q1 + Q2 standalone), since build_stock_features feeds
+    raw_eps_by_stock straight through build_resolved_cumulative_eps_point
+    -> build_standalone_eps_points, not pre-converted standalone
+    values.
+    """
+    from app.ingestion.eps_mapper import RawCumulativeEps
+
+    return [
+        RawCumulativeEps(
+            stock_id=stock_id,
+            fiscal_year=2025,
+            quarter=1,
+            cumulative_eps=1.0,
+            batch_report_date=dt.date(2025, 5, 15),
+        ),
+        RawCumulativeEps(
+            stock_id=stock_id,
+            fiscal_year=2025,
+            quarter=2,
+            cumulative_eps=2.2,  # Q1 1.0 + Q2 standalone 1.2
+            batch_report_date=dt.date(2025, 8, 31),
+        ),
+        RawCumulativeEps(
+            stock_id=stock_id,
+            fiscal_year=2026,
+            quarter=1,
+            cumulative_eps=1.3,  # +30% YoY vs 2025 Q1
+            batch_report_date=dt.date(2026, 5, 15),
+        ),
+        RawCumulativeEps(
+            stock_id=stock_id,
+            fiscal_year=2026,
+            quarter=2,
+            cumulative_eps=2.8,  # Q1 1.3 + Q2 standalone 1.5 (+25% YoY)
+            batch_report_date=dt.date(2026, 8, 7),
+        ),
+    ]
+
+
+def test_build_stock_features_eps_growth_sustained_true_without_db(caplog):
+    """
+    End-to-end regression for the whole eps_mapper -> resolver ->
+    period-converter -> growth-builder chain as actually wired through
+    build_stock_features, WITHOUT an eps_observation_repository (the
+    DATABASE_URL-not-set degraded path) — first_seen_at falls back to
+    each point's own batch_report_date, which is still real and still
+    <= TARGET_DATE for every point here, so the signal should resolve
+    to True. Also confirms eps_growth_sustained is populated on its
+    OWN field, independent of fundamental_growth_sustained (revenue),
+    which stays None here since no revenue fixture is supplied.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    with caplog.at_level("INFO", logger="daily_ranking"):
+        features = build_stock_features(
+            candidates=candidates,
+            target_date=TARGET_DATE,
+            finmind_client=client,
+            ingestion_run_id="run-1",
+            risk_policy=RiskPolicy(),
+            raw_eps_by_stock={"1101": _make_raw_eps_points_sustained()},
+        )
+
+    assert len(features) == 1
+    assert features[0].eps_growth_sustained is True
+    # revenue-only field must be untouched by the EPS result — no
+    # revenue fixture was supplied, so it stays None, never silently
+    # inherits eps_growth_sustained's True.
+    assert features[0].fundamental_growth_sustained is None
+    assert "EPS-growth enrichment: candidates=1 success=1 none=0 failed=0" in (
+        caplog.text
+    )
+    assert "db_backed=False" in caplog.text
+
+
+def test_build_stock_features_eps_growth_sustained_none_for_stock_with_no_eps_data():
+    """A candidate simply absent from raw_eps_by_stock (e.g. the
+    TWSE/TPEx financial-statement fetch never covered it, or Step 1e
+    failed non-fatally) must resolve to None — never False, never
+    guessed at from silence."""
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+        raw_eps_by_stock={},
+    )
+
+    assert features[0].eps_growth_sustained is None
+
+
+def test_build_stock_features_eps_uses_observation_repository_first_seen_at():
+    """
+    When eps_observation_repository IS provided, the EPS block must
+    actually call observe()/rely on its returned first_seen_at rather
+    than silently falling back to batch_report_date — proven here by
+    deliberately using a batch_report_date that's AFTER TARGET_DATE
+    (which would make every point ineligible under the
+    batch_report_date fallback) while first_seen_at (this run's own
+    target_date, per build_stock_features's own call into observe())
+    is <= TARGET_DATE, so the signal can only resolve to True via the
+    repository path actually being exercised.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from app.db.eps_observation_repository import EpsObservationRepository
+    from app.db.models import EpsCumulativeObservation, IngestionRun
+    from app.ingestion.eps_mapper import RawCumulativeEps
+    from app.jobs.daily_ranking import build_stock_features
+
+    engine = create_engine("sqlite:///:memory:")
+    IngestionRun.__table__.create(engine)
+    EpsCumulativeObservation.__table__.create(engine)
+    session = Session(engine)
+    session.add(
+        IngestionRun(
+            ingestion_run_id="run-1",
+            target_date=TARGET_DATE,
+            started_at=dt.datetime.now(dt.timezone.utc),
+            status="RUNNING",
+        )
+    )
+    session.commit()
+    eps_observation_repository = EpsObservationRepository(session)
+
+    future_batch_date = TARGET_DATE + dt.timedelta(days=30)  # deliberately unusable
+    raw_points = [
+        RawCumulativeEps(
+            stock_id="1101",
+            fiscal_year=2025,
+            quarter=1,
+            cumulative_eps=1.0,
+            batch_report_date=future_batch_date,
+        ),
+        RawCumulativeEps(
+            stock_id="1101",
+            fiscal_year=2025,
+            quarter=2,
+            cumulative_eps=2.2,
+            batch_report_date=future_batch_date,
+        ),
+        RawCumulativeEps(
+            stock_id="1101",
+            fiscal_year=2026,
+            quarter=1,
+            cumulative_eps=1.3,
+            batch_report_date=future_batch_date,
+        ),
+        RawCumulativeEps(
+            stock_id="1101",
+            fiscal_year=2026,
+            quarter=2,
+            cumulative_eps=2.8,
+            batch_report_date=future_batch_date,
+        ),
+    ]
+
+    candidates = [_make_candidate("1101")]
+    client = FakeHistoryFinMindClient(rows_by_stock={"1101": _make_history_rows(20)})
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+        raw_eps_by_stock={"1101": raw_points},
+        eps_observation_repository=eps_observation_repository,
+    )
+
+    assert features[0].eps_growth_sustained is True
+
+    # Also confirms observe() actually persisted first_seen_at=TARGET_DATE
+    # (not the future batch_report_date) for a fresh value.
+    recorded = eps_observation_repository.get_first_seen_at(
+        stock_id="1101", fiscal_year=2026, quarter=2, cumulative_eps=2.8
+    )
+    assert recorded == TARGET_DATE
+
+
 def test_build_stock_features_institutional_net_buy_3d_positive_is_false_when_negative():
     """近 3 個交易日累積買超為負（或加總 <= 0）時，
     institutional_net_buy_3d_positive 必須是 False，不是 None——
@@ -2063,13 +2374,15 @@ def test_run_report_dry_run_off_by_default_prints_no_report(capsys, monkeypatch)
     monkeypatch.delenv("REPORT_DRY_RUN", raising=False)
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     result = run(
@@ -2077,6 +2390,7 @@ def test_run_report_dry_run_off_by_default_prints_no_report(capsys, monkeypatch)
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 0
@@ -2098,13 +2412,15 @@ def test_run_report_dry_run_prints_no_qualified_report(capsys, monkeypatch, capl
     monkeypatch.setenv("REPORT_DRY_RUN", "true")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -2113,6 +2429,7 @@ def test_run_report_dry_run_prints_no_qualified_report(capsys, monkeypatch, capl
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -2159,13 +2476,15 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     monkeypatch.setenv("REPORT_DRY_RUN", "true")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     fake_scored = [
@@ -2191,6 +2510,7 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -2203,6 +2523,138 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert "訊號" in captured.out
     assert "🟢 流動性：強" in captured.out
     assert "🟢 基本面：強" in captured.out
+
+
+def test_run_end_to_end_eps_growth_sustained_reaches_rendered_report(
+    capsys, monkeypatch
+):
+    """
+    Full end-to-end integration test (Step 16): a real TWSE
+    t187ap06_L_ci-shaped JSON response, fetched via Step 1e, must flow
+    all the way through parse_twse_json_rows -> eps_mapper ->
+    eps_availability_resolver (batch_report_date fallback, no
+    eps_observation_repository injected here) -> eps_period_converter
+    -> eps_growth_builder -> build_stock_features's independent block 4
+    -> StockFeatures.eps_growth_sustained -> report_builder ->
+    text_renderer's combined "基本面" headline in the ACTUAL rendered
+    report text — not just verified piecewise the way every other test
+    in this file (and in test_report_builder.py/test_text_renderer.py)
+    does it. This is the one test that would catch a real seam breaking
+    (e.g. a field name mismatch between build_stock_features and
+    report_builder) even though every individual layer's own unit
+    tests still pass in isolation.
+
+    score_candidates() is patched at the boundary — same pattern as
+    test_run_report_dry_run_prints_ranked_report — since FinMind
+    price/institutional/revenue enrichment realism is already covered
+    by that test and by test_build_stock_features_*; this test's job
+    is specifically to prove the EPS chain, not re-prove FinMind
+    scoring for the Nth time. Because score_candidates is faked,
+    revenue_yoy/fundamental_growth_sustained naturally stay None here
+    (the default make_finmind_client fixture doesn't serve real
+    monthly-revenue rows) — the report must show "資料不足" for the
+    revenue sub-line while still correctly resolving the COMBINED
+    headline to "是" via EPS alone, which is itself the OR-logic this
+    whole feature exists for.
+    """
+    from unittest.mock import patch
+
+    from app.domain.scoring import ScoredStock
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("REPORT_DRY_RUN", "true")
+
+    # Real t187ap06_L_ci row shape (see app.ingestion.eps_mapper's
+    # module docstring) for stock 1101 across four quarters. Standalone
+    # EPS after eps_period_converter: Q1(2025)=1.0, Q2(2025)=1.2,
+    # Q1(2026)=1.3 (+30% YoY), Q2(2026)=1.5 (+25% YoY) — both trailing
+    # quarters clear the 10% threshold, so eps_growth_sustained must
+    # resolve to True.
+    twse_financial_statement_rows = [
+        {
+            "出表日期": "1140515",
+            "公司代號": "1101",
+            "公司名稱": "測試水泥",
+            "年度": "114",
+            "季別": "1",
+            "基本每股盈餘（元）": "1.0",
+        },
+        {
+            "出表日期": "1140831",
+            "公司代號": "1101",
+            "公司名稱": "測試水泥",
+            "年度": "114",
+            "季別": "2",
+            "基本每股盈餘（元）": "2.2",
+        },
+        {
+            "出表日期": "1150515",
+            "公司代號": "1101",
+            "公司名稱": "測試水泥",
+            "年度": "115",
+            "季別": "1",
+            "基本每股盈餘（元）": "1.3",
+        },
+        {
+            "出表日期": "1150807",  # == TARGET_DATE, inclusive boundary
+            "公司代號": "1101",
+            "公司名稱": "測試水泥",
+            "年度": "115",
+            "季別": "2",
+            "基本每股盈餘（元）": "2.8",
+        },
+    ]
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+            twse_financial_statement_rows=twse_financial_statement_rows,
+        )
+    )
+
+    fake_scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=82.5,
+            data_completeness=0.90,
+            factor_scores={
+                "liquidity": 90.0,
+                "volume_price": 80.0,
+                "momentum": 75.0,
+                "institutional": 70.0,
+                "fundamental": 85.0,
+                "risk_quality": None,
+            },
+            risk_flags=(),
+        )
+    ]
+
+    with patch("app.jobs.daily_ranking.score_candidates", return_value=fake_scored):
+        result = run(
+            repository=repository,
+            twse_client=twse_client,
+            tpex_client=tpex_client,
+            finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
+        )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "1. 測試水泥（1101）" in captured.out
+    # The combined "基本面" headline — the ORIGINAL spec this whole
+    # EPS effort was for — resolves to True via EPS ALONE.
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是" in captured.out
+    assert "　EPS YoY ≥ 10%，且具持續性：是" in captured.out
+    # Revenue's own sub-line stays "資料不足" (no real revenue fixture
+    # was supplied) — the combined headline being True must not be
+    # mistaken for revenue itself having passed.
+    assert "　營收 YoY ≥ 10%，且具持續性：資料不足" in captured.out
 
 
 def test_run_uses_ranking_limit_of_ten_not_five_in_pipeline_summary_log(
@@ -2219,13 +2671,15 @@ def test_run_uses_ranking_limit_of_ten_not_five_in_pipeline_summary_log(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     with caplog.at_level("INFO", logger="daily_ranking"):
@@ -2234,6 +2688,7 @@ def test_run_uses_ranking_limit_of_ten_not_five_in_pipeline_summary_log(
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
 
     assert result == 0
@@ -2246,13 +2701,15 @@ def test_run_line_live_push_off_by_default_does_not_touch_delivery(monkeypatch):
     monkeypatch.delenv("LINE_LIVE_PUSH", raising=False)
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     result = run(
@@ -2260,6 +2717,7 @@ def test_run_line_live_push_off_by_default_does_not_touch_delivery(monkeypatch):
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
 
     assert result == 0
@@ -2282,19 +2740,22 @@ def test_run_report_text_is_deterministic_for_same_inputs(capsys, monkeypatch):
 
     def run_once():
         repository = InMemoryRawPayloadRepository()
-        twse_client, tpex_client, finmind_client = make_all_clients(
-            repository=repository,
-            twse_csv=TWSE_CSV_LIMIT_UP,
-            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-            stock_info_data=_merged_stock_info(
-                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-            ),
+        twse_client, tpex_client, finmind_client, financial_statement_client = (
+            make_all_clients(
+                repository=repository,
+                twse_csv=TWSE_CSV_LIMIT_UP,
+                tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+                stock_info_data=_merged_stock_info(
+                    FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+                ),
+            )
         )
         run(
             repository=repository,
             twse_client=twse_client,
             tpex_client=tpex_client,
             finmind_client=finmind_client,
+            financial_statement_client=financial_statement_client,
         )
         return capsys.readouterr().out
 
@@ -2310,13 +2771,15 @@ def test_run_line_delivery_mode_off_by_default_does_not_touch_delivery(monkeypat
     monkeypatch.delenv("LINE_DELIVERY_MODE", raising=False)
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     result = run(
@@ -2324,6 +2787,7 @@ def test_run_line_delivery_mode_off_by_default_does_not_touch_delivery(monkeypat
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
     assert result == 0
 
@@ -2333,13 +2797,15 @@ def test_run_line_delivery_mode_rejects_unknown_value(monkeypatch):
     monkeypatch.setenv("LINE_DELIVERY_MODE", "not-a-real-mode")
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     result = run(
@@ -2347,6 +2813,7 @@ def test_run_line_delivery_mode_rejects_unknown_value(monkeypatch):
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
     assert result == 1
 
@@ -2357,13 +2824,15 @@ def test_run_line_delivery_mode_push_requires_target_id(monkeypatch):
     monkeypatch.delenv("LINE_TARGET_ID", raising=False)
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
 
     result = run(
@@ -2371,6 +2840,7 @@ def test_run_line_delivery_mode_push_requires_target_id(monkeypatch):
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
     )
     assert result == 1
 
@@ -2402,13 +2872,15 @@ def test_run_line_delivery_mode_broadcast_does_not_require_target_id(
         return httpx.Response(200, headers={"x-line-request-id": "req-1"})
 
     repository = InMemoryRawPayloadRepository()
-    twse_client, tpex_client, finmind_client = make_all_clients(
-        repository=repository,
-        twse_csv=TWSE_CSV_LIMIT_UP,
-        tpex_rows=TPEX_JSON_NON_LIMIT_UP,
-        stock_info_data=_merged_stock_info(
-            FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
-        ),
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
     )
     session = Session(engine)
     line_client = LineMessagingClient(
@@ -2422,6 +2894,7 @@ def test_run_line_delivery_mode_broadcast_does_not_require_target_id(
         twse_client=twse_client,
         tpex_client=tpex_client,
         finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
         delivery_repository=DeliveryRepository(session),
         line_client=line_client,
     )

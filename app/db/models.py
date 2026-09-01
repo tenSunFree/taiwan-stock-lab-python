@@ -154,3 +154,109 @@ class MessageDelivery(Base):
         default=lambda: dt.datetime.now(dt.timezone.utc),
     )
     sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EpsCumulativeObservation(Base):
+    """
+    Append-only, revision-safe observation log for TWSE/TPEx cumulative
+    EPS figures (see app.ingestion.eps_mapper.RawCumulativeEps and
+    app.ingestion.eps_availability_resolver's module docstring for the
+    concepts this table exists to support).
+
+    THE CORE INVARIANT THIS TABLE PROTECTS: first_seen_at, once written
+    for a given (stock_id, fiscal_year, quarter, cumulative_eps) VALUE,
+    must NEVER be updated — not even by a later ingestion run that
+    re-observes the exact same value. This is enforced structurally,
+    not by application discipline: the UniqueConstraint below is on
+    the value itself (cumulative_eps included), so:
+
+      - Re-observing the SAME value on a later run hits the unique
+        constraint -> the repository (see
+        app.db.eps_observation_repository.EpsObservationRepository)
+        catches the resulting IntegrityError and returns the EXISTING
+        row untouched. first_seen_at is never rewritten because no
+        UPDATE is ever issued against it — the same pattern
+        DeliveryRepository.reserve() already uses to make
+        line_retry_key crash-recovery-safe.
+      - A REVISED value (e.g. TWSE restates 台泥 2026Q2's EPS from 0.38
+        to 0.40) has a DIFFERENT cumulative_eps, so it does not match
+        the unique constraint on the OLD row at all — it inserts as a
+        brand-new row with its own, later first_seen_at. The OLD row
+        (and its original first_seen_at) is left completely alone.
+        Both revisions coexist in this table permanently; which one is
+        "current" is a query-time decision (see
+        get_first_seen_at_for_current_value below), never an in-place
+        mutation.
+
+    DESIGN DECISION — why cumulative_eps is part of the uniqueness key,
+    not just (stock_id, fiscal_year, quarter): the whole point of this
+    table is to answer "when did OUR pipeline first see THIS EXACT
+    figure" for
+    app.ingestion.eps_availability_resolver.build_resolved_cumulative_eps_point's
+    first_seen_at parameter — that function's contract is per-VALUE,
+    not per-period, precisely because a later revision needs its own,
+    later first_seen_at rather than silently inheriting the original
+    period's. Keying on the period alone would make a restatement look
+    exactly like it had been known since the original disclosure —
+    reintroducing the look-ahead bias this whole mechanism exists to
+    prevent.
+
+    DESIGN DECISION — first_seen_at is a Date, not a DateTime: it
+    represents a business/calendar date matching this project's daily
+    ingestion cadence (typically the ingestion run's own target_date),
+    consistent with every other look-ahead-safe available_at field in
+    this project (MonthlyRevenuePoint.available_at,
+    QuarterlyEpsPoint.available_at). created_at below is the separate,
+    wall-clock "when did this ROW get written" timestamp — the two are
+    not interchangeable: a backfill run executed on 2026-09-01 for
+    target_date 2026-08-11 must record first_seen_at=2026-08-11, not
+    today.
+
+    market/batch_report_date are carried here purely for observability
+    and as the fallback input to
+    eps_availability_resolver.resolve_eps_availability (batch_report_date)
+    — neither participates in the uniqueness key, since a company is
+    only ever listed on one of TWSE/TPEx and batch_report_date is
+    dataset-wide metadata, not part of what makes a revision distinct.
+    """
+
+    __tablename__ = "eps_cumulative_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "stock_id",
+            "fiscal_year",
+            "quarter",
+            "cumulative_eps",
+            name="uq_eps_observation_value",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+
+    stock_id: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    market: Mapped[str] = mapped_column(String(16), nullable=False)  # "twse" | "tpex"
+    fiscal_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    quarter: Mapped[int] = mapped_column(Integer, nullable=False)
+    cumulative_eps: Mapped[Numeric] = mapped_column(Numeric(12, 4), nullable=False)
+
+    # TWSE/TPEx's own 出表日期 for the batch THIS revision was first
+    # observed in — the availability-resolver fallback, kept here even
+    # though first_seen_at (below) is normally the sharper signal; see
+    # app.ingestion.eps_availability_resolver's precedence rule.
+    batch_report_date: Mapped[dt.date] = mapped_column(Date, nullable=False)
+
+    # The core, never-updated field this table exists for — see class
+    # docstring's "CORE INVARIANT" section.
+    first_seen_at: Mapped[dt.date] = mapped_column(Date, nullable=False)
+
+    first_seen_ingestion_run_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_runs.ingestion_run_id"), nullable=False
+    )
+
+    # Wall-clock row-creation time — NOT the same thing as
+    # first_seen_at; see class docstring.
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: dt.datetime.now(dt.timezone.utc),
+    )

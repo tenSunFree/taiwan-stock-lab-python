@@ -437,34 +437,67 @@ def test_technical_signal_is_independent_of_momentum_score():
     assert "✅ 低檔且具起漲訊號：是" in report
 
 
-# --- 基本面（display-only tri-state，獨立於 fundamental 評分因子） -----------
+# --- 基本面（display-only tri-state：營收 OR EPS，獨立於 fundamental 評分因子）
 
 
 def test_fundamental_growth_sustained_shows_yes():
+    """營收單獨成立（EPS 未提供/None）就足以讓合併後的頭行顯示「是」——
+    OR 的語意：任一邊確定為 True，結果就是 True。"""
     report = _render(_make_stock_view(fundamental_growth_sustained=True))
-    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
+
+
+def test_eps_growth_sustained_alone_also_satisfies_combined_headline():
+    """反過來：營收確定為 False，但 EPS 確定為 True，合併結果仍然是
+    「是」——不能因為營收沒過就把整體判成否，這正是 OR 語意存在的理由。"""
+    report = _render(
+        _make_stock_view(fundamental_growth_sustained=False, eps_growth_sustained=True)
+    )
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：是" in report
 
 
 def test_fundamental_growth_not_sustained_shows_no():
-    report = _render(_make_stock_view(fundamental_growth_sustained=False))
-    assert "❌ 營收 YoY ≥ 10%，且具持續性：否" in report
+    """只有當營收與 EPS 都確定為 False 時，合併頭行才會是「否」——
+    單獨一邊 False、另一邊未知（None）不算數，見下面的 unknown 測試。"""
+    report = _render(
+        _make_stock_view(fundamental_growth_sustained=False, eps_growth_sustained=False)
+    )
+    assert "❌ 營收或 EPS YoY ≥ 10%，且具持續性：否" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：否" in report
 
 
 def test_fundamental_growth_sustained_unknown_shows_insufficient_data():
-    """預設值（未提供時）與明確傳入 None 都必須顯示「資料不足」，
-    不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——理由跟
-    法人籌碼／技術面那兩個 tri-state 欄位完全一樣。"""
-    report = _render(_make_stock_view(fundamental_growth_sustained=None))
-    assert "⚪ 營收 YoY ≥ 10%，且具持續性：資料不足" in report
-    assert "✅ 營收 YoY ≥ 10%，且具持續性" not in report
-    assert "❌ 營收 YoY ≥ 10%，且具持續性" not in report
+    """兩者都是預設值（None）時，合併頭行與兩條子項都必須顯示「資料
+    不足」，不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——
+    理由跟法人籌碼／技術面那兩個 tri-state 欄位完全一樣。"""
+    report = _render(_make_stock_view())
+    assert "⚪ 營收或 EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性" not in report
+    assert "❌ 營收或 EPS YoY ≥ 10%，且具持續性" not in report
+
+
+def test_fundamental_growth_one_confirmed_false_one_unknown_stays_unconfirmed():
+    """營收確定為 False，但 EPS 還是未知（None）——合併結果不能因為
+    「至少有一邊確定」就順勢判成否；EPS 仍有可能是 True，所以頭行必須
+    維持「資料不足」，不能提早下結論。"""
+    report = _render(_make_stock_view(fundamental_growth_sustained=False))
+    assert "⚪ 營收或 EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
 
 
 def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
-    """基本面區塊的 True/False 與「訊號」區塊裡 fundamental 因子的分數
+    """基本面區塊的合併結果與「訊號」區塊裡 fundamental 因子的分數
     是兩件獨立的事：即使 fundamental 評分因子（單月最新 YoY）偏低，
-    3 個月的持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被合併
-    顯示。"""
+    營收的 3 個月持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被
+    合併顯示。"""
     report = _render(
         _make_stock_view(
             factor_scores={
@@ -479,15 +512,16 @@ def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
         )
     )
     assert "🔴 基本面：偏弱" in report
-    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：是" in report
 
 
 def test_progress_checklist_shows_fundamental_growth_as_done():
-    """功能上線後，「📌 功能進度」清單裡的「基本面」項目要從 ⬜ 改成 ✅，
-    並且要清楚標註 v1 範圍僅涵蓋營收、EPS 尚未串接，避免讀者誤以為
-    已經含 EPS 判斷。"""
+    """功能上線後，「📌 功能進度」清單裡的「基本面」項目要從 ⬜ 改成
+    ✅，且文字要反映「營收或 EPS」的合併判斷已經上線，不再標註「EPS
+    尚未串接」。"""
     report = _render(_make_stock_view())
-    assert "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）" in report
+    assert "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性" in report
+    assert "EPS 尚未串接" not in report
     assert "⬜ 基本面" not in report
 
 
