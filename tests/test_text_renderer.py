@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from app.reports.text_renderer import (
     DISCLAIMER,
+    MAX_LINE_TEXT_UTF16_UNITS,
     ReportStockView,
     render_daily_report,
     render_no_qualified_stock_report,
@@ -437,34 +438,67 @@ def test_technical_signal_is_independent_of_momentum_score():
     assert "✅ 低檔且具起漲訊號：是" in report
 
 
-# --- 基本面（display-only tri-state，獨立於 fundamental 評分因子） -----------
+# --- 基本面（display-only tri-state：營收 OR EPS，獨立於 fundamental 評分因子）
 
 
 def test_fundamental_growth_sustained_shows_yes():
+    """營收單獨成立（EPS 未提供/None）就足以讓合併後的頭行顯示「是」——
+    OR 的語意：任一邊確定為 True，結果就是 True。"""
     report = _render(_make_stock_view(fundamental_growth_sustained=True))
-    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
+
+
+def test_eps_growth_sustained_alone_also_satisfies_combined_headline():
+    """反過來：營收確定為 False，但 EPS 確定為 True，合併結果仍然是
+    「是」——不能因為營收沒過就把整體判成否，這正是 OR 語意存在的理由。"""
+    report = _render(
+        _make_stock_view(fundamental_growth_sustained=False, eps_growth_sustained=True)
+    )
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：是" in report
 
 
 def test_fundamental_growth_not_sustained_shows_no():
-    report = _render(_make_stock_view(fundamental_growth_sustained=False))
-    assert "❌ 營收 YoY ≥ 10%，且具持續性：否" in report
+    """只有當營收與 EPS 都確定為 False 時，合併頭行才會是「否」——
+    單獨一邊 False、另一邊未知（None）不算數，見下面的 unknown 測試。"""
+    report = _render(
+        _make_stock_view(fundamental_growth_sustained=False, eps_growth_sustained=False)
+    )
+    assert "❌ 營收或 EPS YoY ≥ 10%，且具持續性：否" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：否" in report
 
 
 def test_fundamental_growth_sustained_unknown_shows_insufficient_data():
-    """預設值（未提供時）與明確傳入 None 都必須顯示「資料不足」，
-    不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——理由跟
-    法人籌碼／技術面那兩個 tri-state 欄位完全一樣。"""
-    report = _render(_make_stock_view(fundamental_growth_sustained=None))
-    assert "⚪ 營收 YoY ≥ 10%，且具持續性：資料不足" in report
-    assert "✅ 營收 YoY ≥ 10%，且具持續性" not in report
-    assert "❌ 營收 YoY ≥ 10%，且具持續性" not in report
+    """兩者都是預設值（None）時，合併頭行與兩條子項都必須顯示「資料
+    不足」，不能因為 Python 的 falsy 判斷把 None 誤判成 False（否）——
+    理由跟法人籌碼／技術面那兩個 tri-state 欄位完全一樣。"""
+    report = _render(_make_stock_view())
+    assert "⚪ 營收或 EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "✅ 營收或 EPS YoY ≥ 10%，且具持續性" not in report
+    assert "❌ 營收或 EPS YoY ≥ 10%，且具持續性" not in report
+
+
+def test_fundamental_growth_one_confirmed_false_one_unknown_stays_unconfirmed():
+    """營收確定為 False，但 EPS 還是未知（None）——合併結果不能因為
+    「至少有一邊確定」就順勢判成否；EPS 仍有可能是 True，所以頭行必須
+    維持「資料不足」，不能提早下結論。"""
+    report = _render(_make_stock_view(fundamental_growth_sustained=False))
+    assert "⚪ 營收或 EPS YoY ≥ 10%，且具持續性：資料不足" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：否" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
 
 
 def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
-    """基本面區塊的 True/False 與「訊號」區塊裡 fundamental 因子的分數
+    """基本面區塊的合併結果與「訊號」區塊裡 fundamental 因子的分數
     是兩件獨立的事：即使 fundamental 評分因子（單月最新 YoY）偏低，
-    3 個月的持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被合併
-    顯示。"""
+    營收的 3 個月持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被
+    合併顯示。"""
     report = _render(
         _make_stock_view(
             factor_scores={
@@ -479,15 +513,16 @@ def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
         )
     )
     assert "🔴 基本面：偏弱" in report
-    assert "✅ 營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "　營收 YoY ≥ 10%，且具持續性：是" in report
 
 
 def test_progress_checklist_shows_fundamental_growth_as_done():
-    """功能上線後，「📌 功能進度」清單裡的「基本面」項目要從 ⬜ 改成 ✅，
-    並且要清楚標註 v1 範圍僅涵蓋營收、EPS 尚未串接，避免讀者誤以為
-    已經含 EPS 判斷。"""
+    """功能上線後，「📌 功能進度」清單裡的「基本面」項目要從 ⬜ 改成
+    ✅，且文字要反映「營收或 EPS」的合併判斷已經上線，不再標註「EPS
+    尚未串接」。"""
     report = _render(_make_stock_view())
-    assert "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）" in report
+    assert "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性" in report
+    assert "EPS 尚未串接" not in report
     assert "⬜ 基本面" not in report
 
 
@@ -684,3 +719,111 @@ def test_utf16_length_matches_line_counting_rule():
     # based on len(text).
     assert len("😀") == 1  # sanity check: Python counts this as 1 code point
     assert utf16_length("😀") == 2
+
+
+# --- Full-size report length (10 stocks) -----------------------------------
+
+
+def _make_populated_stock_view(rank: int) -> ReportStockView:
+    """Every optional signal field given a real (non-None) value, plus
+    two common risk flags — a realistic "complete data, ordinary day"
+    stock. Deliberately does NOT include a 資料缺口 line or an
+    attention/disposition reason: those are exercised separately by
+    the overflow test below, since stacking them onto every one of 10
+    stocks is what actually breaks the length budget (see that test's
+    docstring)."""
+    return _make_stock_view(
+        rank=rank,
+        stock_id=f"{1000 + rank}",
+        stock_name="範例公司",
+        close_price=Decimal("999.99"),
+        change_percent=9.99,
+        risk_flags=("ONE_PRICE_LIMIT_UP", "HIGH_FIVE_DAY_RETURN"),
+        institutional_net_buy_3d_positive=True,
+        technical_low_with_rising_signal=True,
+        fundamental_growth_sustained=True,
+        eps_growth_sustained=True,
+        is_one_price_limit_up=True,
+        volume_ratio_20d=2.4,
+    )
+
+
+def test_full_report_with_ten_stocks_and_populated_signals_stays_within_line_limit():
+    """Guards MAX_LINE_TEXT_UTF16_UNITS against regressions like the
+    EPS sub-line addition: 10 stocks, each with every tri-state
+    signal populated (not None) and a couple of ordinary risk flags —
+    the shape a fully-scored, ordinary trading day actually produces.
+    Must not raise, and must stay within LINE's limit."""
+    stocks = [_make_populated_stock_view(rank=i) for i in range(1, 11)]
+
+    report = render_daily_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=42,
+        eligible_count=18,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+
+    assert utf16_length(report) <= MAX_LINE_TEXT_UTF16_UNITS
+
+
+def test_full_report_raises_helpful_error_when_data_gaps_and_flags_compound():
+    """
+    Documents a real, currently-unresolved boundary: 10 stocks that
+    each carry BOTH a 資料缺口 line (missing risk_quality inputs) AND
+    an attention-stock reason — a plausible, not even extreme,
+    combination on a volatile trading day — already exceeds
+    MAX_LINE_TEXT_UTF16_UNITS on its own, well before every possible
+    flag is stacked on. render_daily_report's ValueError guard is the
+    intended behavior here (see its own docstring: "consider trimming
+    ... or splitting into multiple messages") rather than a silent
+    truncation or a crash with no explanation — this test locks in
+    that the guard actually fires, with an actionable message, instead
+    of the report ever being silently cut off or sent malformed.
+
+    NOTE for a future PR: this boundary is uncomfortably close for a
+    completely ordinary combination of real-world signals (an
+    attention-stock reason plus one missing risk-quality input, times
+    10 stocks). Trimming per-stock output (e.g. shortening the
+    disposition/attention reason display, or capping missing_factor_
+    names to a top-N) is worth a dedicated follow-up rather than
+    silently living with more ValueError-triggered publish failures
+    as real fixtures get closer to this shape.
+    """
+    stocks = [
+        _make_stock_view(
+            rank=i,
+            stock_id=f"{1000 + i}",
+            stock_name="範例公司",
+            risk_flags=(
+                "ONE_PRICE_LIMIT_UP",
+                "HIGH_FIVE_DAY_RETURN",
+                "ATTENTION_STOCK",
+            ),
+            attention_reason="近期股價及成交量異常波動",
+            missing_factor_names=("risk_quality",),
+            risk_missing_inputs=("is_disposition", "is_managed"),
+            institutional_net_buy_3d_positive=True,
+            technical_low_with_rising_signal=True,
+            fundamental_growth_sustained=True,
+            eps_growth_sustained=False,
+        )
+        for i in range(1, 11)
+    ]
+
+    try:
+        render_daily_report(
+            trading_date=TRADING_DATE,
+            data_updated_at="16:47",
+            candidate_count=42,
+            eligible_count=18,
+            strategy_version="rule-v1.2.0",
+            ranked_stocks=stocks,
+            ranking_limit=10,
+        )
+        assert False, "expected render_daily_report to raise ValueError"
+    except ValueError as exc:
+        assert "5000-UTF16-unit" in str(exc)
+        assert "splitting into multiple messages" in str(exc)

@@ -56,7 +56,23 @@ through to ReportStockView so the report can render the "基本面" block
 institutional_net_buy_3d_positive/technical_low_with_rising_signal
 above — independent of the "fundamental" scoring factor already
 carried via factor_scores (that factor is built from the single
-newest revenue_yoy value; this signal looks at a 3-month window).
+newest revenue_yoy value; this signal looks at a 3-month window). At
+this point fundamental_growth_sustained is REVENUE ONLY.
+
+As of text-v11, also carries StockFeatures.eps_growth_sustained
+through to ReportStockView — the sibling signal to
+fundamental_growth_sustained above, sourced from TWSE/TPEx's
+financial-statement EPS pipeline instead of FinMind's monthly revenue
+(see app.domain.eps_growth_builder / app.ingestion.financial_statement_client).
+Deliberately passed through as its OWN field here too, NOT combined
+with fundamental_growth_sustained into a single value at this layer —
+per StockFeatures.fundamental_growth_sustained's own docstring, the
+revenue-OR-EPS combination (the ORIGINAL spec: "營收或 EPS YoY >=
+10%，且具持續性") is computed at the render layer instead (see
+app.reports.text_renderer._render_fundamental_growth_lines, which
+calls app.domain.eps_growth_builder.combine_fundamental_growth_signal
+on demand), so both components stay independently inspectable all the
+way through to the view model — this module included.
 """
 
 from __future__ import annotations
@@ -194,6 +210,7 @@ def build_report_stocks(
                     features.technical_low_with_rising_signal
                 ),
                 fundamental_growth_sustained=(features.fundamental_growth_sustained),
+                eps_growth_sustained=(features.eps_growth_sustained),
                 risk_missing_inputs=scored.risk_missing_inputs,
             )
         )

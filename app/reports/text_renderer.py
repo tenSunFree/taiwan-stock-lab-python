@@ -17,6 +17,8 @@ import datetime as dt
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+
 DISCLAIMER = (
     "本清單依公開市場資料及固定量化規則產生，"
     "僅供研究與資料整理，不構成買進、賣出或持有建議。"
@@ -198,10 +200,28 @@ class ReportStockView:
     # above. Independent of the "fundamental" scoring factor already
     # carried via factor_scores (that factor is built from a single
     # newest-month revenue_yoy value; this signal looks at a
-    # strictly-consecutive 3-month window instead). v1 scope is
-    # revenue only — EPS is a known data gap, not folded into this
-    # field yet.
+    # strictly-consecutive 3-month window instead). REVENUE ONLY — see
+    # eps_growth_sustained below for its EPS sibling, and
+    # _render_fundamental_growth_lines for where the two are combined
+    # into the report's single "基本面" determination.
     fundamental_growth_sustained: bool | None = None
+
+    # From StockFeatures — SIBLING of fundamental_growth_sustained
+    # above: whether quarterly EPS YoY growth has been sustained over
+    # its own trailing window (see
+    # app.domain.eps_growth_builder.build_eps_growth_sustained_signal),
+    # sourced from TWSE/TPEx's financial-statement pipeline rather
+    # than FinMind's monthly revenue. Same tri-state rendering
+    # convention as every other optional signal above. Kept as its OWN
+    # field rather than pre-combined with fundamental_growth_sustained
+    # — the ORIGINAL spec these two fields jointly answer is "營收或
+    # EPS YoY >= 10%，且具持續性" (revenue OR EPS), computed at render
+    # time by _render_fundamental_growth_lines via
+    # app.domain.eps_growth_builder.combine_fundamental_growth_signal's
+    # tri-state OR, so a reader can still see which component (revenue,
+    # EPS, or both) actually drove the combined result rather than that
+    # distinction being erased the moment either one becomes True.
+    eps_growth_sustained: bool | None = None
 
     # RiskAssessment.missing_inputs, carried all the way through
     # StockFeatures -> ScoredStock -> here. This is what lets the
@@ -446,37 +466,52 @@ def _render_technical_signal_lines(stock: ReportStockView) -> list[str]:
     return ["技術面", line]
 
 
-# --- 基本面 (revenue-growth-sustained, display-only tri-state) ----------------
+# --- 基本面 (revenue-or-EPS-growth-sustained, display-only tri-state) --------
 #
 # This is intentionally NOT the same thing as the "fundamental" entry
 # in factor_scores/訊號 above: that is a 0-100 normalized score built
 # from the SINGLE newest month's revenue_yoy, used in the weighted
-# total score. This block instead answers a narrower, literal
-# question — "has revenue YoY growth of >= 10% been sustained over the
-# trailing 3 STRICTLY CONSECUTIVE calendar months ending at the latest
-# known-available month, with the latest month itself required to
-# clear 10% and at most 1 soft month elsewhere in the window" — as a
-# plain yes/no/unknown fact, independent of scoring. "Strictly
-# consecutive" means a gap month inside the window (a required
-# calendar month with no resolvable data) is NEVER bridged by reaching
-# further back to an older month — it renders as "資料不足" (None)
-# below, not a guess from a partial window. v1 scope is revenue only;
-# EPS is a known data gap (see StockFeatures.fundamental_growth_sustained
-# and app.domain.monthly_revenue_builder's module docstring). See
+# total score. This block instead answers the ORIGINAL spec's literal
+# question — "has revenue OR EPS YoY growth of >= 10% been sustained
+# over each figure's own trailing window" (see
 # app.domain.monthly_revenue_builder.build_revenue_growth_sustained_signal
-# for the exact threshold, window, and no-look-ahead / no-best-effort
-# rules.
+# and app.domain.eps_growth_builder.build_eps_growth_sustained_signal
+# for the two exact, independent rules) — as a plain yes/no/unknown
+# fact, independent of scoring.
+#
+# The combined determination is computed HERE, at render time, via
+# app.domain.eps_growth_builder.combine_fundamental_growth_signal's
+# tri-state OR — never pre-combined upstream in StockFeatures or
+# ReportStockView (see both of those fields' own docstrings for why:
+# collapsing revenue/EPS into one stored value the moment either
+# becomes True would erase which component actually drove the result).
+# The two components are still shown as their own sub-lines below the
+# combined headline so a reader can see exactly that.
 
 
 def _render_fundamental_growth_lines(stock: ReportStockView) -> list[str]:
-    value = stock.fundamental_growth_sustained
-    if value is None:
-        line = "⚪ 營收 YoY ≥ 10%，且具持續性：資料不足"
-    elif value:
-        line = "✅ 營收 YoY ≥ 10%，且具持續性：是"
+    combined = combine_fundamental_growth_signal(
+        revenue=stock.fundamental_growth_sustained, eps=stock.eps_growth_sustained
+    )
+
+    def _sub_line(label: str, value: bool | None) -> str:
+        if value is None:
+            return f"　{label}：資料不足"
+        return f"　{label}：{'是' if value else '否'}"
+
+    if combined is None:
+        headline = "⚪ 營收或 EPS YoY ≥ 10%，且具持續性：資料不足"
+    elif combined:
+        headline = "✅ 營收或 EPS YoY ≥ 10%，且具持續性：是"
     else:
-        line = "❌ 營收 YoY ≥ 10%，且具持續性：否"
-    return ["基本面", line]
+        headline = "❌ 營收或 EPS YoY ≥ 10%，且具持續性：否"
+
+    return [
+        "基本面",
+        headline,
+        _sub_line("營收 YoY ≥ 10%，且具持續性", stock.fundamental_growth_sustained),
+        _sub_line("EPS YoY ≥ 10%，且具持續性", stock.eps_growth_sustained),
+    ]
 
 
 # --- 漲停結構 (Phase A subset — no intraday data yet) --------------------------
@@ -632,7 +667,8 @@ def render_daily_report(
         "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
         "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
         "✅ 技術面：低檔且具起漲訊號",
-        "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）",
+        "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+        "⬜ 技術面：低檔首板",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
         "資料概況",
@@ -678,11 +714,11 @@ def render_daily_report(
                 "不會改變「訊號」區塊中動能因子的評分結果。"
             ),
             (
-                "「基本面」區塊顯示最近連續 3 個曆月的已公布月營收中，"
-                "最新月 YoY 是否 ≥ 10%，且至少 2 個月 YoY ≥ 10%，"
-                "用以判斷成長是否具持續性；若其中任一月缺漏或無法計算，"
-                "則顯示「資料不足」，不會以較早的月份遞補湊滿 3 個月。"
-                "目前僅採用月營收資料，EPS／財報資料尚未串接，"
+                "「基本面」區塊顯示營收與 EPS 各自的持續成長判斷（營收看最近"
+                "連續 3 個曆月已公布月營收，EPS 看最近連續季的財報 YoY），"
+                "並以兩者的「或」關係判斷整體是否具持續性——只要營收或 EPS "
+                "任一項成立即視為是；若其中任一月／任一季缺漏或無法計算，"
+                "該項即顯示「資料不足」，不會以較早的期間遞補湊滿窗口。"
                 "為獨立於綜合分數之外的參考訊號，"
                 "不會改變「訊號」區塊中基本面因子的評分結果。"
             ),
@@ -729,7 +765,8 @@ def render_no_qualified_stock_report(
             "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
             "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
             "✅ 技術面：低檔且具起漲訊號",
-            "✅ 基本面：營收 YoY ≥ 10%，且具持續性（EPS 尚未串接）",
+            "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+            "⬜ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
             "資料概況",

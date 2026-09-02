@@ -84,6 +84,10 @@ a later phase (see [Roadmap](#roadmap)).
   is exposed), so a backfill run for a past `TARGET_TRADING_DATE`
   will correctly fail this one source rather than risk mismatching a
   different day's data
+- Financial-statement (EPS) ingestion from TWSE's `t187ap06_L_ci` and
+  TPEx's `t187ap06_O_ci` general-industry quarterly income-statement
+  open data — see Enrichment (TWSE / TPEx Financial Statements) below
+  for the full pipeline, including revision-safe availability dating
 - Legally correct tick-size table and limit-up price calculation using
   `Decimal` arithmetic, verified against the official TWSE worked
   example (reference price 40.60 → limit-up price 44.65) and against a
@@ -154,13 +158,52 @@ a later phase (see [Roadmap](#roadmap)).
   month (never "whichever 3 calendar months happen to have data"), so
   a gap inside the window (a missing calendar month) is never silently
   bridged by an older month — it makes the whole signal `None` rather
-  than a partial-window guess. v1 scope is revenue only —
-  EPS/financial-statement data is not yet ingested (see Roadmap's
-  Known data gaps)
+  than a partial-window guess
 - Each enrichment type (price history, institutional flow, monthly
   revenue) fails **independently**: one FinMind endpoint being briefly
   unavailable never clears factors already computed from another
   successful fetch for the same stock
+
+### Enrichment (TWSE / TPEx Financial Statements — EPS)
+
+- A separate, dedicated ingestion path from FinMind's enrichment
+  above: TWSE's `t187ap06_L_ci` (JSON) and TPEx's `t187ap06_O_ci`
+  (CSV) general-industry quarterly comprehensive-income-statement open
+  data, fetched once for the WHOLE market per run (same tier as the
+  TWSE/TPEx price/valuation/regulatory snapshots), not per-candidate —
+  neither endpoint has FinMind's per-stock rate limit, so there's no
+  reason to repeat the call for every candidate
+- TWSE/TPEx report cumulative (year-to-date) EPS per quarter, not
+  standalone per-quarter figures — verified directly against real
+  台泥/1101 data. A dedicated converter reconstructs genuine
+  standalone quarterly EPS (`Q2 = H1 cumulative − Q1 cumulative`, etc.)
+  before any YoY comparison is made
+- A revision-safe, append-only observation table
+  (`eps_cumulative_observations`) records the first calendar date this
+  pipeline itself ever observed each distinct `(stock_id, fiscal_year,
+  quarter, cumulative_eps)` VALUE — keying on the value itself, not
+  just the period, so a later restatement (TWSE revising a prior
+  quarter's EPS) gets its own new `first_seen_at` rather than
+  inheriting the original disclosure's date, which would otherwise
+  reintroduce look-ahead bias for a figure the market didn't actually
+  know at the time. When `DATABASE_URL` isn't configured for a given
+  run, this degrades gracefully to the dataset's own `出表日期` (batch
+  report date) — a real, observed date, never a synthetic one — rather
+  than failing the run
+- An independent EPS-growth-sustained display signal (`bool | None`),
+  the direct sibling of the revenue-growth-sustained signal above:
+  whether standalone quarterly EPS YoY has cleared `>= 10%` and been
+  sustained across the required trailing quarters. Kept as its own
+  field end-to-end (never pre-combined with the revenue signal in
+  `StockFeatures` or `ReportStockView`) — the "revenue OR EPS"
+  combination is computed on demand at the report-rendering layer
+  instead, so a reader can always see which component actually drove
+  the combined result (see Report Rendering below)
+- Fails non-fatally at the whole-market level, same policy as the
+  regulatory (attention/disposition) sources above: a fetch/parse
+  failure on either TWSE's or TPEx's endpoint simply leaves that
+  market's candidates with `eps_growth_sustained = None` for the run,
+  never silently treated as "confirmed not sustained"
 
 ### Risk Policy
 
@@ -310,9 +353,18 @@ a later phase (see [Roadmap](#roadmap)).
   consecutive calendar months `>= 10%`) — so the two can legitimately
   disagree for the same stock (e.g. a strong single-month YoY that
   hasn't yet been sustained, or vice versa) without that being a
-  contradiction. v1 scope is revenue only; the functional-progress
-  checklist line explicitly notes "（EPS 尚未串接）" so readers aren't
-  misled into thinking EPS is already factored into this signal
+  contradiction
+- As of `text-v11`, the 基本面 section's headline answers the
+  ORIGINALLY intended question — "has revenue OR EPS YoY growth of
+  `>= 10%` been sustained" — combined via a tri-state OR at render
+  time from the independent revenue and EPS signals above (`✅` yes /
+  `❌` no, only when BOTH components are confirmed `False` / `⚪`
+  unconfirmed, if either component is still unknown and neither is
+  confirmed `True`). The two underlying components are still shown as
+  their own sub-lines beneath the combined headline, so a reader can
+  see exactly whether revenue, EPS, or both actually drove the
+  result — the combination never erases that distinction the moment
+  either component becomes `True`
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -349,7 +401,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v10`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v11`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -407,15 +459,19 @@ a later phase (see [Roadmap](#roadmap)).
   reference-price source and is not reconstructed from raw closing
   prices, since doing so would violate this project's own rule
   against inferring limit-up status via "previous close × 1.10."
-  EPS/financial-statement data (FinMind's income-statement dataset) is
-  not yet ingested, so `fundamental_growth_sustained` currently
-  measures revenue-growth persistence only, not the originally
-  intended "revenue OR EPS" condition — the report's functional-
-  progress checklist explicitly marks this as "（EPS 尚未串接）" rather
-  than silently treating revenue-only as the complete rule. All
-  remaining gaps are logged as an explicit warning on every run rather
-  than silently assumed fixed, and are reflected per-stock in the
-  report's dynamic "資料缺口" line (see Report Rendering above).
+  EPS/financial-statement data is now ingested (TWSE's `t187ap06_L_ci`
+  + TPEx's `t187ap06_O_ci` — see Enrichment above), so the report's
+    基本面 section now answers the originally intended "revenue OR EPS"
+    condition rather than revenue alone. The revision-safe
+    `eps_cumulative_observations` table this relies on for a precise
+    `first_seen_at` is optional at runtime, not a hard requirement: when
+    `DATABASE_URL` isn't configured, the pipeline still computes
+    `eps_growth_sustained` correctly, just with coarser (dataset-batch-
+    level rather than first-truly-observed) availability dating — see
+    Enrichment above. All remaining gaps are logged as an explicit
+    warning on every run rather than silently assumed fixed, and are
+    reflected per-stock in the report's dynamic "資料缺口" line (see
+    Report Rendering above).
 
 ---
 
@@ -577,6 +633,24 @@ pytest -v
   month (missing current-side point, or missing/non-positive
   previous-year denominator) makes the whole signal `None` rather than
   a partial-window guess
+- EPS pipeline tests spanning every layer independently plus one
+  end-to-end integration test: `financial_statement_client.py`'s TWSE
+  JSON / TPEx CSV fetch and parse (including a real-shaped BOM-prefixed
+  TPEx CSV response, to catch a BOM leaking into the first header's
+  key and silently making every row look like it's missing that
+  field), `eps_mapper.py`'s row-dropping rules, `eps_period_converter.py`'s
+  cumulative-to-standalone conversion, `eps_growth_builder.py`'s YoY
+  and sustained-growth threshold/window logic and its revenue-OR-EPS
+  tri-state combiner's full truth table, `eps_observation_repository.py`'s
+  revision-safety guarantee (a restated value gets a new row and a new
+  `first_seen_at`; re-observing an unchanged value never overwrites the
+  original `first_seen_at`, proven with a case where naive `float`
+  comparison would otherwise wrongly treat two textually-identical
+  figures as different due to binary floating-point noise), and one
+  full `daily_ranking.run()` integration test that feeds a real
+  TWSE `t187ap06_L_ci`-shaped JSON response all the way through to the
+  actual rendered report text — not just verified piecewise the way
+  each layer's own unit tests do it
 - Regulatory-mapper tests (TWSE HTML via `twse_regulatory_mapper.py`,
   TPEx JSON via `regulatory_mapper.py`) covering exact-announcement-date
   matching for attention data vs active-period matching for
@@ -607,10 +681,14 @@ pytest -v
   tri-state rendering test confirming it stays independent of the
   "momentum" signal-light score for the same stock, and a 基本面
   tri-state rendering test confirming it stays independent of the
-  "fundamental" signal-light score for the same stock (including a
-  progress-checklist regression test confirming the "基本面" line
-  correctly flips from ⬜ to ✅ with its "（EPS 尚未串接）" scope
-  annotation intact)
+  "fundamental" signal-light score for the same stock, dedicated tests
+  for the revenue-OR-EPS combined headline's tri-state-OR truth table
+  (including the case where one component is confirmed `False` and the
+  other is still unknown — the combined result must stay unconfirmed,
+  never prematurely resolve to "否" just because one side already has
+  an answer), and a progress-checklist regression test confirming the
+  "基本面" line correctly flips from ⬜ to ✅ with wording that no
+  longer claims EPS isn't wired in
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, that a
@@ -650,8 +728,10 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   features.py               StockFeatures, including risk_missing_inputs
                             (carried through from RiskAssessment),
                             institutional_net_buy_3d_positive,
-                            technical_low_with_rising_signal, and
-                            fundamental_growth_sustained (all display-only)
+                            technical_low_with_rising_signal,
+                            fundamental_growth_sustained (revenue-only),
+                            and eps_growth_sustained (its independent
+                            EPS sibling — all display-only)
   candidate_builder.py     Common-stock filtering + turnover ranking
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
@@ -679,16 +759,32 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   scoring.py / normalization.py
                              Multi-factor scoring, Top-N selection, and
                              risk_missing_inputs propagation to ScoredStock
+  eps_growth_builder.py       Standalone quarterly EPS YoY + sustained-growth
+                            signal, and the revenue-OR-EPS tri-state OR
+                            combiner used at the report-rendering layer
 
 app/ingestion/        Data source integration
   trading_calendar.py     Trading-day checks
   market_data_client.py    Raw-snapshot-first ingestion clients with retry,
                             including TWSE/TPEx attention + disposition fetches
+  financial_statement_client.py
+                             Unified TWSE (t187ap06_L_ci JSON) / TPEx
+                            (t187ap06_O_ci CSV) financial-statement fetch
+                            client + row parsers, feeding the EPS pipeline
   finmind_mapper.py / twse_mapper.py / tpex_mapper.py
                              Provider-specific row parsing
   valuation_mapper.py       TWSE/TPEx P/E ratio row parsing
   regulatory_mapper.py       TPEx attention/disposition JSON parsing
   twse_regulatory_mapper.py  TWSE attention/disposition HTML parsing
+  eps_mapper.py               Raw cumulative-EPS row parsing (TWSE/TPEx
+                            general-industry income-statement rows)
+  eps_availability_resolver.py
+                             Resolves each EPS point's look-ahead-safe
+                            available_at: first_seen_at (from the revision-
+                            safe observation DB) when known, else the
+                            dataset's own batch report date
+  eps_period_converter.py    Converts cumulative (year-to-date) EPS into
+                            genuine standalone per-quarter EPS
 
 app/reports/           Report rendering
   report_builder.py         ScoredStock + StockFeatures -> ReportStockView
@@ -696,8 +792,10 @@ app/reports/           Report rendering
                             factor_scores, volume_ratio_20d,
                             institutional_net_buy_3d_positive,
                             technical_low_with_rising_signal,
-                            fundamental_growth_sustained, and
-                            risk_missing_inputs
+                            fundamental_growth_sustained,
+                            eps_growth_sustained, and risk_missing_inputs —
+                            revenue and EPS are passed through as their OWN
+                            independent fields, never pre-combined here
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
                             overheating override), tri-state regulatory
@@ -705,8 +803,10 @@ app/reports/           Report rendering
                             active-period wording, a 法人籌碼 tri-state
                             institutional net-buy display, a 技術面
                             tri-state low-position/early-rally display, a
-                            基本面 tri-state revenue-growth-sustained
-                            display, limit-up structure, and a
+                            基本面 section combining revenue and EPS
+                            growth-sustained via a tri-state OR at render
+                            time (with both components still shown as
+                            sub-lines), limit-up structure, and a
                             dynamically built risk_quality gap explanation
 
 app/clients/           External API clients
@@ -717,7 +817,22 @@ app/delivery/          Delivery orchestration
   service.py                 Reserve -> send -> mark-success/failed, for both Push and Broadcast
 
 app/db/                SQLAlchemy ORM models
+  models.py                    IngestionRun, RawSourcePayloadRow,
+                            MessageDelivery, and the revision-safe
+                            EpsCumulativeObservation table (unique on
+                            stock_id + fiscal_year + quarter +
+                            cumulative_eps, so a restated figure gets its
+                            own row and its own first_seen_at rather than
+                            overwriting the original disclosure's)
   delivery_repository.py     Delivery idempotency persistence
+  eps_observation_repository.py
+                             Revision-safe first_seen_at read/write —
+                            observe() never overwrites an existing row's
+                            first_seen_at once a given EPS value has been
+                            recorded once, the same crash/concurrency-safe
+                            "insert, catch the UNIQUE-constraint conflict,
+                            return the existing row" pattern as
+                            delivery_repository.py
 
 app/jobs/              Scheduled job entry points
   daily_ranking.py            Full pipeline orchestration
