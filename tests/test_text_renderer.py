@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from app.reports.text_renderer import (
     DISCLAIMER,
+    MAX_LINE_TEXT_UTF16_UNITS,
     ReportStockView,
     render_daily_report,
     render_no_qualified_stock_report,
@@ -718,3 +719,111 @@ def test_utf16_length_matches_line_counting_rule():
     # based on len(text).
     assert len("😀") == 1  # sanity check: Python counts this as 1 code point
     assert utf16_length("😀") == 2
+
+
+# --- Full-size report length (10 stocks) -----------------------------------
+
+
+def _make_populated_stock_view(rank: int) -> ReportStockView:
+    """Every optional signal field given a real (non-None) value, plus
+    two common risk flags — a realistic "complete data, ordinary day"
+    stock. Deliberately does NOT include a 資料缺口 line or an
+    attention/disposition reason: those are exercised separately by
+    the overflow test below, since stacking them onto every one of 10
+    stocks is what actually breaks the length budget (see that test's
+    docstring)."""
+    return _make_stock_view(
+        rank=rank,
+        stock_id=f"{1000 + rank}",
+        stock_name="範例公司",
+        close_price=Decimal("999.99"),
+        change_percent=9.99,
+        risk_flags=("ONE_PRICE_LIMIT_UP", "HIGH_FIVE_DAY_RETURN"),
+        institutional_net_buy_3d_positive=True,
+        technical_low_with_rising_signal=True,
+        fundamental_growth_sustained=True,
+        eps_growth_sustained=True,
+        is_one_price_limit_up=True,
+        volume_ratio_20d=2.4,
+    )
+
+
+def test_full_report_with_ten_stocks_and_populated_signals_stays_within_line_limit():
+    """Guards MAX_LINE_TEXT_UTF16_UNITS against regressions like the
+    EPS sub-line addition: 10 stocks, each with every tri-state
+    signal populated (not None) and a couple of ordinary risk flags —
+    the shape a fully-scored, ordinary trading day actually produces.
+    Must not raise, and must stay within LINE's limit."""
+    stocks = [_make_populated_stock_view(rank=i) for i in range(1, 11)]
+
+    report = render_daily_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=42,
+        eligible_count=18,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+
+    assert utf16_length(report) <= MAX_LINE_TEXT_UTF16_UNITS
+
+
+def test_full_report_raises_helpful_error_when_data_gaps_and_flags_compound():
+    """
+    Documents a real, currently-unresolved boundary: 10 stocks that
+    each carry BOTH a 資料缺口 line (missing risk_quality inputs) AND
+    an attention-stock reason — a plausible, not even extreme,
+    combination on a volatile trading day — already exceeds
+    MAX_LINE_TEXT_UTF16_UNITS on its own, well before every possible
+    flag is stacked on. render_daily_report's ValueError guard is the
+    intended behavior here (see its own docstring: "consider trimming
+    ... or splitting into multiple messages") rather than a silent
+    truncation or a crash with no explanation — this test locks in
+    that the guard actually fires, with an actionable message, instead
+    of the report ever being silently cut off or sent malformed.
+
+    NOTE for a future PR: this boundary is uncomfortably close for a
+    completely ordinary combination of real-world signals (an
+    attention-stock reason plus one missing risk-quality input, times
+    10 stocks). Trimming per-stock output (e.g. shortening the
+    disposition/attention reason display, or capping missing_factor_
+    names to a top-N) is worth a dedicated follow-up rather than
+    silently living with more ValueError-triggered publish failures
+    as real fixtures get closer to this shape.
+    """
+    stocks = [
+        _make_stock_view(
+            rank=i,
+            stock_id=f"{1000 + i}",
+            stock_name="範例公司",
+            risk_flags=(
+                "ONE_PRICE_LIMIT_UP",
+                "HIGH_FIVE_DAY_RETURN",
+                "ATTENTION_STOCK",
+            ),
+            attention_reason="近期股價及成交量異常波動",
+            missing_factor_names=("risk_quality",),
+            risk_missing_inputs=("is_disposition", "is_managed"),
+            institutional_net_buy_3d_positive=True,
+            technical_low_with_rising_signal=True,
+            fundamental_growth_sustained=True,
+            eps_growth_sustained=False,
+        )
+        for i in range(1, 11)
+    ]
+
+    try:
+        render_daily_report(
+            trading_date=TRADING_DATE,
+            data_updated_at="16:47",
+            candidate_count=42,
+            eligible_count=18,
+            strategy_version="rule-v1.2.0",
+            ranked_stocks=stocks,
+            ranking_limit=10,
+        )
+        assert False, "expected render_daily_report to raise ValueError"
+    except ValueError as exc:
+        assert "5000-UTF16-unit" in str(exc)
+        assert "splitting into multiple messages" in str(exc)

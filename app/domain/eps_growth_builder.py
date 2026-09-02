@@ -56,6 +56,27 @@ quarter at a time from the latest known-available quarter (e.g.
 backward at Q1. A gap quarter inside the window is never bridged by
 an older quarter — it makes the whole signal None, exactly like a
 missing calendar month does for revenue.
+
+KNOWN LIMITATION — seasonal blind spot while Q4 conversion is
+pending: app.ingestion.eps_period_converter.build_standalone_eps_points
+does not yet emit a standalone Q4 QuarterlyEpsPoint (see that
+module's own docstring for why — the FY-cumulative-minus-9M-cumulative
+subtraction has not been independently verified). Because
+build_eps_growth_sustained_signal's default 2-quarter window always
+needs the quarter immediately before the latest one, whenever the
+newest available standalone quarter is Q1, the window requires last
+year's Q4 — which never exists yet. During that period each year
+(roughly from Q1's disclosure season until Q2's figures are
+converted, i.e. spring/early summer), eps_growth_sustained resolves
+to None for every stock, not a computed True/False.
+
+This is intentional under this project's "never guess, fail closed"
+convention rather than a bug — but it is a real, multi-month-per-year
+availability gap that report readers and any future caller of this
+module should be aware of. It closes automatically, with no change
+needed here, once eps_period_converter gains Q4 support (see the
+project README's Roadmap known gaps) — this module only reacts to
+whatever QuarterlyEpsPoint values it's given.
 """
 
 from __future__ import annotations

@@ -55,13 +55,20 @@ class RawCumulativeEps:
     batch_report_date: dt.date  # NOT a disclosure date — see module docstring
 
 
-def _parse_roc_date(roc_date_str: str) -> dt.date | None:
+def _parse_roc_date(roc_date_str: object) -> dt.date | None:
     """
     Parse a ROC-calendar date string as used in TWSE's `出表日期`
     field (e.g. "1150831" -> 2026-08-31: the last 4 digits are MMDD,
     everything before that is the ROC year). Returns None — never
     raises — on any malformed input, so the caller can drop a single
     corrupt row instead of aborting the whole batch.
+
+    Accepts `object`, not `str`, on purpose: TWSE/TPEx's JSON
+    responses do not guarantee every field is typed as a string (a
+    batch report date could in principle come back as a bare int).
+    Calling .strip()/len() on a non-string value would raise instead
+    of letting the caller cleanly drop just this one row, so the
+    isinstance check below runs BEFORE any string method is touched.
 
     NOTE: if this project's app.ingestion.twse_mapper (or tpex_mapper)
     already exposes a shared ROC-date parser used for other TWSE/TPEx
@@ -72,7 +79,7 @@ def _parse_roc_date(roc_date_str: str) -> dt.date | None:
     and signature were not available to verify at the time this
     module was written.
     """
-    if not roc_date_str or len(roc_date_str) < 5:
+    if not isinstance(roc_date_str, str) or len(roc_date_str) < 5:
         return None
     try:
         roc_year = int(roc_date_str[:-4])
@@ -94,7 +101,7 @@ def build_raw_cumulative_eps_points(
 
     A row is DROPPED (excluded from the result, never guessed at or
     substituted), rather than raising, when:
-    - `公司代號` (stock_id) is missing or empty
+    - `公司代號` (stock_id) is missing, empty, or not a string
     - `年度` (fiscal year, ROC) or `季別` (quarter) is missing or
       can't be parsed as an integer, or the parsed quarter isn't 1-4
     - `基本每股盈餘（元）` (cumulative EPS) is missing, empty, or
@@ -103,17 +110,27 @@ def build_raw_cumulative_eps_points(
       via a DIFFERENT TWSE/TPEx endpoint (t187ap06_X_fh / _basi / _bd
       / _ins) with different column layouts, not this general-
       industry one
-    - `出表日期` (batch report date) is missing or can't be parsed as
-      a ROC date
+    - `出表日期` (batch report date) is missing, not a string, or
+      can't be parsed as a ROC date
 
     This mirrors this project's existing fail-closed-per-row
     convention elsewhere (e.g. finmind_mapper.build_monthly_revenue_
     points: a malformed row is silently excluded, never guessed at).
+
+    Field values are not guaranteed to be strings by the source APIs
+    (a JSON response could, in principle, type a field as a number
+    instead of the expected string) — every field that goes through a
+    string method below is isinstance-checked FIRST, so one row with
+    an unexpected type is dropped on its own rather than raising and
+    aborting the whole batch.
     """
     points: list[RawCumulativeEps] = []
 
     for row in rows:
-        stock_id = (row.get("公司代號") or "").strip()
+        stock_id_raw = row.get("公司代號")
+        if not isinstance(stock_id_raw, str):
+            continue
+        stock_id = stock_id_raw.strip()
         if not stock_id:
             continue
 
@@ -139,7 +156,7 @@ def build_raw_cumulative_eps_points(
         except (ValueError, TypeError):
             continue
 
-        batch_report_date = _parse_roc_date(row.get("出表日期") or "")
+        batch_report_date = _parse_roc_date(row.get("出表日期"))
         if batch_report_date is None:
             continue
 
