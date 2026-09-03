@@ -37,12 +37,24 @@ def percentile_score(series: pd.Series, higher_is_better: bool = True) -> pd.Ser
     return score
 
 
+# Momentum scoring thresholds, pulled out as named module-level
+# constants (rather than living only inside bounded_momentum_score's
+# own parameter defaults) so other layers — notably
+# app.reports.signal_explainer, which needs to describe WHY a given
+# return_5d landed in a particular band — can import the exact same
+# numbers instead of hardcoding a second copy that could silently
+# drift out of sync with this function's actual behavior.
+MOMENTUM_IDEAL_LOW = 0.03
+MOMENTUM_IDEAL_HIGH = 0.15
+MOMENTUM_DANGEROUS_HIGH = 0.40
+
+
 def bounded_momentum_score(
     returns: pd.Series,
     *,
-    ideal_low: float = 0.03,
-    ideal_high: float = 0.15,
-    dangerous_high: float = 0.40,
+    ideal_low: float = MOMENTUM_IDEAL_LOW,
+    ideal_high: float = MOMENTUM_IDEAL_HIGH,
+    dangerous_high: float = MOMENTUM_DANGEROUS_HIGH,
 ) -> pd.Series:
     """
     Non-monotonic momentum scoring:

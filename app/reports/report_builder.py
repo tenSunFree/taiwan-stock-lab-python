@@ -73,6 +73,20 @@ app.reports.text_renderer._render_fundamental_growth_lines, which
 calls app.domain.eps_growth_builder.combine_fundamental_growth_signal
 on demand), so both components stay independently inspectable all the
 way through to the view model — this module included.
+
+As of text-v12 (explainable signals), also carries the RAW inputs
+that actually feed each of the six scoring factors — turnover,
+average_turnover_20d, return_5d, return_20d,
+institutional_net_buy_ratio_5d, revenue_yoy, risk_quality_raw —
+through to ReportStockView. These are consumed by
+app.reports.signal_explainer to turn each factor_scores[key] into
+verifiable, template-based reasons (see that module's own docstring
+for exactly which raw field feeds which factor — the mapping matters,
+e.g. "liquidity" is scored on turnover alone, never on
+turnover/average_turnover_20d). Same required-not-optional status as
+StockFeatures itself: every ranked stock_id is guaranteed a matching
+StockFeatures entry, so these fields are always populated from that
+same entry, never defaulted independently.
 """
 
 from __future__ import annotations
@@ -203,6 +217,20 @@ def build_report_stocks(
                 ),
                 factor_scores=dict(scored.factor_scores),
                 volume_ratio_20d=features.volume_ratio_20d,
+                # --- text-v12: raw inputs behind each factor score, for
+                # app.reports.signal_explainer. See that module's
+                # docstring for the exact factor <-> raw-field mapping
+                # (e.g. "liquidity" is scored on turnover alone, never
+                # on turnover/average_turnover_20d).
+                turnover=features.turnover,
+                average_turnover_20d=features.average_turnover_20d,
+                return_5d=features.return_5d,
+                return_20d=features.return_20d,
+                institutional_net_buy_ratio_5d=(
+                    features.institutional_net_buy_ratio_5d
+                ),
+                revenue_yoy=features.revenue_yoy,
+                risk_quality_raw=features.risk_quality_raw,
                 institutional_net_buy_3d_positive=(
                     features.institutional_net_buy_3d_positive
                 ),

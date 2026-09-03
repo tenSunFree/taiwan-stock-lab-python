@@ -9,6 +9,20 @@ LLM output fails schema/content validation (see Roadmap).
 Output must never use promotional or advisory language ("必買",
 "明牌", "保證獲利", "最佳買點" etc.) and must always include the
 research disclaimer verbatim.
+
+As of text-v12 (explainable signals), the "訊號" block no longer just
+prints a bare word per factor — it delegates to
+app.reports.signal_explainer, which turns each factor's raw
+StockFeatures input + its already-computed 0-100 score into fixed,
+template-based, verifiable reasons. This module still owns 100% of
+the emoji/level-word decisions (_signal_emoji / _signal_word /
+_momentum_signal_word below) — signal_explainer only explains WHY a
+score landed where it did, it never decides the color or the word.
+Whether a score is "候選池相對" (pool-relative percentile) or "絕對
+規則" (an absolute rule, momentum only) is rendered here, directly
+next to the score, rather than as an extra reason bullet from
+signal_explainer — kept here rather than duplicated per-factor to
+stay within LINE's per-message character budget.
 """
 
 from __future__ import annotations
@@ -18,6 +32,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+from app.reports import signal_explainer as se
 
 DISCLAIMER = (
     "本清單依公開市場資料及固定量化規則產生，"
@@ -159,6 +174,19 @@ class ReportStockView:
     # history), rendered as an explicit "資料不足", never silently
     # omitted (see _render_limit_up_structure_lines).
     volume_ratio_20d: float | None = None
+
+    # --- text-v12: raw factor inputs, consumed by
+    # app.reports.signal_explainer to explain factor_scores above.
+    # See that module's docstring for the exact factor <-> raw-field
+    # mapping (e.g. "liquidity" is scored on turnover ALONE, never on
+    # turnover/average_turnover_20d — that ratio is supplemental-only).
+    turnover: float | None = None
+    average_turnover_20d: float | None = None
+    return_5d: float | None = None
+    return_20d: float | None = None
+    institutional_net_buy_ratio_5d: float | None = None
+    revenue_yoy: float | None = None
+    risk_quality_raw: float | None = None
 
     # From StockFeatures — DISPLAY-ONLY signal for the "法人籌碼"
     # block: whether cumulative institutional net-buy shares over the
@@ -322,19 +350,111 @@ def _momentum_signal_word(score: float | None, risk_flags: tuple[str, ...]) -> s
     return _signal_word(score)
 
 
-def _render_signal_lines(
-    factor_scores: dict[str, float | None], risk_flags: tuple[str, ...]
+def _render_factor_block(
+    *,
+    key: str,
+    label: str,
+    score: float | None,
+    risk_flags: tuple[str, ...],
+    explanation: se.FactorExplanation,
 ) -> list[str]:
+    """
+    One factor's full block: emoji + level word + score (+ pool-
+    relative/absolute-rule qualifier), then its verifiable reasons/
+    confirmed/missing/supplemental lines, then a data-status line
+    (omitted when data_status == "完整" — the common, unremarkable
+    case — to keep each block short; "部分缺失"/"資料不足" are the
+    cases a reader actually needs flagged). The emoji/word decision
+    stays entirely with _signal_emoji/_signal_word/_momentum_signal_word
+    above — this function (and signal_explainer) never re-derive or
+    override those.
+    """
+    emoji = _signal_emoji(score)
+    word = (
+        _momentum_signal_word(score, risk_flags)
+        if key == "momentum"
+        else _signal_word(score)
+    )
+    header = f"{emoji} {label}：{word}"
+    if score is not None:
+        qualifier = "絕對規則" if key == "momentum" else "候選池相對"
+        header += f"｜{score:.0f}/100（{qualifier}）"
+
+    lines = [header]
+    if explanation.reasons:
+        lines.extend(f"• {reason}" for reason in explanation.reasons)
+    if explanation.confirmed:
+        lines.append("已確認：")
+        lines.extend(f"• {item}" for item in explanation.confirmed)
+    if explanation.missing:
+        lines.append("缺失：")
+        lines.extend(f"• {item}" for item in explanation.missing)
+    if explanation.supplemental:
+        lines.append("補充：")
+        lines.extend(f"• {item}" for item in explanation.supplemental)
+    if explanation.data_status != "完整":
+        lines.append(f"資料狀態：{explanation.data_status}")
+    return lines
+
+
+def _render_signal_lines(stock: ReportStockView) -> list[str]:
+    """
+    Builds the "訊號" block: one _render_factor_block per factor, each
+    fed by its own app.reports.signal_explainer.explain_* function —
+    see that module's docstring for exactly which raw field feeds
+    which factor (the mapping matters; e.g. "fundamental" is scored on
+    revenue_yoy alone, never on fundamental_growth_sustained/
+    eps_growth_sustained, which stay in their own separate "基本面"
+    block below via _render_fundamental_growth_lines).
+    """
+    scores = stock.factor_scores
+    risk_flags = stock.risk_flags
+
+    explanations: dict[str, se.FactorExplanation] = {
+        "liquidity": se.explain_liquidity(
+            turnover=stock.turnover,
+            average_turnover_20d=stock.average_turnover_20d,
+            score=scores.get("liquidity"),
+        ),
+        "volume_price": se.explain_volume_price(
+            volume_ratio_20d=stock.volume_ratio_20d,
+            score=scores.get("volume_price"),
+        ),
+        "momentum": se.explain_momentum(
+            return_5d=stock.return_5d,
+            return_20d=stock.return_20d,
+            score=scores.get("momentum"),
+            risk_flags=risk_flags,
+        ),
+        "institutional": se.explain_institutional(
+            institutional_net_buy_ratio_5d=stock.institutional_net_buy_ratio_5d,
+            score=scores.get("institutional"),
+        ),
+        "fundamental": se.explain_fundamental(
+            revenue_yoy=stock.revenue_yoy,
+            score=scores.get("fundamental"),
+        ),
+        "risk_quality": se.explain_risk_quality(
+            risk_quality_raw=stock.risk_quality_raw,
+            score=scores.get("risk_quality"),
+            risk_flags=risk_flags,
+            risk_missing_inputs=stock.risk_missing_inputs,
+        ),
+    }
+
     lines = ["訊號"]
     for key, label in _SIGNAL_FACTOR_ORDER:
-        score = factor_scores.get(key)
-        word = (
-            _momentum_signal_word(score, risk_flags)
-            if key == "momentum"
-            else _signal_word(score)
+        lines.extend(
+            _render_factor_block(
+                key=key,
+                label=label,
+                score=scores.get(key),
+                risk_flags=risk_flags,
+                explanation=explanations[key],
+            )
         )
-        lines.append(f"{_signal_emoji(score)} {label}：{word}")
-    return lines
+        lines.append("")  # 因子間空一行，避免整段黏在一起
+    return lines[:-1]  # 去掉最後多的空行
 
 
 # --- 監管狀態 (tri-state regulatory status) -----------------------------------
@@ -391,8 +511,8 @@ def _disposition_status_lines(stock: ReportStockView) -> list[str]:
         if stock.disposition_start_date and stock.disposition_end_date:
             lines.append(
                 "　處置期間："
-                f"{stock.disposition_start_date:%Y/%m/%d}"
-                f"～{stock.disposition_end_date:%Y/%m/%d}"
+                f"{stock.disposition_start_date:%Y/%m/%d}～"
+                f"{stock.disposition_end_date:%Y/%m/%d}"
             )
         if stock.disposition_reason:
             lines.append(f"　處置原因：{stock.disposition_reason}")
@@ -605,7 +725,7 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
     lines.append("")
     lines.extend(_render_limit_up_structure_lines(stock))
     lines.append("")
-    lines.extend(_render_signal_lines(stock.factor_scores, stock.risk_flags))
+    lines.extend(_render_signal_lines(stock))
     lines.append("")
     lines.extend(_render_regulatory_status_lines(stock))
     lines.append("")
@@ -668,6 +788,7 @@ def render_daily_report(
         "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
         "✅ 技術面：低檔且具起漲訊號",
         "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+        "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
         "⬜ 技術面：低檔首板",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
@@ -694,12 +815,21 @@ def render_daily_report(
             ),
             (
                 "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
-                "⚪ 代表該因子目前資料不足，並不代表負面訊號。"
+                "⚪ 代表該因子目前資料不足，並不代表負面訊號。分數後方標註"
+                "「候選池相對」或「絕對規則」——除動能因子（絕對規則，見下）外，"
+                "其餘因子分數皆為與當日候選股互相比較後的相對名次，"
+                "不代表對照市場整體或固定絕對門檻。"
             ),
             (
                 "動能因子採非單調評分；顯示「漲多過熱」時，"
                 "代表近期累積漲幅已達短線過熱門檻，"
                 "反映追價風險升高，並非代表近期沒有上漲動能。"
+            ),
+            (
+                "各因子下方列出的原因僅呈現「實際參與該因子評分」的數值；"
+                "若某項資訊有參考價值但未參與評分（例如流動性的 20 日均量倍數、"
+                "動能的 20 日累積報酬率、風險品質中目前尚未扣分的監管旗標），"
+                "會另外列於「補充」，不與計分原因混在一起。"
             ),
             (
                 "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
@@ -766,6 +896,7 @@ def render_no_qualified_stock_report(
             "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
             "✅ 技術面：低檔且具起漲訊號",
             "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+            "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
             "⬜ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
