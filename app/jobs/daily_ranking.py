@@ -219,7 +219,7 @@ from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
-    render_daily_report,
+    render_daily_report_messages,
     render_no_qualified_stock_report,
     utf16_length,
 )
@@ -414,7 +414,19 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # StockFeatures inputs, so it needs its own message_version per this
 # file's own idempotency rule — the "功能進度" checklist line and the
 # model-explanation paragraph for 基本面 both changed wording too.
-MESSAGE_VERSION = "text-v11"
+#
+# text-v12: the "訊號" block's per-factor lines gain explainable
+# reasons (score + 1-3 verifiable sentences via
+# app.reports.signal_explainer, plus a "候選池相對"/"絕對規則"
+# qualifier next to each score) — another real, visible content
+# change requiring its own version. Also: a fully-populated Top N
+# report can now genuinely exceed LINE's single-message limit, so
+# rendering switched from render_daily_report() (single string) to
+# render_daily_report_messages() (list[str]) below, and delivery now
+# uses deliver_many()/deliver_broadcast_many() with a per-part
+# idempotency identity (see app.delivery.service.build_message_part_version)
+# instead of a single deliver()/deliver_broadcast() call.
+MESSAGE_VERSION = "text-v12"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -1907,7 +1919,7 @@ def _run_pipeline(
         return 1
 
     line_live_delivery = line_delivery_mode != "off"
-    report_text: str | None = None
+    report_messages: list[str] = []
 
     if report_dry_run or line_live_delivery:
         candidates_by_stock_id = {
@@ -1927,7 +1939,7 @@ def _run_pipeline(
         data_updated_at = DATA_UPDATED_LABEL
 
         if report_stocks:
-            report_text = render_daily_report(
+            report_messages = render_daily_report_messages(
                 trading_date=target_date,
                 data_updated_at=data_updated_at,
                 # candidate_count_before_pe_filter, not len(candidates):
@@ -1943,28 +1955,32 @@ def _run_pipeline(
                 ranking_limit=RANKING_LIMIT,
             )
         else:
-            report_text = render_no_qualified_stock_report(
-                trading_date=target_date,
-                data_updated_at=data_updated_at,
-                candidate_count=candidate_count_before_pe_filter,
-                strategy_version=STRATEGY_VERSION,
-                ranking_limit=RANKING_LIMIT,
-            )
+            report_messages = [
+                render_no_qualified_stock_report(
+                    trading_date=target_date,
+                    data_updated_at=data_updated_at,
+                    candidate_count=candidate_count_before_pe_filter,
+                    strategy_version=STRATEGY_VERSION,
+                    ranking_limit=RANKING_LIMIT,
+                )
+            ]
 
     if report_dry_run:
-        assert report_text is not None
-        report_length = utf16_length(report_text)
+        assert report_messages
 
         print()
-        print("=" * 72)
-        print("REPORT_DRY_RUN preview")
-        print("NOT sent to LINE / NOT written to delivery DB")
-        print("=" * 72)
-        print(report_text)
-        print("=" * 72)
-        print(f"UTF-16 length: {report_length} / {MAX_LINE_TEXT_UTF16_UNITS}")
-        print("=" * 72)
-        print()
+        for index, message in enumerate(report_messages, start=1):
+            print("=" * 72)
+            print(f"REPORT_DRY_RUN preview {index}/{len(report_messages)}")
+            print("NOT sent to LINE / NOT written to delivery DB")
+            print("=" * 72)
+            print(message)
+            print("=" * 72)
+            print(
+                f"UTF-16 length: {utf16_length(message)} / {MAX_LINE_TEXT_UTF16_UNITS}"
+            )
+            print("=" * 72)
+            print()
 
     # --- Step 8: LINE live delivery (real side effect — opt-in only) ---
     # off       -> no LINE call, no DB write (default)
@@ -1974,7 +1990,7 @@ def _run_pipeline(
     # broadcast -> send to ALL friends of this Official Account — the
     #              real daily delivery to family/subscribers
     if line_live_delivery:
-        assert report_text is not None
+        assert report_messages
 
         target_id: str | None = None
         if line_delivery_mode == "push":
@@ -1996,20 +2012,20 @@ def _run_pipeline(
                 return 1
             line_client = LineMessagingClient(channel_access_token=channel_access_token)
 
-        def _run_delivery(service: DeliveryService) -> str:
+        def _run_delivery(service: DeliveryService) -> list[str]:
             if line_delivery_mode == "push":
-                return service.deliver(
+                return service.deliver_many(
                     trading_date=target_date,
                     strategy_version=STRATEGY_VERSION,
                     target_id=target_id,
                     message_version=MESSAGE_VERSION,
-                    message=report_text,
+                    messages=report_messages,
                 )
-            return service.deliver_broadcast(
+            return service.deliver_broadcast_many(
                 trading_date=target_date,
                 strategy_version=STRATEGY_VERSION,
                 message_version=MESSAGE_VERSION,
-                message=report_text,
+                messages=report_messages,
             )
 
         try:
@@ -2020,7 +2036,7 @@ def _run_pipeline(
                 delivery_service = DeliveryService(
                     repository=delivery_repository, line_client=line_client
                 )
-                delivery_result = _run_delivery(delivery_service)
+                delivery_results = _run_delivery(delivery_service)
             else:
                 database_url = os.environ.get("DATABASE_URL", "").strip()
                 if not database_url:
@@ -2038,7 +2054,7 @@ def _run_pipeline(
                             repository=DeliveryRepository(session),
                             line_client=line_client,
                         )
-                        delivery_result = _run_delivery(delivery_service)
+                        delivery_results = _run_delivery(delivery_service)
                 finally:
                     engine.dispose()
         except Exception:
@@ -2054,12 +2070,13 @@ def _run_pipeline(
 
         logger.info(
             "LINE delivery mode=%s result=%s trading_date=%s strategy_version=%s "
-            "message_version=%s",
+            "message_version=%s parts=%d",
             line_delivery_mode,
-            delivery_result,
+            ", ".join(delivery_results),
             target_date,
             STRATEGY_VERSION,
             MESSAGE_VERSION,
+            len(report_messages),
         )
 
     logger.info(

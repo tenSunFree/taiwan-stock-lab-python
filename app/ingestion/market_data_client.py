@@ -102,26 +102,41 @@ class MarketDataClient:
     ) -> RawSourcePayload:
         """
         fetch_fn: () -> tuple[raw_payload: Any, source_updated_at: dt.datetime | None]
-        Injected by each subclass (FinMindClient, etc.) to perform the
-        actual API call.
+        Injected by each subclass (FinMindClient, TwseClient, TpexClient,
+        etc.) to perform the actual API call.
 
-        Transient read/connect timeouts to TWSE/TPEx are a known,
-        recurring condition: their public endpoints are served by a
-        DNS round-robin pool of backend nodes, and it's common for a
-        subset of those nodes to be temporarily unhealthy while
-        others respond normally within milliseconds (confirmed by
-        testing all 8 www.twse.com.tw IPs directly — 6 timed out, 2
-        responded in ~0.06s). A retry gives the next attempt a chance
-        to land on a healthy node via DNS re-resolution, rather than
-        being permanently blocked by one bad node.
+        Retry policy
+        ------------
+        ReadTimeout / ConnectTimeout
+            Retried. Official/public market-data endpoints are served by
+            a DNS round-robin pool of backend nodes, and it's common for
+            a subset to be temporarily unhealthy while others respond
+            normally within milliseconds (confirmed by testing all 8
+            www.twse.com.tw IPs directly — 6 timed out, 2 responded in
+            ~0.06s). A retry gives the next attempt a chance to land on a
+            healthy node via DNS re-resolution.
 
-        Deliberately scoped to ReadTimeout/ConnectTimeout only — an
-        HTTP error status (4xx/5xx, raised as HTTPStatusError by each
-        subclass's response.raise_for_status()) is a DIFFERENT
-        failure mode: the request reached the server and was
-        explicitly rejected. Retrying that blindly could hammer a
-        server that's already signaling a problem, so it is
-        intentionally NOT retried here.
+        HTTP 5xx
+            Also retried, with the same backoff. Observed in production:
+            TPEx's tpex_mainboard_peratio_analysis returned 520 while a
+            sibling TPEx endpoint responded normally seconds later, and
+            on a later run the reverse happened. This is consistent with
+            transient upstream/edge failures rather than a fixed,
+            endpoint-specific problem — the same class of issue as a
+            timeout, just surfaced as an HTTP status instead of a
+            socket-level failure.
+
+        HTTP 4xx
+            NOT retried. A 4xx means the server reached the request and
+            rejected it as invalid/unauthorized/rate-limited — retrying
+            the identical request is unlikely to produce a different
+            result and could hammer a server already signaling a
+            problem. (429 rate-limiting may eventually deserve its own
+            Retry-After-aware policy; deliberately out of scope here.)
+
+        Bounded to 3 attempts with exponential backoff (2s, 4s). Raw
+        payload persistence still happens only after a successful fetch —
+        a failed attempt is never stored as a valid source snapshot.
         """
         MAX_FETCH_ATTEMPTS = 3
         RETRY_BACKOFF_BASE_SECONDS = 2.0
@@ -130,15 +145,17 @@ class MarketDataClient:
 
         raw_payload = None
         source_updated_at = None
-        last_timeout_error: httpx.TimeoutException | None = None
+        last_retryable_error: httpx.TimeoutException | httpx.HTTPStatusError | None = (
+            None
+        )
 
         for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
             try:
                 raw_payload, source_updated_at = fetch_fn()
-                last_timeout_error = None
+                last_retryable_error = None
                 break
             except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
-                last_timeout_error = exc
+                last_retryable_error = exc
                 if attempt == MAX_FETCH_ATTEMPTS:
                     break
                 wait_seconds = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
@@ -151,14 +168,34 @@ class MarketDataClient:
                     wait_seconds,
                 )
                 time.sleep(wait_seconds)
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                if status_code < 500:
+                    # 4xx: an explicit rejection, not a transient node
+                    # issue — see this method's docstring for why this is
+                    # never retried.
+                    raise
+                last_retryable_error = exc
+                if attempt == MAX_FETCH_ATTEMPTS:
+                    break
+                wait_seconds = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "source=%s attempt=%d/%d got HTTP %d server error; retrying in %.0fs",
+                    self.source_name,
+                    attempt,
+                    MAX_FETCH_ATTEMPTS,
+                    status_code,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
 
-        if last_timeout_error is not None:
+        if last_retryable_error is not None:
             logger.error(
-                "source=%s all %d attempts timed out; giving up",
+                "source=%s all %d attempts failed with a retryable error; giving up",
                 self.source_name,
                 MAX_FETCH_ATTEMPTS,
             )
-            raise last_timeout_error
+            raise last_retryable_error
 
         payload = RawSourcePayload(
             ingestion_run_id=ingestion_run_id,

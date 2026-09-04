@@ -11,7 +11,7 @@ from app.reports.signal_explainer import (
 def test_liquidity_reason_uses_turnover_not_ratio():
     result = explain_liquidity(turnover=5.43e8, average_turnover_20d=2.35e8, score=82.0)
     assert any("成交金額" in r for r in result.reasons)
-    # 均量倍數必須在 supplemental，不在 reasons
+    # The average-turnover ratio must live in supplemental, not reasons
     assert not any("倍" in r for r in result.reasons)
     assert any("倍" in s for s in result.supplemental)
 
@@ -21,9 +21,12 @@ def test_liquidity_missing_score_is_data_insufficient():
     assert result.data_status == "資料不足"
 
 
-def test_liquidity_missing_average_is_partial_but_still_scored():
+def test_liquidity_missing_average_is_still_complete():
+    """average_turnover_20d is supplemental only and never affects
+    data_status — liquidity's score is built from turnover alone, so
+    a present turnover means "complete" regardless of the average."""
     result = explain_liquidity(turnover=5.43e8, average_turnover_20d=None, score=82.0)
-    assert result.data_status == "部分缺失"
+    assert result.data_status == "完整"
     assert any("成交金額" in r for r in result.reasons)
     assert result.supplemental == ()
 
@@ -71,8 +74,9 @@ def test_momentum_ideal_band():
 
 
 def test_momentum_high_return_without_overheat_flag_is_not_mislabeled_overheated():
-    """excessive_return_5d 跟 bounded_momentum_score 的門檻可以各自設定，
-    分數還在偏弱以上、旗標也沒觸發時，不該顯示「過熱」字樣。"""
+    """excessive_return_5d and bounded_momentum_score's own thresholds
+    are independently configurable, so when the score is still decent
+    and the flag hasn't fired, the wording must never say "過熱"."""
     result = explain_momentum(
         return_5d=0.20,
         return_20d=0.25,
@@ -107,9 +111,24 @@ def test_risk_quality_zero_penalty_flag_goes_to_supplemental():
         risk_flags=("ATTENTION_STOCK", "ONE_PRICE_LIMIT_UP"),
         risk_missing_inputs=(),
     )
-    assert any("一字漲停" in r and "扣" in r for r in result.reasons)
+    assert any("一字漲停" in r for r in result.reasons)
     assert any("注意股" in s and "未影響" in s for s in result.supplemental)
     assert not any("注意股" in r for r in result.reasons)
+
+
+def test_risk_quality_explains_all_penalized_flags_not_just_first_two():
+    """Regression test: previously reasons[:2] silently dropped a real
+    penalty flag once 3+ flags fired at once."""
+    result = explain_risk_quality(
+        risk_quality_raw=0.45,
+        score=55.0,
+        risk_flags=("KY_STOCK", "ONE_PRICE_LIMIT_UP", "HIGH_FIVE_DAY_RETURN"),
+        risk_missing_inputs=(),
+    )
+    text = " ".join(result.reasons)
+    assert "KY" in text
+    assert "一字漲停" in text
+    assert "近 5 日漲幅過高" in text
 
 
 def test_risk_quality_no_flags_at_all():
@@ -120,6 +139,7 @@ def test_risk_quality_no_flags_at_all():
         risk_missing_inputs=(),
     )
     assert any("1.00" in r for r in result.reasons)
+    assert any("未觸發" in r for r in result.reasons)
     assert result.supplemental == ()
     assert result.data_status == "完整"
 

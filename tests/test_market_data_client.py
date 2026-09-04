@@ -453,11 +453,13 @@ def test_fetch_and_snapshot_gives_up_after_max_attempts(monkeypatch):
     assert repo.saved == []
 
 
-def test_fetch_and_snapshot_does_not_retry_http_error_status(monkeypatch):
+def test_fetch_and_snapshot_does_not_retry_4xx(monkeypatch):
     """
-    HTTPStatusError (4xx/5xx) is a different failure mode from a
-    timeout — the server explicitly responded with an error. This
-    must fail immediately on the first attempt, not be retried.
+    A 4xx means the server reached the request and explicitly
+    rejected it — this must fail immediately on the first attempt,
+    not be retried. (5xx has a DIFFERENT policy — see
+    test_fetch_and_snapshot_retries_on_5xx_then_succeeds and
+    test_fetch_and_snapshot_gives_up_after_max_5xx_attempts below.)
     """
     monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
 
@@ -465,13 +467,66 @@ def test_fetch_and_snapshot_does_not_retry_http_error_status(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
-        return httpx.Response(500, json={"error": "server error"})
+        return httpx.Response(400, json={"error": "bad request"})
 
     client, repo = make_client(handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
         client.fetch_stock_info(
             ingestion_run_id="run-1", target_date=dt.date(2026, 8, 18)
         )
 
-    assert call_count["n"] == 1  # no retry for HTTP error status
+    assert exc_info.value.response.status_code == 400
+    assert call_count["n"] == 1  # no retry for 4xx
+    assert repo.saved == []
+
+
+def test_fetch_and_snapshot_retries_on_5xx_then_succeeds(monkeypatch):
+    """
+    Regression test for the real incident: TPEx returned 520 on
+    tpex_mainboard_peratio_analysis in one run, then 520 on the
+    sibling tpex_mainboard_daily_close_quotes endpoint in the very
+    next run — consistent with a transient upstream/edge failure, the
+    same class of issue as a timeout. A 5xx on the first attempt(s)
+    must not fail the whole call if a later attempt succeeds.
+    """
+    monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(520, text="temporary upstream error")
+        return httpx.Response(200, json={"data": []})
+
+    client, repo = make_client(handler)
+    result = client.fetch_stock_info(
+        ingestion_run_id="run-1", target_date=dt.date(2026, 9, 4)
+    )
+
+    assert call_count["n"] == 2
+    assert len(repo.saved) == 1
+    assert result is repo.saved[0]
+
+
+def test_fetch_and_snapshot_gives_up_after_max_5xx_attempts(monkeypatch):
+    """Bounds the 5xx retry — must not retry forever, and must
+    propagate the original HTTPStatusError once attempts are
+    exhausted."""
+    monkeypatch.setattr("app.ingestion.market_data_client.time.sleep", lambda _: None)
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(520, text="temporary upstream error")
+
+    client, repo = make_client(handler)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        client.fetch_stock_info(
+            ingestion_run_id="run-1", target_date=dt.date(2026, 9, 4)
+        )
+
+    assert exc_info.value.response.status_code == 520
+    assert call_count["n"] == 3
     assert repo.saved == []
