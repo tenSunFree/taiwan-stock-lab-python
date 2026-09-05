@@ -94,10 +94,14 @@ a later phase (see [Roadmap](#roadmap)).
   tick-by-tick walk-up reference implementation across every tick-size
   band boundary
 - Automatic retry with exponential backoff for transient upstream read
-  timeouts (confirmed via direct IP-level testing that TWSE's serving
-  infrastructure has genuinely time-varying node/edge health, not a
-  fixed set of broken hosts — see `market_data_client.py`'s
-  `fetch_and_snapshot()` docstring)
+  timeouts AND HTTP 5xx server errors (confirmed via direct IP-level
+  testing that TWSE's serving infrastructure has genuinely
+  time-varying node/edge health, not a fixed set of broken hosts, and
+  via a real production incident where TPEx returned 520 on one
+  endpoint while a sibling endpoint responded normally seconds later —
+  see `market_data_client.py`'s `fetch_and_snapshot()` docstring). 4xx
+  responses are deliberately never retried — an explicit rejection is
+  a different failure mode from a transient upstream/edge issue
 
 ### Candidate Pool
 
@@ -253,7 +257,10 @@ a later phase (see [Roadmap](#roadmap)).
   structure, momentum, institutional flow, fundamentals, and risk
   quality
 - Cross-sectional percentile normalization (Winsorized 5%-95%) so
-  factors on different units and scales become comparable
+  factors on different units and scales become comparable, except for
+  momentum, which uses a dedicated non-monotonic absolute scoring rule
+  (see below) rather than a percentile — the report distinguishes the
+  two explicitly (see Report Rendering)
 - A dedicated non-monotonic momentum scoring function — an already
   extended rally is treated as elevated chase-in risk, not as an
   automatically higher score
@@ -365,6 +372,43 @@ a later phase (see [Roadmap](#roadmap)).
   see exactly whether revenue, EPS, or both actually drove the
   result — the combination never erases that distinction the moment
   either component becomes `True`
+- As of `text-v12`, each factor's signal-light gains a **fixed-template
+  explanation** underneath it — the score (with an explicit
+  "候選池相對" pool-relative-percentile / "絕對規則" absolute-rule
+  qualifier, since only momentum uses an absolute non-monotonic rule
+  and every other factor is a same-day cross-sectional percentile),
+  followed by 1-3 verifiable, numeric reasons generated entirely by
+  `app.reports.signal_explainer` — no LLM, every sentence comes from
+  an if/elif against a value already present in `StockFeatures`.
+  `signal_explainer` enforces a strict distinction between `reasons`
+  (facts that actually drove the factor's score — e.g. liquidity's
+  reason is today's turnover, never the 20-day average ratio, since
+  the "liquidity" factor is scored on turnover alone) and
+  `supplemental` (verifiable, useful context that did NOT affect the
+  score — e.g. that same 20-day average ratio, or momentum's 20-day
+  cumulative return alongside its scoring 5-day figure). For
+  `risk_quality`, every currently-penalizing flag (per
+  `RISK_FLAG_PENALTIES`) is merged into a single reason line rather
+  than one-flag-per-line-then-truncated, so a stock triggering 3+
+  penalty flags at once never silently loses one from the explanation;
+  zero-penalty/display-only flags (`ATTENTION_STOCK`/
+  `DISPOSITION_STOCK`/`MANAGED_STOCK` in `rule-v1.2.0`) always render
+  as `supplemental`, never mixed into the same sentence as an actual
+  score-driving reason. `text_renderer.py` still owns 100% of the
+  emoji/level-word decision — `signal_explainer` only explains *why* a
+  score landed where it did, never *what color* it gets
+- Because every factor now carries explanatory text, a fully-populated
+  Top N report can genuinely exceed LINE's single-message
+  5000-UTF-16-unit limit — no longer a rare edge case.
+  `render_daily_report_messages()` packs the header, each stock's
+  full block, and the footer into as few LINE messages as needed,
+  never splitting a single stock's block across two messages, and
+  each message is independently size-validated. `render_daily_report()`
+  (single string) is kept for backward-compatible callers (dry-run
+  diffing, existing tests) and still raises `ValueError` if the whole
+  report doesn't fit in one message — this is now an expected outcome
+  of the explainable-signals rollout, not a bug, and callers doing
+  live delivery should use `render_daily_report_messages()` instead
 - A **漲停結構 (limit-up structure)** section combining
   `is_one_price_limit_up` and the 20-day volume ratio; a missing
   volume ratio is rendered as an explicit "資料不足," never silently
@@ -388,7 +432,10 @@ a later phase (see [Roadmap](#roadmap)).
   normally
 - Enforces LINE's 5000-UTF-16-unit text message limit at render time
 - `REPORT_DRY_RUN=true` prints the exact report text to stdout for
-  manual inspection, with no LINE call and no database write
+  manual inspection, with no LINE call and no database write — as of
+  `text-v12`, when the report is split into multiple messages, each
+  is printed as its own numbered preview block (`REPORT_DRY_RUN
+  preview N/M`)
 
 ### Delivery
 
@@ -401,7 +448,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v11`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v12`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -416,6 +463,24 @@ a later phase (see [Roadmap](#roadmap)).
   LINE client, and one reserve→send→mark-success/failed orchestration
   in `DeliveryService`, so a future change to that logic can't
   silently apply to one send mode and not the other
+- Since `text-v12`, a report that `render_daily_report_messages()`
+  split into multiple LINE messages is delivered via
+  `deliver_many()` / `deliver_broadcast_many()`, not a naive loop
+  over `deliver()`/`deliver_broadcast()`: the database idempotency
+  key is `(trading_date, strategy_version, target/scope,
+  message_version)` and does NOT include message content, so reusing
+  the SAME `message_version` for every part would make the second
+  part's `reserve()` call collide with the first part's already-
+  persisted row and raise `DeliveryContentConflict`. Each part
+  instead gets its own per-part identity via
+  `build_message_part_version()` (e.g. `text-v12:p01-of-03`), with
+  the total part count baked into the string so a future run that
+  splits into a different number of parts never collides with a
+  prior day's keys. This gives per-part crash recovery for free — a
+  crash after part 2 of 3 succeeds, followed by a rerun, correctly
+  `SKIPPED_ALREADY_SENT`s parts 1-2 and only (re)sends part 3, using
+  the exact same reserve→send→mark-success/failed machinery as a
+  single-message delivery
 - Broadcast has no single LINE target to hash into the idempotency key
   the way Push does; it reuses the same mechanism with a fixed logical
   scope label instead of changing the database schema — verified
@@ -666,6 +731,16 @@ pytest -v
 - Scoring tests covering factor-weight integrity, liquidity ordering,
   missing-factor renormalization (never backfilled with a neutral
   score), and Top-N selection under a data-completeness floor
+- Explainable-signal tests (`test_signal_explainer.py`) covering all
+  six `explain_*` functions: that liquidity's reason is built from
+  today's turnover alone (never the 20-day average ratio, which is
+  supplemental-only and never affects `data_status`), that
+  fundamental's reason never mentions EPS, that momentum correctly
+  distinguishes "genuinely weak" from "overheated" wording and never
+  mislabels a decent, non-overheated score as overheated, and a
+  dedicated regression test confirming risk_quality merges every
+  currently-penalizing flag into its reason even when 3+ flags fire
+  at once (a prior version silently truncated to the first two)
 - Signal-light and tri-state regulatory-status renderer tests covering
   all six factors' emoji/word mapping (including the "unconfirmed ≠
   confirmed clean" distinction for attention/disposition/managed), a
@@ -689,6 +764,14 @@ pytest -v
   an answer), and a progress-checklist regression test confirming the
   "基本面" line correctly flips from ⬜ to ✅ with wording that no
   longer claims EPS isn't wired in
+- Multi-message report-packing tests (`test_text_renderer.py`)
+  confirming `render_daily_report_messages()` splits a
+  no-longer-single-message-sized Top N report into multiple messages
+  each within the LINE limit, that a small report still stays a
+  single message, that no single stock's block is ever split across
+  two messages, and that `render_daily_report()` (the single-string,
+  backward-compatible API) correctly raises once a fully-populated
+  Top 10 no longer fits in one message
 - Report-renderer tests asserting the disclaimer is always present,
   that promotional language never appears in output, that
   candidate/eligible counts are labeled accurately, that a
@@ -708,6 +791,19 @@ pytest -v
   test asserting report content stays byte-identical across a real
   wall-clock time gap (a prerequisite for delivery idempotency to hold
   at all)
+- Multi-part delivery tests (`test_delivery_service.py`) covering
+  `deliver_many()`/`deliver_broadcast_many()`'s per-part idempotency
+  identity, that a rerun of an already-fully-delivered multi-part
+  report skips every part without a new LINE call, and a crash-
+  recovery regression test simulating a mid-batch failure (part 1
+  succeeds, part 2 fails) followed by a rerun that correctly skips
+  part 1 and resumes from part 2
+- Retry-policy tests (`test_market_data_client.py`) covering the 5xx
+  retry-then-succeed path, bounded retry exhaustion for a persistent
+  5xx (propagating the original `HTTPStatusError` rather than retrying
+  forever), and confirming 4xx responses are never retried — a
+  regression test born directly from a real TPEx 520 incident
+  encountered in production
 
 See the badge at the top of this file for current test status.
 
@@ -755,18 +851,30 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                              revenue points, no second API call
   risk_inputs.py             Reliable/heuristic RiskPolicy input reconstruction
   risk_policy.py              Tri-state hard exclusion + soft risk flagging,
-                              configurable allow/exclude per official flag
+                              configurable allow/exclude per official flag,
+                              and RISK_FLAG_PENALTIES — the single source
+                              of truth for which flags actually deduct from
+                              risk_quality_raw vs. which are display-only
   scoring.py / normalization.py
-                             Multi-factor scoring, Top-N selection, and
-                             risk_missing_inputs propagation to ScoredStock
+                             Multi-factor scoring, Top-N selection,
+                             risk_missing_inputs propagation to
+                             ScoredStock, and (normalization.py)
+                             MOMENTUM_IDEAL_LOW/HIGH/DANGEROUS_HIGH as
+                             named constants shared with
+                             app.reports.signal_explainer so the scoring
+                             rule and its explanation never drift apart
   eps_growth_builder.py       Standalone quarterly EPS YoY + sustained-growth
                             signal, and the revenue-OR-EPS tri-state OR
                             combiner used at the report-rendering layer
 
 app/ingestion/        Data source integration
   trading_calendar.py     Trading-day checks
-  market_data_client.py    Raw-snapshot-first ingestion clients with retry,
-                            including TWSE/TPEx attention + disposition fetches
+  market_data_client.py    Raw-snapshot-first ingestion clients with
+                            bounded, exponential-backoff retry on both
+                            transient timeouts and HTTP 5xx server errors
+                            (4xx responses fail fast, never retried),
+                            including TWSE/TPEx attention + disposition
+                            fetches
   financial_statement_client.py
                              Unified TWSE (t187ap06_L_ci JSON) / TPEx
                             (t187ap06_O_ci CSV) financial-statement fetch
@@ -793,28 +901,58 @@ app/reports/           Report rendering
                             institutional_net_buy_3d_positive,
                             technical_low_with_rising_signal,
                             fundamental_growth_sustained,
-                            eps_growth_sustained, and risk_missing_inputs —
-                            revenue and EPS are passed through as their OWN
-                            independent fields, never pre-combined here
+                            eps_growth_sustained, risk_missing_inputs, and
+                            (as of text-v12) the raw per-factor inputs
+                            (turnover, average_turnover_20d, return_5d,
+                            return_20d, institutional_net_buy_ratio_5d,
+                            revenue_yoy, risk_quality_raw) that
+                            signal_explainer.py needs to explain each
+                            factor_scores value — revenue and EPS are
+                            passed through as their OWN independent fields,
+                            never pre-combined here
+  signal_explainer.py         Turns each of the six scoring factors' raw
+                            input + its already-computed 0-100 score into
+                            1-3 fixed-template, verifiable reasons — no
+                            LLM. Strictly separates reasons (what actually
+                            drove the score) from supplemental (verifiable
+                            but non-scored context); merges all currently-
+                            penalizing risk flags into one line rather than
+                            truncating; never decides the emoji/level-word,
+                            only explains why a score landed where it did
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
-                            overheating override), tri-state regulatory
-                            status with distinct per-day-announcement vs
-                            active-period wording, a 法人籌碼 tri-state
-                            institutional net-buy display, a 技術面
-                            tri-state low-position/early-rally display, a
-                            基本面 section combining revenue and EPS
-                            growth-sustained via a tri-state OR at render
-                            time (with both components still shown as
-                            sub-lines), limit-up structure, and a
-                            dynamically built risk_quality gap explanation
+                            overheating override) each backed by
+                            signal_explainer's reasons, tri-state
+                            regulatory status with distinct
+                            per-day-announcement vs active-period wording,
+                            a 法人籌碼 tri-state institutional net-buy
+                            display, a 技術面 tri-state low-position/
+                            early-rally display, a 基本面 section
+                            combining revenue and EPS growth-sustained via
+                            a tri-state OR at render time (with both
+                            components still shown as sub-lines), limit-up
+                            structure, a dynamically built risk_quality gap
+                            explanation, and (as of text-v12)
+                            render_daily_report_messages() /
+                            _pack_report_messages() for splitting a
+                            fully-populated report across multiple
+                            LINE messages when it exceeds the
+                            5000-UTF-16-unit single-message limit
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
   idempotency.py              Idempotency key + retry key derivation
 
 app/delivery/          Delivery orchestration
-  service.py                 Reserve -> send -> mark-success/failed, for both Push and Broadcast
+  service.py                 Reserve -> send -> mark-success/failed, for
+                            both Push and Broadcast, plus (as of text-v12)
+                            deliver_many()/deliver_broadcast_many() for a
+                            multi-message report — each part gets its own
+                            idempotency identity via
+                            build_message_part_version() so a crash
+                            mid-batch and a subsequent rerun correctly
+                            skip already-succeeded parts and resume from
+                            the failed one
 
 app/db/                SQLAlchemy ORM models
   models.py                    IngestionRun, RawSourcePayloadRow,

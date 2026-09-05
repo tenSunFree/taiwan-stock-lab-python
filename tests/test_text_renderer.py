@@ -1,11 +1,14 @@
 import datetime as dt
 from decimal import Decimal
 
+import pytest
+
 from app.reports.text_renderer import (
     DISCLAIMER,
     MAX_LINE_TEXT_UTF16_UNITS,
     ReportStockView,
     render_daily_report,
+    render_daily_report_messages,
     render_no_qualified_stock_report,
     top_factors,
     utf16_length,
@@ -748,15 +751,35 @@ def _make_populated_stock_view(rank: int) -> ReportStockView:
     )
 
 
-def test_full_report_with_ten_stocks_and_populated_signals_stays_within_line_limit():
-    """Guards MAX_LINE_TEXT_UTF16_UNITS against regressions like the
-    EPS sub-line addition: 10 stocks, each with every tri-state
-    signal populated (not None) and a couple of ordinary risk flags —
-    the shape a fully-scored, ordinary trading day actually produces.
-    Must not raise, and must stay within LINE's limit."""
+def test_full_report_with_ten_stocks_and_populated_signals_raises_on_single_message():
+    """render_daily_report() (single-string, backward-compat only)
+    correctly raises once a fully-populated Top 10 no longer fits in
+    one LINE message — this is the EXPECTED outcome of the
+    explainable-signals rollout (every factor now carries reasons),
+    not a regression. Live delivery must use
+    render_daily_report_messages() instead — see the next test."""
     stocks = [_make_populated_stock_view(rank=i) for i in range(1, 11)]
 
-    report = render_daily_report(
+    with pytest.raises(ValueError, match="exceeds LINE's"):
+        render_daily_report(
+            trading_date=TRADING_DATE,
+            data_updated_at="16:47",
+            candidate_count=42,
+            eligible_count=18,
+            strategy_version="rule-v1.2.0",
+            ranked_stocks=stocks,
+            ranking_limit=10,
+        )
+
+
+def test_full_report_with_ten_stocks_is_split_into_valid_messages():
+    """render_daily_report_messages() is what live delivery actually
+    uses — it must split the same 10-stock report into multiple
+    messages, each within MAX_LINE_TEXT_UTF16_UNITS, instead of
+    raising."""
+    stocks = [_make_populated_stock_view(rank=i) for i in range(1, 11)]
+
+    messages = render_daily_report_messages(
         trading_date=TRADING_DATE,
         data_updated_at="16:47",
         candidate_count=42,
@@ -766,7 +789,39 @@ def test_full_report_with_ten_stocks_and_populated_signals_stays_within_line_lim
         ranking_limit=10,
     )
 
-    assert utf16_length(report) <= MAX_LINE_TEXT_UTF16_UNITS
+    assert len(messages) >= 2
+    assert all(utf16_length(m) <= MAX_LINE_TEXT_UTF16_UNITS for m in messages)
+
+
+def test_small_report_stays_single_message():
+    stocks = [_make_populated_stock_view(rank=i) for i in range(1, 3)]
+    messages = render_daily_report_messages(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=10,
+        eligible_count=5,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+    assert len(messages) == 1
+
+
+def test_stock_block_is_never_split_across_messages():
+    stocks = [_make_populated_stock_view(rank=i) for i in range(1, 11)]
+    messages = render_daily_report_messages(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=42,
+        eligible_count=18,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+    for stock in stocks:
+        marker = f"{stock.rank}. {stock.stock_name}（{stock.stock_id}）"
+        matches = [m for m in messages if marker in m]
+        assert len(matches) == 1, f"{marker} should appear in exactly one message"
 
 
 def test_full_report_raises_helpful_error_when_data_gaps_and_flags_compound():

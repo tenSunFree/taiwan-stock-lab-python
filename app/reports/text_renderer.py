@@ -9,6 +9,34 @@ LLM output fails schema/content validation (see Roadmap).
 Output must never use promotional or advisory language ("必買",
 "明牌", "保證獲利", "最佳買點" etc.) and must always include the
 research disclaimer verbatim.
+
+As of text-v12 (explainable signals), the "訊號" block no longer just
+prints a bare word per factor — it delegates to
+app.reports.signal_explainer, which turns each factor's raw
+StockFeatures input + its already-computed 0-100 score into fixed,
+template-based, verifiable reasons. This module still owns 100% of
+the emoji/level-word decisions (_signal_emoji / _signal_word /
+_momentum_signal_word below) — signal_explainer only explains WHY a
+score landed where it did, it never decides the color or the word.
+Whether a score is "候選池相對" (pool-relative percentile) or "絕對
+規則" (an absolute rule, momentum only) is rendered here, directly
+next to the score, rather than as an extra reason bullet from
+signal_explainer — kept here rather than duplicated per-factor to
+stay within LINE's per-message character budget.
+
+Also as of text-v12, the header/footer sections of the daily report
+are split out into their own render functions
+(_render_report_header_lines / _render_report_footer_lines) and a
+message-packing layer (_pack_report_messages /
+render_daily_report_messages) is added. This is because a
+fully-populated Top N report — with every factor now carrying
+explanatory reasons — can genuinely exceed LINE's single-message
+5000-UTF16-unit limit, which used to be a rare edge case and is now an
+expected outcome. render_daily_report() (single string) is kept as-is
+for backward-compatible callers (dry-run diffing, existing tests) and
+still raises ValueError if the whole thing doesn't fit in one message;
+render_daily_report_messages() is the one live delivery should use, as
+it splits into as many messages as needed instead of raising.
 """
 
 from __future__ import annotations
@@ -18,6 +46,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+from app.reports import signal_explainer as se
 
 DISCLAIMER = (
     "本清單依公開市場資料及固定量化規則產生，"
@@ -159,6 +188,19 @@ class ReportStockView:
     # history), rendered as an explicit "資料不足", never silently
     # omitted (see _render_limit_up_structure_lines).
     volume_ratio_20d: float | None = None
+
+    # --- text-v12: raw factor inputs, consumed by
+    # app.reports.signal_explainer to explain factor_scores above.
+    # See that module's docstring for the exact factor <-> raw-field
+    # mapping (e.g. "liquidity" is scored on turnover ALONE, never on
+    # turnover/average_turnover_20d — that ratio is supplemental-only).
+    turnover: float | None = None
+    average_turnover_20d: float | None = None
+    return_5d: float | None = None
+    return_20d: float | None = None
+    institutional_net_buy_ratio_5d: float | None = None
+    revenue_yoy: float | None = None
+    risk_quality_raw: float | None = None
 
     # From StockFeatures — DISPLAY-ONLY signal for the "法人籌碼"
     # block: whether cumulative institutional net-buy shares over the
@@ -322,19 +364,111 @@ def _momentum_signal_word(score: float | None, risk_flags: tuple[str, ...]) -> s
     return _signal_word(score)
 
 
-def _render_signal_lines(
-    factor_scores: dict[str, float | None], risk_flags: tuple[str, ...]
+def _render_factor_block(
+    *,
+    key: str,
+    label: str,
+    score: float | None,
+    risk_flags: tuple[str, ...],
+    explanation: se.FactorExplanation,
 ) -> list[str]:
+    """
+    One factor's full block: emoji + level word + score (+ pool-
+    relative/absolute-rule qualifier), then its verifiable reasons/
+    confirmed/missing/supplemental lines, then a data-status line
+    (omitted when data_status == "完整" — the common, unremarkable
+    case — to keep each block short; "部分缺失"/"資料不足" are the
+    cases a reader actually needs flagged). The emoji/word decision
+    stays entirely with _signal_emoji/_signal_word/_momentum_signal_word
+    above — this function (and signal_explainer) never re-derive or
+    override those.
+    """
+    emoji = _signal_emoji(score)
+    word = (
+        _momentum_signal_word(score, risk_flags)
+        if key == "momentum"
+        else _signal_word(score)
+    )
+    header = f"{emoji} {label}：{word}"
+    if score is not None:
+        qualifier = "絕對規則" if key == "momentum" else "候選池相對"
+        header += f"｜{score:.0f}/100（{qualifier}）"
+
+    lines = [header]
+    if explanation.reasons:
+        lines.extend(f"• {reason}" for reason in explanation.reasons)
+    if explanation.confirmed:
+        lines.append("已確認：")
+        lines.extend(f"• {item}" for item in explanation.confirmed)
+    if explanation.missing:
+        lines.append("缺失：")
+        lines.extend(f"• {item}" for item in explanation.missing)
+    if explanation.supplemental:
+        lines.append("補充：")
+        lines.extend(f"• {item}" for item in explanation.supplemental)
+    if explanation.data_status != "完整":
+        lines.append(f"資料狀態：{explanation.data_status}")
+    return lines
+
+
+def _render_signal_lines(stock: ReportStockView) -> list[str]:
+    """
+    Builds the "訊號" block: one _render_factor_block per factor, each
+    fed by its own app.reports.signal_explainer.explain_* function —
+    see that module's docstring for exactly which raw field feeds
+    which factor (the mapping matters; e.g. "fundamental" is scored on
+    revenue_yoy alone, never on fundamental_growth_sustained/
+    eps_growth_sustained, which stay in their own separate "基本面"
+    block below via _render_fundamental_growth_lines).
+    """
+    scores = stock.factor_scores
+    risk_flags = stock.risk_flags
+
+    explanations: dict[str, se.FactorExplanation] = {
+        "liquidity": se.explain_liquidity(
+            turnover=stock.turnover,
+            average_turnover_20d=stock.average_turnover_20d,
+            score=scores.get("liquidity"),
+        ),
+        "volume_price": se.explain_volume_price(
+            volume_ratio_20d=stock.volume_ratio_20d,
+            score=scores.get("volume_price"),
+        ),
+        "momentum": se.explain_momentum(
+            return_5d=stock.return_5d,
+            return_20d=stock.return_20d,
+            score=scores.get("momentum"),
+            risk_flags=risk_flags,
+        ),
+        "institutional": se.explain_institutional(
+            institutional_net_buy_ratio_5d=stock.institutional_net_buy_ratio_5d,
+            score=scores.get("institutional"),
+        ),
+        "fundamental": se.explain_fundamental(
+            revenue_yoy=stock.revenue_yoy,
+            score=scores.get("fundamental"),
+        ),
+        "risk_quality": se.explain_risk_quality(
+            risk_quality_raw=stock.risk_quality_raw,
+            score=scores.get("risk_quality"),
+            risk_flags=risk_flags,
+            risk_missing_inputs=stock.risk_missing_inputs,
+        ),
+    }
+
     lines = ["訊號"]
     for key, label in _SIGNAL_FACTOR_ORDER:
-        score = factor_scores.get(key)
-        word = (
-            _momentum_signal_word(score, risk_flags)
-            if key == "momentum"
-            else _signal_word(score)
+        lines.extend(
+            _render_factor_block(
+                key=key,
+                label=label,
+                score=scores.get(key),
+                risk_flags=risk_flags,
+                explanation=explanations[key],
+            )
         )
-        lines.append(f"{_signal_emoji(score)} {label}：{word}")
-    return lines
+        lines.append("")  # 因子間空一行，避免整段黏在一起
+    return lines[:-1]  # 去掉最後多的空行
 
 
 # --- 監管狀態 (tri-state regulatory status) -----------------------------------
@@ -391,8 +525,8 @@ def _disposition_status_lines(stock: ReportStockView) -> list[str]:
         if stock.disposition_start_date and stock.disposition_end_date:
             lines.append(
                 "　處置期間："
-                f"{stock.disposition_start_date:%Y/%m/%d}"
-                f"～{stock.disposition_end_date:%Y/%m/%d}"
+                f"{stock.disposition_start_date:%Y/%m/%d}～"
+                f"{stock.disposition_end_date:%Y/%m/%d}"
             )
         if stock.disposition_reason:
             lines.append(f"　處置原因：{stock.disposition_reason}")
@@ -605,7 +739,7 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
     lines.append("")
     lines.extend(_render_limit_up_structure_lines(stock))
     lines.append("")
-    lines.extend(_render_signal_lines(stock.factor_scores, stock.risk_flags))
+    lines.extend(_render_signal_lines(stock))
     lines.append("")
     lines.extend(_render_regulatory_status_lines(stock))
     lines.append("")
@@ -619,6 +753,104 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
     lines.append("")
 
     return lines
+
+
+# --- Report header / footer ------------------------------------------------
+#
+# Split out of render_daily_report() (text-v12) so both
+# render_daily_report() (single-string) and
+# render_daily_report_messages() (multi-message) render the exact same
+# header/footer text from one source, instead of two copies that could
+# drift apart.
+
+
+def _render_report_header_lines(
+    *,
+    trading_date: dt.date,
+    data_updated_at: str,
+    candidate_count: int,
+    eligible_count: int,
+    strategy_version: str,
+    ranking_limit: int,
+) -> list[str]:
+    return [
+        f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
+        "",
+        "📌 功能進度",
+        f"✅ 顯示 Top {ranking_limit}",
+        "✅ 估值：0 < P/E ≤ 20",
+        "✅ 注意／處置有價證券官方風控",
+        "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
+        "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
+        "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
+        "✅ 技術面：低檔且具起漲訊號",
+        "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+        "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
+        "⬜ 技術面：低檔首板",
+        "⬜ 產業題材：電子業且具 AI 相關性",
+        "",
+        "資料概況",
+        f"資料更新：{data_updated_at}",
+        f"進入候選池：{candidate_count} 檔",
+        f"通過資料完整度門檻：{eligible_count} 檔",
+        f"展示範圍：綜合分數 Top {ranking_limit}",
+        f"策略版本：{strategy_version}",
+    ]
+
+
+def _render_report_footer_lines(*, strategy_version: str) -> list[str]:
+    return [
+        "模型說明",
+        (
+            f"綜合分數為各量化因子依 {strategy_version} "
+            "加權計算後的相對評分，用於當日候選標的之間排序，"
+            "不代表預測報酬率、上漲機率或目標價。"
+        ),
+        (
+            "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
+            "⚪ 代表該因子目前資料不足，並不代表負面訊號。分數後方標註"
+            "「候選池相對」或「絕對規則」——除動能因子（絕對規則，見下）外，"
+            "其餘因子分數皆為與當日候選股互相比較後的相對名次，"
+            "不代表對照市場整體或固定絕對門檻。"
+        ),
+        (
+            "動能因子採非單調評分；顯示「漲多過熱」時，"
+            "代表近期累積漲幅已達短線過熱門檻，"
+            "反映追價風險升高，並非代表近期沒有上漲動能。"
+        ),
+        (
+            "各因子下方列出的原因僅呈現「實際參與該因子評分」的數值；"
+            "若某項資訊有參考價值但未參與評分（例如流動性的 20 日均量倍數、"
+            "動能的 20 日累積報酬率、風險品質中目前尚未扣分的監管旗標），"
+            "會另外列於「補充」，不與計分原因混在一起。"
+        ),
+        (
+            "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
+            "為獨立於綜合分數之外的參考訊號，"
+            "不會改變「訊號」區塊中籌碼因子的評分結果。"
+        ),
+        (
+            "「技術面」區塊顯示今日收盤是否同時符合"
+            "「位於近 20 個交易日價格區間下緣」及"
+            "「今日剛站上 5 日均線」兩項條件，"
+            "同樣為獨立於綜合分數之外的參考訊號，"
+            "不會改變「訊號」區塊中動能因子的評分結果。"
+        ),
+        (
+            "「基本面」區塊顯示營收與 EPS 各自的持續成長判斷（營收看最近"
+            "連續 3 個曆月已公布月營收，EPS 看最近連續季的財報 YoY），"
+            "並以兩者的「或」關係判斷整體是否具持續性——只要營收或 EPS "
+            "任一項成立即視為是；若其中任一月／任一季缺漏或無法計算，"
+            "該項即顯示「資料不足」，不會以較早的期間遞補湊滿窗口。"
+            "為獨立於綜合分數之外的參考訊號，"
+            "不會改變「訊號」區塊中基本面因子的評分結果。"
+        ),
+        (
+            "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
+            "待累積足夠歷史樣本及建立回測流程後提供。"
+        ),
+        DISCLAIMER,
+    ]
 
 
 def render_daily_report(
@@ -655,80 +887,30 @@ def render_daily_report(
         is 10): showing "1 / 10" next to a 5-stock list would read as
         a contradiction, since there is no stock ranked 6th through
         10th anywhere in the report to justify that denominator.
+
+    Renders the entire report as ONE string and raises ValueError if it
+    doesn't fit in a single LINE message. Kept for backward-compatible
+    single-string callers (dry-run diffing, existing tests). For live
+    delivery, prefer render_daily_report_messages() instead — it splits
+    into as many messages as needed rather than raising, which is now
+    the expected outcome once every factor carries explanatory reasons
+    (see this module's own docstring).
     """
-    lines = [
-        f"【每日漲停股量化觀察｜{trading_date:%Y/%m/%d}】",
-        "",
-        "📌 功能進度",
-        f"✅ 顯示 Top {ranking_limit}",
-        "✅ 估值：0 < P/E ≤ 20",
-        "✅ 注意／處置有價證券官方風控",
-        "✅ 六大因子訊號燈號 ＋ 監管狀態明細（含注意／處置／全額交割 True／False／未知）",
-        "✅ 注意／處置時間語意區分（今日公告 vs 目前生效）＋ 動能過熱識別",
-        "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
-        "✅ 技術面：低檔且具起漲訊號",
-        "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
-        "⬜ 技術面：低檔首板",
-        "⬜ 產業題材：電子業且具 AI 相關性",
-        "",
-        "資料概況",
-        f"資料更新：{data_updated_at}",
-        f"進入候選池：{candidate_count} 檔",
-        f"通過資料完整度門檻：{eligible_count} 檔",
-        f"展示範圍：綜合分數 Top {ranking_limit}",
-        f"策略版本：{strategy_version}",
-        "",
-    ]
+    lines = _render_report_header_lines(
+        trading_date=trading_date,
+        data_updated_at=data_updated_at,
+        candidate_count=candidate_count,
+        eligible_count=eligible_count,
+        strategy_version=strategy_version,
+        ranking_limit=ranking_limit,
+    )
+    lines.append("")
 
     total_shown = len(ranked_stocks)
     for stock in ranked_stocks:
         lines.extend(_render_stock_block(stock, total_shown=total_shown))
 
-    lines.extend(
-        [
-            "模型說明",
-            (
-                f"綜合分數為各量化因子依 {strategy_version} "
-                "加權計算後的相對評分，用於當日候選標的之間排序，"
-                "不代表預測報酬率、上漲機率或目標價。"
-            ),
-            (
-                "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
-                "⚪ 代表該因子目前資料不足，並不代表負面訊號。"
-            ),
-            (
-                "動能因子採非單調評分；顯示「漲多過熱」時，"
-                "代表近期累積漲幅已達短線過熱門檻，"
-                "反映追價風險升高，並非代表近期沒有上漲動能。"
-            ),
-            (
-                "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
-                "為獨立於綜合分數之外的參考訊號，"
-                "不會改變「訊號」區塊中籌碼因子的評分結果。"
-            ),
-            (
-                "「技術面」區塊顯示今日收盤是否同時符合"
-                "「位於近 20 個交易日價格區間下緣」及"
-                "「今日剛站上 5 日均線」兩項條件，"
-                "同樣為獨立於綜合分數之外的參考訊號，"
-                "不會改變「訊號」區塊中動能因子的評分結果。"
-            ),
-            (
-                "「基本面」區塊顯示營收與 EPS 各自的持續成長判斷（營收看最近"
-                "連續 3 個曆月已公布月營收，EPS 看最近連續季的財報 YoY），"
-                "並以兩者的「或」關係判斷整體是否具持續性——只要營收或 EPS "
-                "任一項成立即視為是；若其中任一月／任一季缺漏或無法計算，"
-                "該項即顯示「資料不足」，不會以較早的期間遞補湊滿窗口。"
-                "為獨立於綜合分數之外的參考訊號，"
-                "不會改變「訊號」區塊中基本面因子的評分結果。"
-            ),
-            (
-                "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
-                "待累積足夠歷史樣本及建立回測流程後提供。"
-            ),
-            DISCLAIMER,
-        ]
-    )
+    lines.extend(_render_report_footer_lines(strategy_version=strategy_version))
 
     result = "\n".join(lines)
 
@@ -737,9 +919,112 @@ def render_daily_report(
             f"Rendered report exceeds LINE's {MAX_LINE_TEXT_UTF16_UNITS}-UTF16-unit "
             f"text message limit ({utf16_length(result)} units). Consider trimming "
             f"the number of reasons/risk flags per stock, or splitting into multiple "
-            f"messages."
+            f"messages via render_daily_report_messages()."
         )
     return result
+
+
+# --- Multi-message packing (text-v12) ---------------------------------------
+
+
+def _join_sections(sections: list[str]) -> str:
+    return "\n\n".join(section for section in sections if section)
+
+
+def _assert_line_message_size(message: str, *, context: str) -> None:
+    length = utf16_length(message)
+    if length > MAX_LINE_TEXT_UTF16_UNITS:
+        raise ValueError(
+            f"{context} exceeds LINE's {MAX_LINE_TEXT_UTF16_UNITS}-UTF16-unit "
+            f"limit on its own ({length} units) — cannot be split further "
+            "without cutting content mid-section; trim its reasons/risk flags."
+        )
+
+
+def _pack_report_messages(
+    *, header_lines: list[str], stock_blocks: list[str], footer_lines: list[str]
+) -> list[str]:
+    """
+    Packs header + stock blocks + footer into as few LINE messages as
+    possible, each within MAX_LINE_TEXT_UTF16_UNITS. A stock block is
+    NEVER split across two messages — it moves to the next message in
+    full, so a reader never sees a half-rendered stock. header and
+    footer are each validated standalone first (a header/footer that
+    alone exceeds the limit is a template bug, not something packing
+    can fix).
+    """
+    header = "\n".join(header_lines)
+    footer = "\n".join(footer_lines)
+    _assert_line_message_size(header, context="Report header")
+    _assert_line_message_size(footer, context="Report footer")
+    for index, block in enumerate(stock_blocks, start=1):
+        _assert_line_message_size(block, context=f"Stock block #{index}")
+
+    messages: list[str] = []
+    current_sections: list[str] = [header]
+
+    for block in stock_blocks:
+        candidate = _join_sections([*current_sections, block])
+        if utf16_length(candidate) <= MAX_LINE_TEXT_UTF16_UNITS:
+            current_sections.append(block)
+            continue
+        messages.append(_join_sections(current_sections))
+        current_sections = [block]
+
+    candidate_with_footer = _join_sections([*current_sections, footer])
+    if utf16_length(candidate_with_footer) <= MAX_LINE_TEXT_UTF16_UNITS:
+        current_sections.append(footer)
+    else:
+        messages.append(_join_sections(current_sections))
+        current_sections = [footer]
+
+    messages.append(_join_sections(current_sections))
+
+    for index, message in enumerate(messages, start=1):
+        _assert_line_message_size(message, context=f"Report message #{index}")
+
+    return messages
+
+
+def render_daily_report_messages(
+    *,
+    trading_date: dt.date,
+    data_updated_at: str,
+    candidate_count: int,
+    eligible_count: int,
+    strategy_version: str,
+    ranked_stocks: list[ReportStockView],
+    ranking_limit: int = 10,
+) -> list[str]:
+    """
+    Same content as render_daily_report(), but split across as many
+    LINE text messages as needed so every message stays within
+    MAX_LINE_TEXT_UTF16_UNITS. Prefer this over render_daily_report()
+    for live delivery — render_daily_report() is kept for
+    backward-compatible single-string callers (dry-run diffing,
+    existing tests) but will raise once a day's Top N genuinely no
+    longer fits in one message, which is now an expected, not
+    exceptional, outcome of the explainable-signals rollout.
+    """
+    header_lines = _render_report_header_lines(
+        trading_date=trading_date,
+        data_updated_at=data_updated_at,
+        candidate_count=candidate_count,
+        eligible_count=eligible_count,
+        strategy_version=strategy_version,
+        ranking_limit=ranking_limit,
+    )
+    footer_lines = _render_report_footer_lines(strategy_version=strategy_version)
+
+    total_shown = len(ranked_stocks)
+    stock_blocks = [
+        "\n".join(_render_stock_block(stock, total_shown=total_shown))
+        for stock in ranked_stocks
+    ]
+
+    return _pack_report_messages(
+        header_lines=header_lines, stock_blocks=stock_blocks, footer_lines=footer_lines
+    )
 
 
 def render_no_qualified_stock_report(
@@ -766,6 +1051,7 @@ def render_no_qualified_stock_report(
             "✅ 法人籌碼：近 3 個交易日累積買超 > 0",
             "✅ 技術面：低檔且具起漲訊號",
             "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
+            "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
             "⬜ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
