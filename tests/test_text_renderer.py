@@ -685,6 +685,18 @@ def test_report_model_explanation_reflects_new_template():
     assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" in report
     # old text-v5 section is gone
     assert "「主要得分來源」" not in report
+    # Absolute Signal / Relative Score separation model description
+    assert "改採絕對訊號，見下" in report
+    assert "「訊號」區塊中的籌碼、基本面因子，其燈號改為「絕對訊號」" in report
+    assert "本次燈號語意調整不影響既有綜合分數計算公式" in report
+    assert "候選池樣本過少時" in report
+    assert "資料尚未到位，則明確顯示「資料尚未確認」" in report
+
+
+def test_progress_checklist_shows_absolute_signal_rollout_as_done():
+    report = _render(_make_stock_view())
+    assert "✅ 評分模型：絕對訊號與候選池相對分數分離" in report
+    assert "⬜ 評分模型：絕對訊號與候選池相對分數分離" not in report
 
 
 # --- No-qualified-stock report (unchanged behavior) --------------------------
@@ -712,6 +724,19 @@ def test_no_qualified_stock_report_uses_custom_ranking_limit():
         ranking_limit=15,
     )
     assert "暫無 Top 15 名單" in report
+
+
+def test_no_qualified_stock_report_also_shows_absolute_signal_rollout_as_done():
+    """render_no_qualified_stock_report 有自己獨立的一份功能進度清單
+    （見該函式定義），必須跟 render_daily_report 那份同步翻成 ✅。"""
+    report = render_no_qualified_stock_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=5,
+        strategy_version="rule-v1.2.0",
+    )
+    assert "✅ 評分模型：絕對訊號與候選池相對分數分離" in report
+    assert "⬜ 評分模型：絕對訊號與候選池相對分數分離" not in report
 
 
 # --- Standalone utilities (unchanged) -----------------------------------------
@@ -1025,7 +1050,12 @@ def test_relative_score_normal_sample_size_shown_alongside_percentile():
         )
     )
     assert "候選池相對分數：50/100（樣本 24）" in report
-    assert "樣本偏少" not in report
+    # scoped to the per-stock warning line's exact wording, not a bare
+    # substring — the footer's general policy explanation legitimately
+    # uses the phrase "樣本偏少" in prose describing when the warning
+    # would apply, which must not be confused with this stock's own
+    # per-stock warning actually firing.
+    assert "⚠ 樣本偏少，相對結果僅供參考" not in report
 
 
 def test_relative_score_warns_when_sample_size_between_five_and_nine():
@@ -1084,7 +1114,10 @@ def test_relative_score_missing_metadata_does_not_crash_and_shows_plain_score():
     )
     assert "候選池相對分數：50/100" in report
     assert "（樣本" not in report
-    assert "樣本偏少" not in report
+    # scoped to the per-stock warning line's exact wording — see the
+    # sibling fix above for why a bare "樣本偏少" substring check would
+    # false-positive against the footer's general policy explanation.
+    assert "⚠ 樣本偏少，相對結果僅供參考" not in report
 
 
 def test_institutional_cutoff_current_shows_confirmed_date():
@@ -1100,7 +1133,11 @@ def test_institutional_cutoff_current_shows_confirmed_date():
         )
     )
     assert "法人資料截止：T-1（2026/08/06）" in report
-    assert "資料尚未確認" not in report
+    # scoped to the exact per-stock cutoff line, not a bare substring
+    # check — the footer's general policy explanation legitimately
+    # mentions "資料尚未確認" as prose, which must not be confused with
+    # this stock's own (confirmed, non-stale) cutoff line.
+    assert "法人資料截止：T-1（2026/08/06）資料尚未確認" not in report
 
 
 def test_institutional_cutoff_stale_shows_unconfirmed_and_forces_unknown_signal():

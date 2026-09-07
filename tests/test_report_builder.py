@@ -6,10 +6,12 @@ import pytest
 
 from app.domain.candidate_builder import Candidate
 from app.domain.features import StockFeatures
+from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.limit_up import LimitUpResult, LimitUpSource
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
-from app.domain.scoring import ScoredStock
+from app.domain.scoring import FACTOR_WEIGHTS, ScoredStock
 from app.reports.report_builder import build_report_stocks
+from app.reports.text_renderer import render_daily_report
 
 TRADING_DATE = dt.date(2026, 8, 7)
 
@@ -699,3 +701,166 @@ def test_build_report_stocks_defaults_absolute_signal_fields_when_absent():
     assert result[0].institutional_data_cutoff is None
     assert result[0].relative_sample_size == {}
     assert result[0].relative_rank == {}
+
+
+# --- Step 8: end-to-end regression tests -------------------------------------
+#
+# The tests above (and Step 5/6's own unit tests) each verify their own
+# layer in isolation — build_report_stocks() carries fields through
+# correctly, text_renderer renders a hand-built ReportStockView
+# correctly. Neither proves the two layers are actually wired together
+# correctly when driven by the SAME real objects a live run would
+# produce. These tests close that gap by running the full
+# ScoredStock -> build_report_stocks() -> render_daily_report() chain,
+# exactly the sequence app.jobs.daily_ranking uses in production.
+
+
+def test_3022_institutional_absolute_signal_never_green_end_to_end():
+    """
+    Named regression test straight from the requirements doc: stock
+    "3022" on trading date 2026/09/04, with a 5-day institutional
+    net-buy ratio of -6.3% that nonetheless ranks 1st (percentile 100)
+    in an unusually small 3-stock candidate pool. Run through the REAL
+    ScoredStock -> build_report_stocks -> render_daily_report chain
+    (not a hand-built ReportStockView) to prove Steps 4/5/6 are
+    correctly wired together end-to-end, not just individually
+    correct in isolation.
+
+    Absolute Signal must show 🔴 (never 🟢), Relative Score must still
+    be visible (100/100, with the small pool correctly triggering the
+    rank-only degrade from Step 6), and the T-1 cutoff must be stated
+    explicitly.
+    """
+    trading_date = dt.date(2026, 9, 4)
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 9, 3),
+        confirmed_as_of_date=dt.date(2026, 9, 3),
+    )
+
+    scored = [
+        ScoredStock(
+            stock_id="3022",
+            total_score=76.4,
+            data_completeness=1.0,
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 100.0,  # best of the 3-stock pool...
+                "fundamental": 50.0,
+                "risk_quality": 90.0,
+            },
+            risk_flags=(),
+            relative_sample_size={"institutional": 3},
+            relative_rank={"institutional": 1},
+        )
+    ]
+    candidate = _make_candidate(
+        stock_id="3022",
+        stock_name="測試光罩",
+        open_price="50",
+        high_price="55",
+        low_price="50",
+        close_price="55",
+        reference_price="50",
+        limit_up_price="55",
+    )
+    features = StockFeatures(
+        stock_id="3022",
+        turnover=200_000_000.0,
+        average_turnover_20d=150_000_000.0,
+        volume_ratio_20d=1.8,
+        return_5d=0.06,
+        return_20d=0.15,
+        institutional_net_buy_ratio_5d=-0.063,  # ...but still a net sell
+        institutional_data_cutoff=cutoff,
+        revenue_yoy=0.05,
+        risk_quality_raw=0.9,
+    )
+
+    report_stocks = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"3022": candidate.stock},
+        candidates={"3022": candidate},
+        features_by_stock={"3022": features},
+    )
+
+    report = render_daily_report(
+        trading_date=trading_date,
+        data_updated_at="16:47",
+        candidate_count=3,
+        eligible_count=3,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=report_stocks,
+        ranking_limit=10,
+    )
+
+    assert "🟢 籌碼：強" not in report
+    assert "🔴 籌碼：偏弱" in report
+    assert "候選池相對：第 1 / 3（樣本偏少）" in report
+    assert "法人資料截止：T-1（2026/09/03）" in report
+    # the composite score is untouched by any of this — see the
+    # sibling test below for the more general version of this check.
+    assert "綜合分數：76.40" in report
+
+
+def test_total_score_unaffected_by_absolute_signal_rendering_end_to_end():
+    """
+    Item 17 from the requirements doc's completion checklist,
+    end-to-end version of Step 4's scoring-layer-only test: with the
+    SAME ScoredStock.total_score/factor_scores, changing only the
+    Absolute-Signal-relevant raw inputs (institutional_net_buy_ratio_5d
+    swung from positive to sharply negative) must not change the
+    rendered "綜合分數" line at all — Absolute Signal is a rendering
+    concern layered entirely on top of scoring, never feeding back
+    into it.
+    """
+
+    def render_with(institutional_net_buy_ratio_5d: float | None) -> str:
+        scored = [
+            ScoredStock(
+                stock_id="1101",
+                total_score=88.8,
+                data_completeness=1.0,
+                factor_scores={
+                    "liquidity": 90.0,
+                    "volume_price": 85.0,
+                    "momentum": 80.0,
+                    "institutional": 90.0,
+                    "fundamental": 90.0,
+                    "risk_quality": 90.0,
+                },
+                risk_flags=(),
+            )
+        ]
+        candidate = _make_candidate(stock_id="1101")
+        features = _make_features(
+            "1101", institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d
+        )
+        report_stocks = build_report_stocks(
+            ranked_stocks=scored,
+            stock_master={"1101": candidate.stock},
+            candidates={"1101": candidate},
+            features_by_stock={"1101": features},
+        )
+        return render_daily_report(
+            trading_date=TRADING_DATE,
+            data_updated_at="16:47",
+            candidate_count=1,
+            eligible_count=1,
+            strategy_version="rule-v1.2.0",
+            ranked_stocks=report_stocks,
+            ranking_limit=10,
+        )
+
+    report_positive = render_with(0.03)
+    report_negative = render_with(-0.09)
+
+    assert "🟢 籌碼：強" in report_positive
+    assert "🔴 籌碼：偏弱" in report_negative
+    # despite the opposite Absolute Signal, both reports show the
+    # exact same composite score, unaffected by which raw institutional
+    # value was used to derive the light.
+    assert "綜合分數：88.80" in report_positive
+    assert "綜合分數：88.80" in report_negative
+    assert sum(FACTOR_WEIGHTS.values()) == pytest.approx(1.0)
