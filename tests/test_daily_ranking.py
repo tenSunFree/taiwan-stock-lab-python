@@ -2522,7 +2522,17 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert "資料完整度：90%" in captured.out
     assert "訊號" in captured.out
     assert "🟢 流動性：強" in captured.out
-    assert "🟢 基本面：強" in captured.out
+    # NOTE: as of the Absolute Signal / Relative Score rollout,
+    # "fundamental"'s 🟢/🟡/🔴/⚪ is decided by the RAW revenue_yoy value
+    # (see app.domain.absolute_signal), not by the mocked
+    # factor_scores["fundamental"]=85.0 above. This test's fixture
+    # only mocks score_candidates() — revenue_yoy still flows through
+    # the REAL FinMind pipeline, which this fixture never supplies
+    # revenue rows for, so revenue_yoy is None for stock 1101 here.
+    # ⚪ is therefore the correct, honest result: it reflects real
+    # missing revenue data, not a wiring bug in the rendering pipeline
+    # this test exists to verify.
+    assert "⚪ 基本面：資料不足" in captured.out
 
 
 def test_run_end_to_end_eps_growth_sustained_reaches_rendered_report(

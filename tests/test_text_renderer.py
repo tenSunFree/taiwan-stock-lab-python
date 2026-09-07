@@ -243,7 +243,8 @@ def test_report_shows_signal_lights_including_volume_price():
                 "institutional": None,
                 "fundamental": 75.0,
                 "risk_quality": None,
-            }
+            },
+            revenue_yoy=0.12,
         )
     )
     assert "🟢 流動性：強" in report
@@ -374,10 +375,13 @@ def test_institutional_net_buy_unknown_shows_insufficient_data():
 
 
 def test_institutional_net_buy_is_independent_of_institutional_score():
-    """法人籌碼區塊的 True/False 與「訊號」區塊裡 institutional 因子
-    的分數是兩件獨立的事：即使 institutional 評分因子偏低（🔴 偏弱），
-    近 3 日累積買超一樣可能是正的，兩者不應互相覆蓋或矛盾地被合併
-    顯示。"""
+    """Absolute institutional signal、candidate-pool relative score，
+    以及 3-day institutional display signal 是三件不同的事：即使
+    Absolute Signal 為 🔴 偏弱（近 5 日淨買超比為負），近 3 日累積
+    買超一樣可能是正的——5 日 ratio 與 3 日 cumulative net-buy sign
+    本來就是不同的計算窗口（例如：前兩日大量賣超、最近三日小幅轉買，
+    5 日合計仍可能為負，3 日合計卻是正），兩者不應互相覆蓋或矛盾地
+    被合併顯示。"""
     report = _render(
         _make_stock_view(
             factor_scores={
@@ -388,6 +392,7 @@ def test_institutional_net_buy_is_independent_of_institutional_score():
                 "fundamental": 50.0,
                 "risk_quality": 90.0,
             },
+            institutional_net_buy_ratio_5d=-0.02,
             institutional_net_buy_3d_positive=True,
         )
     )
@@ -497,11 +502,20 @@ def test_fundamental_growth_one_confirmed_false_one_unknown_stays_unconfirmed():
     assert "　EPS YoY ≥ 10%，且具持續性：資料不足" in report
 
 
-def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
-    """基本面區塊的合併結果與「訊號」區塊裡 fundamental 因子的分數
-    是兩件獨立的事：即使 fundamental 評分因子（單月最新 YoY）偏低，
-    營收的 3 個月持續性判斷仍可能是 True，兩者不應互相覆蓋或矛盾地被
-    合併顯示。"""
+def test_absolute_fundamental_signal_is_independent_of_growth_sustained_signal():
+    """Absolute fundamental signal（最新月營收 YoY 的絕對值）、
+    候選池相對分數，以及「營收或 EPS 持續性」這個獨立的 tri-state
+    區塊，是三件不同的事：最新月營收 YoY 可以是 -5%（Absolute Signal
+    因此為 🔴 偏弱），但 EPS 的持續性判斷仍可能是 True（不同的計算
+    窗口、不同的資料來源）——兩者不應互相覆蓋或矛盾地被合併顯示。
+
+    注意：不能用 revenue_yoy=-0.05 搭配
+    fundamental_growth_sustained=True，因為 fundamental_growth_sustained
+    本身的規則就要求最新月營收 YoY >= 10%（見
+    app.domain.monthly_revenue_builder），兩者在正常資料中不可能同時
+    成立。這裡改用 eps_growth_sustained=True 來證明同一件事：Absolute
+    Fundamental Signal 不等於 Revenue/EPS Sustained Signal，也不等於
+    Relative Fundamental Score。"""
     report = _render(
         _make_stock_view(
             factor_scores={
@@ -512,11 +526,13 @@ def test_fundamental_growth_sustained_is_independent_of_fundamental_score():
                 "fundamental": 20.0,
                 "risk_quality": 90.0,
             },
-            fundamental_growth_sustained=True,
+            revenue_yoy=-0.05,
+            fundamental_growth_sustained=False,
+            eps_growth_sustained=True,
         )
     )
     assert "🔴 基本面：偏弱" in report
-    assert "　營收 YoY ≥ 10%，且具持續性：是" in report
+    assert "　EPS YoY ≥ 10%，且具持續性：是" in report
 
 
 def test_progress_checklist_shows_fundamental_growth_as_done():
@@ -882,3 +898,270 @@ def test_full_report_raises_helpful_error_when_data_gaps_and_flags_compound():
     except ValueError as exc:
         assert "5000-UTF16-unit" in str(exc)
         assert "splitting into multiple messages" in str(exc)
+
+
+# --- Step 6: Absolute Signal / Relative Score separation (rendering) --------
+
+
+def test_institutional_absolute_signal_positive_ratio_is_green():
+    report = _render(_make_stock_view(institutional_net_buy_ratio_5d=0.01))
+    assert "🟢 籌碼：強" in report
+
+
+def test_institutional_absolute_signal_zero_ratio_is_yellow():
+    report = _render(_make_stock_view(institutional_net_buy_ratio_5d=0.0))
+    assert "🟡 籌碼：普通" in report
+
+
+def test_institutional_absolute_signal_missing_ratio_is_unknown():
+    report = _render(_make_stock_view(institutional_net_buy_ratio_5d=None))
+    assert "⚪ 籌碼：資料不足" in report
+
+
+def test_institutional_absolute_signal_never_green_despite_top_pool_rank():
+    """
+    核心 regression test，直接對應 Absolute Signal / Relative Score
+    分離這整個 rollout 要修的 bug：一檔法人淨賣超 -6.3% 的股票，即使
+    它在候選池中排名第一（percentile 100），也絕對不能顯示 🟢——
+    Absolute Signal 與 Relative Score 必須同時可見，且互不覆蓋。
+    """
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 100.0,
+                "fundamental": 50.0,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_ratio_5d=-0.063,
+            relative_sample_size={"institutional": 28},
+            relative_rank={"institutional": 1},
+        )
+    )
+    assert "🟢 籌碼：強" not in report
+    assert "🔴 籌碼：偏弱" in report
+    assert "候選池相對分數：100/100（樣本 28）" in report
+
+
+def test_fundamental_absolute_signal_boundaries():
+    assert "🟢 基本面：強" in _render(_make_stock_view(revenue_yoy=0.12))
+    assert "🟡 基本面：普通" in _render(_make_stock_view(revenue_yoy=0.05))
+    assert "🔴 基本面：偏弱" in _render(_make_stock_view(revenue_yoy=-0.05))
+    assert "⚪ 基本面：資料不足" in _render(_make_stock_view(revenue_yoy=None))
+
+
+def test_fundamental_absolute_signal_never_green_despite_top_pool_rank():
+    """基本面版本的核心 disagreement test：最新月營收 YoY 為 -5%
+    （絕對值為負），即使候選池相對分數是滿分 100，也絕對不能顯示
+    🟢 基本面：強。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 50.0,
+                "fundamental": 100.0,
+                "risk_quality": 90.0,
+            },
+            revenue_yoy=-0.05,
+            relative_sample_size={"fundamental": 26},
+            relative_rank={"fundamental": 1},
+        )
+    )
+    assert "🟢 基本面：強" not in report
+    assert "🔴 基本面：偏弱" in report
+    assert "候選池相對分數：100/100（樣本 26）" in report
+
+
+def test_liquidity_volume_price_momentum_risk_quality_rendering_is_unchanged():
+    """這四個因子不在這次 Absolute Gate 的範圍內，燈號規則、行內格式
+    （"｜NN/100（候選池相對／絕對規則）"）都必須維持完全不變。
+    institutional/fundamental 明確設為 None（對應的原始值也是預設
+    None），避免這兩個不是本測試重點的因子意外冒出候選池相對分數的
+    雜訊。"""
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 45.0,
+                "momentum": 70.0,
+                "institutional": None,
+                "fundamental": None,
+                "risk_quality": 90.0,
+            },
+            relative_sample_size={"liquidity": 3, "volume_price": 3, "risk_quality": 3},
+            relative_rank={"liquidity": 1, "volume_price": 2, "risk_quality": 1},
+        )
+    )
+    assert "🟢 流動性：強｜80/100（候選池相對）" in report
+    assert "🟡 量價：普通｜45/100（候選池相對）" in report
+    assert "🟢 動能：強｜70/100（絕對規則）" in report
+    assert "🟢 風險品質：強｜90/100（候選池相對）" in report
+    # these four factors never show the new "候選池相對分數"/"候選池
+    # 相對：第 N / M" wording, even when relative_sample_size/relative_rank
+    # metadata is present for them (that metadata is harmless extra
+    # data these factors simply don't render).
+    assert "候選池相對分數：" not in report
+    assert "候選池相對：第" not in report
+
+
+def test_relative_score_normal_sample_size_shown_alongside_percentile():
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 50.0,
+                "fundamental": None,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_ratio_5d=0.01,
+            relative_sample_size={"institutional": 24},
+            relative_rank={"institutional": 3},
+        )
+    )
+    assert "候選池相對分數：50/100（樣本 24）" in report
+    assert "樣本偏少" not in report
+
+
+def test_relative_score_warns_when_sample_size_between_five_and_nine():
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 50.0,
+                "fundamental": None,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_ratio_5d=0.01,
+            relative_sample_size={"institutional": 7},
+            relative_rank={"institutional": 2},
+        )
+    )
+    assert "候選池相對分數：50/100（樣本 7）" in report
+    assert "⚠ 樣本偏少，相對結果僅供參考" in report
+    assert "候選池相對：第" not in report
+
+
+def test_relative_score_degrades_to_rank_when_sample_size_below_five():
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 50.0,
+                "fundamental": None,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_ratio_5d=0.01,
+            relative_sample_size={"institutional": 3},
+            relative_rank={"institutional": 1},
+        )
+    )
+    assert "候選池相對：第 1 / 3（樣本偏少）" in report
+    assert "候選池相對分數：50/100" not in report
+
+
+def test_relative_score_missing_metadata_does_not_crash_and_shows_plain_score():
+    """既有 caller 可能仍以 relative_sample_size={}/relative_rank={}
+    建構 ReportStockView（例如尚未串接 daily_ranking 的舊 caller）——
+    renderer 必須用 .get(key) 安全取值，不能 KeyError，也不能捏造一個
+    假的樣本數或排名。"""
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_ratio_5d=0.01,
+            revenue_yoy=None,
+            relative_sample_size={},
+            relative_rank={},
+        )
+    )
+    assert "候選池相對分數：50/100" in report
+    assert "（樣本" not in report
+    assert "樣本偏少" not in report
+
+
+def test_institutional_cutoff_current_shows_confirmed_date():
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6),
+        confirmed_as_of_date=dt.date(2026, 8, 6),
+    )
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_ratio_5d=0.01, institutional_data_cutoff=cutoff
+        )
+    )
+    assert "法人資料截止：T-1（2026/08/06）" in report
+    assert "資料尚未確認" not in report
+
+
+def test_institutional_cutoff_stale_shows_unconfirmed_and_forces_unknown_signal():
+    """核心 T-1 stale-protection regression test：即使
+    institutional_net_buy_ratio_5d 仍然有值（0.10，正值，絕對意義上
+    應該是 🟢），只要 cutoff 明確表示 T-1 尚未確認，institutional
+    Absolute Signal 就必須強制顯示 ⚪ 資料不足，不能信任這個舊/未確認
+    的數值來畫出 🟢/🟡/🔴——這是 T-1 cutoff 這個機制存在的意義。"""
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6), confirmed_as_of_date=None
+    )
+    report = _render(
+        _make_stock_view(
+            factor_scores={
+                "liquidity": 80.0,
+                "volume_price": 75.0,
+                "momentum": 70.0,
+                "institutional": 60.0,
+                "fundamental": None,
+                "risk_quality": 90.0,
+            },
+            institutional_net_buy_ratio_5d=0.10,  # would otherwise be 🟢
+            institutional_data_cutoff=cutoff,
+            relative_sample_size={"institutional": 24},
+            relative_rank={"institutional": 1},
+        )
+    )
+    assert "🟢 籌碼" not in report
+    assert "⚪ 籌碼：資料不足" in report
+    assert "法人資料截止：T-1（2026/08/06）資料尚未確認" in report
+    # the Relative Score line must also be suppressed — the whole
+    # factor is being treated as unavailable for this render, not
+    # merely re-labeled.
+    assert "候選池相對分數：" not in report
+
+
+def test_institutional_cutoff_unresolved_shows_insufficient_data():
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_ratio_5d=0.01, institutional_data_cutoff=None
+        )
+    )
+    assert "法人資料截止：資料不足" in report
+
+
+def test_institutional_cutoff_does_not_affect_fundamental_factor():
+    """T-1 stale-protection 只作用於 institutional 因子，不應該波及
+    fundamental（兩者是完全獨立的資料來源與截止日概念）。"""
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6), confirmed_as_of_date=None
+    )
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_ratio_5d=0.10,
+            institutional_data_cutoff=cutoff,
+            revenue_yoy=0.12,
+        )
+    )
+    assert "⚪ 籌碼：資料不足" in report
+    assert "🟢 基本面：強" in report
