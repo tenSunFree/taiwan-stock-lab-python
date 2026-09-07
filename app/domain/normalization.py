@@ -15,6 +15,38 @@ from __future__ import annotations
 import pandas as pd
 
 
+def relative_score_sample_size(series: pd.Series) -> int:
+    """
+    Count of values actually available to percentile_score's ranking
+    population (i.e. len(valid) inside that function). Exposed
+    separately so callers (app.domain.scoring) can attach "how many
+    candidates was this percentile computed against" to each factor's
+    Relative Score — needed for the small-sample degrade rule (see
+    rank_within_pool below): a percentile computed against only 3
+    candidates is not the same kind of statement as one computed
+    against 40.
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    return int(numeric.notna().sum())
+
+
+def rank_within_pool(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    """
+    1-based rank of each value within the same non-missing population
+    percentile_score would use (1 = best). Missing input values stay
+    missing (NaN) in the output, same convention as percentile_score.
+
+    Plain ordinal rank — no winsorization, no rescaling. Used as the
+    small-sample fallback display for Relative Score: when the
+    candidate pool is too small for a 0-100 percentile to mean much
+    (see relative_score_sample_size's docstring), "ranked 1st of 3" is
+    a more honest statement than "100/100".
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    ascending = not higher_is_better
+    return numeric.rank(method="min", ascending=ascending)
+
+
 def percentile_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce")
     valid = numeric.dropna()

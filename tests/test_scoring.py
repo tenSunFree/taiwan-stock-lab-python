@@ -3,6 +3,7 @@ import pytest
 from app.domain.features import StockFeatures
 from app.domain.scoring import (
     FACTOR_WEIGHTS,
+    RELATIVE_SCORE_FACTORS,
     ScoredStock,
     score_candidates,
     select_top_n,
@@ -219,3 +220,71 @@ def test_select_top_n_uses_turnover_as_tie_breaker():
     )
 
     assert [stock.stock_id for stock in top_ranked] == ["HIGH_TURNOVER", "LOW_TURNOVER"]
+
+
+# --- Step 4: relative_sample_size / relative_rank are additive-only ---------
+
+
+def test_relative_sample_size_and_rank_are_populated_for_relative_factors():
+    features = [
+        make_features(f"S{i}", inst=0.01 * i, rev=0.01 * i) for i in range(1, 4)
+    ]
+
+    scored = score_candidates(features)
+
+    for stock in scored:
+        for factor_name in RELATIVE_SCORE_FACTORS:
+            assert stock.relative_sample_size[factor_name] == 3
+            assert stock.relative_rank[factor_name] in (1, 2, 3)
+        # momentum is never a key in either dict (absolute rule, not a
+        # pool percentile — see RELATIVE_SCORE_FACTORS's own docstring)
+        assert "momentum" not in stock.relative_sample_size
+        assert "momentum" not in stock.relative_rank
+
+
+def test_relative_rank_is_none_when_stocks_own_value_is_missing():
+    features = [
+        make_features("A"),
+        make_features("B"),
+        StockFeatures(
+            stock_id="C",
+            turnover=100_000_000,
+            average_turnover_20d=80_000_000,
+            volume_ratio_20d=1.5,
+            return_5d=0.05,
+            return_20d=None,
+            institutional_net_buy_ratio_5d=None,  # missing
+            revenue_yoy=0.10,
+            risk_quality_raw=0.9,
+        ),
+    ]
+    scored = {s.stock_id: s for s in score_candidates(features)}
+    assert scored["C"].relative_rank["institutional"] is None
+    # sample size still reflects the other 2 stocks that DID have a
+    # value, not 0 and not 3
+    assert scored["C"].relative_sample_size["institutional"] == 2
+    assert scored["A"].relative_sample_size["institutional"] == 2
+
+
+def test_total_score_formula_is_unchanged_by_relative_score_metadata():
+    """
+    Regression test: adding relative_sample_size/relative_rank must
+    NOT change total_score/data_completeness/factor_scores in any way.
+    Verified by independently recomputing the pre-existing
+    weighted-average formula from factor_scores and comparing against
+    total_score.
+    """
+    features = [make_features(f"S{i}") for i in range(5)]
+    scored = score_candidates(features)
+
+    for stock in scored:
+        weighted_sum = 0.0
+        available_weight = 0.0
+        for factor_name, weight in FACTOR_WEIGHTS.items():
+            value = stock.factor_scores.get(factor_name)
+            if value is None:
+                continue
+            weighted_sum += value * weight
+            available_weight += weight
+        expected_total_score = round(weighted_sum / available_weight, 2)
+        assert stock.total_score == pytest.approx(expected_total_score)

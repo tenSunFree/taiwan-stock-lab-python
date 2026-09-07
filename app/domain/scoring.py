@@ -19,12 +19,17 @@ completeness threshold are not eligible for ranking.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
 from app.domain.features import StockFeatures
-from app.domain.normalization import bounded_momentum_score, percentile_score
+from app.domain.normalization import (
+    bounded_momentum_score,
+    percentile_score,
+    rank_within_pool,
+    relative_score_sample_size,
+)
 
 FACTOR_WEIGHTS: dict[str, float] = {
     "liquidity": 0.25,
@@ -33,6 +38,37 @@ FACTOR_WEIGHTS: dict[str, float] = {
     "institutional": 0.15,
     "fundamental": 0.15,
     "risk_quality": 0.10,
+}
+
+# Factors whose factor_scores[key] is a candidate-pool percentile (see
+# the percentile_score calls in score_candidates below), and therefore
+# have a meaningful "how many candidates was this ranked against"
+# (relative_sample_size) and ordinal rank (relative_rank).
+#
+# "momentum" is deliberately excluded: it is scored by
+# bounded_momentum_score, an ABSOLUTE non-monotonic rule against fixed
+# thresholds (see that function's own docstring), not a percentile
+# against the pool — "sample size" is not a meaningful concept for it.
+RELATIVE_SCORE_FACTORS: tuple[str, ...] = (
+    "liquidity",
+    "volume_price",
+    "institutional",
+    "fundamental",
+    "risk_quality",
+)
+
+# Maps each RELATIVE_SCORE_FACTORS entry to the raw column in
+# _build_factor_frame's output that percentile_score actually consumes
+# for it — used below to compute relative_sample_size/relative_rank
+# from the exact same raw values and higher_is_better direction as the
+# factor_scores[...] = percentile_score(...) calls, so the two can
+# never silently drift apart.
+_RAW_COLUMN_BY_RELATIVE_FACTOR: dict[str, str] = {
+    "liquidity": "turnover",
+    "volume_price": "volume_ratio_20d",
+    "institutional": "institutional_net_buy_ratio_5d",
+    "fundamental": "revenue_yoy",
+    "risk_quality": "risk_quality_raw",
 }
 
 
@@ -51,6 +87,25 @@ class ScoredStock:
     # that constructs a ScoredStock without this field (e.g. an older
     # test fixture) keeps working unchanged.
     risk_missing_inputs: tuple[str, ...] = ()
+
+    # Relative Score metadata for the small-sample degrade rule (see
+    # RELATIVE_SCORE_FACTORS above). Both dicts are keyed by the same
+    # factor names as factor_scores, but ONLY for factors in
+    # RELATIVE_SCORE_FACTORS — "momentum" is never a key in either.
+    # This is purely additive report-layer metadata: it does NOT feed
+    # weighted_sum/total_score/data_completeness above in any way, and
+    # existing callers that construct a ScoredStock without these
+    # fields (e.g. older test fixtures) keep working unchanged since
+    # both default to {}.
+    #
+    # relative_sample_size[factor]: how many candidates in this run's
+    #   pool had a non-missing raw value for that factor (i.e. the
+    #   population percentile_score actually ranked against).
+    relative_sample_size: dict[str, int] = field(default_factory=dict)
+    # relative_rank[factor]: this stock's 1-based ordinal rank within
+    #   that same population (1 = best), or None if this stock's own
+    #   value for that factor was missing.
+    relative_rank: dict[str, int | None] = field(default_factory=dict)
 
 
 def _build_factor_frame(features: list[StockFeatures]) -> pd.DataFrame:
@@ -94,6 +149,23 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
     flags_by_stock = {f.stock_id: f.risk_flags for f in features}
     risk_missing_inputs_by_stock = {f.stock_id: f.risk_missing_inputs for f in features}
 
+    # Relative Score metadata (see RELATIVE_SCORE_FACTORS and
+    # ScoredStock.relative_sample_size/relative_rank above) — computed
+    # from the same raw columns/higher_is_better direction as the
+    # percentile_score calls above, but kept in a separate frame so it
+    # can never influence factor_scores/weighted_sum/total_score.
+    relative_sample_sizes: dict[str, int] = {
+        factor_name: relative_score_sample_size(df[column])
+        for factor_name, column in _RAW_COLUMN_BY_RELATIVE_FACTOR.items()
+    }
+    relative_ranks = pd.DataFrame(
+        {
+            factor_name: rank_within_pool(df[column], higher_is_better=True)
+            for factor_name, column in _RAW_COLUMN_BY_RELATIVE_FACTOR.items()
+        },
+        index=df.index,
+    )
+
     results: list[ScoredStock] = []
     total_weight = sum(FACTOR_WEIGHTS.values())
 
@@ -118,6 +190,13 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
         total_score = round(weighted_sum / available_weight, 2)
         data_completeness = round(available_weight / total_weight, 4)
 
+        stock_relative_rank: dict[str, int | None] = {}
+        for factor_name in RELATIVE_SCORE_FACTORS:
+            rank_value = relative_ranks.loc[stock_id, factor_name]
+            stock_relative_rank[factor_name] = (
+                None if pd.isna(rank_value) else int(rank_value)
+            )
+
         results.append(
             ScoredStock(
                 stock_id=stock_id,
@@ -126,6 +205,8 @@ def score_candidates(features: list[StockFeatures]) -> list[ScoredStock]:
                 factor_scores=row_scores,
                 risk_flags=flags_by_stock.get(stock_id, tuple()),
                 risk_missing_inputs=risk_missing_inputs_by_stock.get(stock_id, tuple()),
+                relative_sample_size=dict(relative_sample_sizes),
+                relative_rank=stock_relative_rank,
             )
         )
 
