@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.reports import signal_explainer as se
 
 DISCLAIMER = (
@@ -273,6 +274,38 @@ class ReportStockView:
     # is_managed — and is also what _risk_quality_missing_reason uses
     # to build an accurate sentence instead of a stale hardcoded one.
     risk_missing_inputs: tuple[str, ...] = field(default_factory=tuple)
+
+    # --- Absolute Signal / Relative Score separation ---------------
+    #
+    # See app.domain.absolute_signal's module docstring for the full
+    # rationale. institutional_data_cutoff carries
+    # app.domain.institutional_flow_builder.InstitutionalDataCutoff
+    # through so every institutional-derived line (the "訊號" block's
+    # "institutional" factor, AND the separate "法人籌碼" tri-state
+    # block) can state an explicit T-1 cutoff instead of leaving a
+    # reader to guess whether a figure already includes target_date's
+    # own activity. None means no trading-day history exists to anchor
+    # a cutoff against at all (distinct from "cutoff resolved but T-1
+    # flow itself missing" — see InstitutionalDataCutoff.is_current).
+    #
+    # NOT YET consumed by any rendering function as of this step —
+    # wiring it into the actual 🟢/🟡/🔴 emoji decision and the printed
+    # cutoff line is a later step. This step only carries the data
+    # through the view model.
+    institutional_data_cutoff: InstitutionalDataCutoff | None = None
+
+    # relative_sample_size[factor] / relative_rank[factor]: carried
+    # straight through from ScoredStock (see that dataclass's own
+    # docstring) for the small-sample Relative Score degrade rule.
+    # Only meaningful for keys in
+    # app.domain.scoring.RELATIVE_SCORE_FACTORS — "momentum" is never a
+    # key in either dict, since it is scored by an absolute rule, not a
+    # pool percentile (see that constant's own docstring). Both default
+    # to {} so existing callers/tests that don't set them keep working
+    # unchanged. Also not yet consumed by any rendering function as of
+    # this step.
+    relative_sample_size: dict[str, int] = field(default_factory=dict)
+    relative_rank: dict[str, int | None] = field(default_factory=dict)
 
 
 def top_factors(

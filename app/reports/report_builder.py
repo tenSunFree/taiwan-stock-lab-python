@@ -87,6 +87,14 @@ turnover/average_turnover_20d). Same required-not-optional status as
 StockFeatures itself: every ranked stock_id is guaranteed a matching
 StockFeatures entry, so these fields are always populated from that
 same entry, never defaulted independently.
+
+As part of the Absolute Signal / Relative Score separation rollout,
+also carries StockFeatures.institutional_data_cutoff and
+ScoredStock.relative_sample_size / ScoredStock.relative_rank through
+to ReportStockView unchanged (see those fields' own docstrings). Same
+required-not-optional status as the rest of StockFeatures/ScoredStock
+above. Not yet consumed by any rendering function — wiring these into
+the actual report output is a later step in this rollout.
 """
 
 from __future__ import annotations
@@ -240,6 +248,10 @@ def build_report_stocks(
                 fundamental_growth_sustained=(features.fundamental_growth_sustained),
                 eps_growth_sustained=(features.eps_growth_sustained),
                 risk_missing_inputs=scored.risk_missing_inputs,
+                # --- Absolute Signal / Relative Score separation ---
+                institutional_data_cutoff=features.institutional_data_cutoff,
+                relative_sample_size=dict(scored.relative_sample_size),
+                relative_rank=dict(scored.relative_rank),
             )
         )
 

@@ -614,3 +614,88 @@ def test_build_report_stocks_eps_growth_sustained_defaults_to_none():
     )
 
     assert result[0].eps_growth_sustained is None
+
+
+# --- Step 5: Absolute Signal / Relative Score fields pass through unchanged --
+
+
+def test_build_report_stocks_carries_institutional_data_cutoff_through():
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6),
+        confirmed_as_of_date=dt.date(2026, 8, 6),
+    )
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features("1101", institutional_data_cutoff=cutoff)
+        },
+    )
+
+    assert result[0].institutional_data_cutoff is cutoff
+
+
+def test_build_report_stocks_carries_relative_sample_size_and_rank_through():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+            relative_sample_size={"liquidity": 12},
+            relative_rank={"liquidity": 1},
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].relative_sample_size == {"liquidity": 12}
+    assert result[0].relative_rank == {"liquidity": 1}
+
+
+def test_build_report_stocks_defaults_absolute_signal_fields_when_absent():
+    """A ScoredStock built without relative_sample_size/relative_rank
+    (e.g. an older test fixture) must still flow through
+    build_report_stocks without error, defaulting to {}."""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].institutional_data_cutoff is None
+    assert result[0].relative_sample_size == {}
+    assert result[0].relative_rank == {}
