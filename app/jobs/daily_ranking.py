@@ -427,7 +427,7 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # uses deliver_many()/deliver_broadcast_many() with a per-part
 # idempotency identity (see app.delivery.service.build_message_part_version)
 # instead of a single deliver()/deliver_broadcast() call.
-MESSAGE_VERSION = "text-v12"
+MESSAGE_VERSION = "text-v13"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
