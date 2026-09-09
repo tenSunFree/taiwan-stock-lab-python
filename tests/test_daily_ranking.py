@@ -1615,6 +1615,99 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     assert client.calls == ["1101"]
     assert client.institutional_calls == ["1101"]
     assert client.revenue_calls == ["1101"]
+    # --- Step 7: institutional_data_cutoff wiring ---
+    # History fixture (20 daily rows starting 2026-06-01) makes the
+    # most recent eligible trading day 2026-06-20; the institutional
+    # fixture above (5 rows starting 2026-06-16) includes that exact
+    # date, so the cutoff must resolve as current.
+    assert feature.institutional_data_cutoff is not None
+    assert feature.institutional_data_cutoff.expected_as_of_date == dt.date(2026, 6, 20)
+    assert feature.institutional_data_cutoff.confirmed_as_of_date == dt.date(
+        2026, 6, 20
+    )
+    assert feature.institutional_data_cutoff.is_current is True
+
+
+def test_build_stock_features_institutional_cutoff_is_stale_when_t_minus_1_flow_missing():
+    """
+    Step 7 regression test for the "3022 @ 2026/09/04"-style scenario
+    from the requirements doc: the price history establishes T-1 as
+    2026-06-20, but the institutional flow fixture only covers
+    2026-06-10 through 2026-06-12 — T-1 itself never landed. The
+    cutoff must resolve as NOT current (confirmed_as_of_date=None),
+    even though institutional_net_buy_ratio_5d/3d_positive already
+    independently return None for the same reason (missing window
+    data) — institutional_data_cutoff is what lets the report EXPLAIN
+    why, instead of just showing a bare "資料不足" with no cutoff
+    detail.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    history_rows = _make_history_rows(20, close="100", volume="1000000")
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": history_rows},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                3, start=dt.date(2026, 6, 10), buy=1000, sell=200
+            )
+        },
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    assert feature.institutional_net_buy_ratio_5d is None
+    assert feature.institutional_net_buy_3d_positive is None
+    assert feature.institutional_data_cutoff is not None
+    assert feature.institutional_data_cutoff.expected_as_of_date == dt.date(2026, 6, 20)
+    assert feature.institutional_data_cutoff.confirmed_as_of_date is None
+    assert feature.institutional_data_cutoff.is_current is False
+
+
+def test_build_stock_features_institutional_cutoff_still_resolves_on_total_fetch_failure():
+    """
+    Step 7 regression test: even when the institutional fetch itself
+    raises (total failure, not just empty rows), institutional_data_cutoff
+    must still resolve from volume_by_date alone (populated
+    independently by block 1's price-history fetch) — it must NOT
+    silently stay None/unresolvable just because block 2's own
+    try/except caught an exception. This is what the flow_points=[]
+    initialization before block 2's try/except exists for.
+    """
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = [_make_candidate("1101")]
+    history_rows = _make_history_rows(20, close="100", volume="1000000")
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": history_rows},
+        institutional_failing_stock_ids={"1101"},
+    )
+
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+
+    assert len(features) == 1
+    feature = features[0]
+    assert feature.institutional_net_buy_ratio_5d is None
+    assert feature.institutional_data_cutoff is not None
+    assert feature.institutional_data_cutoff.expected_as_of_date == dt.date(2026, 6, 20)
+    assert feature.institutional_data_cutoff.confirmed_as_of_date is None
+    assert feature.institutional_data_cutoff.is_current is False
 
 
 def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog):
@@ -2522,7 +2615,17 @@ def test_run_report_dry_run_prints_ranked_report(capsys, monkeypatch):
     assert "資料完整度：90%" in captured.out
     assert "訊號" in captured.out
     assert "🟢 流動性：強" in captured.out
-    assert "🟢 基本面：強" in captured.out
+    # NOTE: as of the Absolute Signal / Relative Score rollout,
+    # "fundamental"'s 🟢/🟡/🔴/⚪ is decided by the RAW revenue_yoy value
+    # (see app.domain.absolute_signal), not by the mocked
+    # factor_scores["fundamental"]=85.0 above. This test's fixture
+    # only mocks score_candidates() — revenue_yoy still flows through
+    # the REAL FinMind pipeline, which this fixture never supplies
+    # revenue rows for, so revenue_yoy is None for stock 1101 here.
+    # ⚪ is therefore the correct, honest result: it reflects real
+    # missing revenue data, not a wiring bug in the rendering pipeline
+    # this test exists to verify.
+    assert "⚪ 基本面：資料不足" in captured.out
 
 
 def test_run_end_to_end_eps_growth_sustained_reaches_rendered_report(

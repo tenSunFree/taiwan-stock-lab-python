@@ -270,6 +270,16 @@ a later phase (see [Roadmap](#roadmap)).
 - Stocks below the minimum data-completeness threshold are ineligible
   for the published ranking (Top N, configurable via `RANKING_LIMIT`),
   regardless of score
+- As of `rule-v1.2.0`'s report layer (not a scoring-formula change —
+  see Report Rendering below), the institutional and fundamental
+  factors' cross-sectional percentile still feeds `total_score`
+  exactly as before, but no longer by itself decides that factor's
+  report-facing 🟢/🟡/🔴 light: a stock's institutional net-buy ratio
+  or revenue YoY can rank best in an unusually small candidate pool
+  (percentile 100) while still being negative in absolute terms (net
+  selling / negative YoY) — the percentile and the absolute value now
+  answer two different questions, shown as two separate report lines,
+  rather than one collapsing into the other
 
 ### Report Rendering
 
@@ -394,9 +404,13 @@ a later phase (see [Roadmap](#roadmap)).
   zero-penalty/display-only flags (`ATTENTION_STOCK`/
   `DISPOSITION_STOCK`/`MANAGED_STOCK` in `rule-v1.2.0`) always render
   as `supplemental`, never mixed into the same sentence as an actual
-  score-driving reason. `text_renderer.py` still owns 100% of the
-  emoji/level-word decision — `signal_explainer` only explains *why* a
-  score landed where it did, never *what color* it gets
+  score-driving reason. As of `text-v13` (see below), `text_renderer.py`
+  still owns 100% of the emoji/level-word decision for
+  liquidity/volume_price/momentum/risk_quality; institutional/
+  fundamental instead delegate that decision to `app.domain.absolute_signal`.
+  Either way, `signal_explainer` never decides the color or the word
+  for any factor — only explains *why* a score/raw value landed where
+  it did
 - Because every factor now carries explanatory text, a fully-populated
   Top N report can genuinely exceed LINE's single-message
   5000-UTF-16-unit limit — no longer a rare edge case.
@@ -431,6 +445,29 @@ a later phase (see [Roadmap](#roadmap)).
   silently sending nothing — the reader can confirm the pipeline ran
   normally
 - Enforces LINE's 5000-UTF-16-unit text message limit at render time
+- As of `text-v13`, the institutional and fundamental factors' 🟢/🟡/
+  🔴/⚪ light is decided by `app.domain.absolute_signal` from the
+  factor's RAW value (5-day institutional net-buy ratio sign / latest
+  monthly revenue YoY vs. a 10% threshold), never from the
+  candidate-pool percentile that still separately feeds `total_score`
+  unchanged — a percentile of 100 among today's candidates does not
+  mean the underlying number is good in absolute terms. That
+  percentile is still shown, just as its own separate "候選池相對分數"
+  line, and degrades to a plain rank ("候選池排名：第 N / M") once the
+  candidate pool is too small (under 10, warned; under 5, rank-only)
+  for a percentile to be a meaningful statement. Every institutional-
+  derived line (this factor's light, its relative-score line, and the
+  independent 3-day net-buy tri-state section above) also states an
+  explicit T-1 data-cutoff date, since FinMind's institutional-flow
+  data for the report's own target date is never available at run
+  time — if that cutoff resolves as stale (T-1 itself hasn't landed
+  yet), the institutional light renders ⚪ (data unavailable)
+  regardless of whatever raw ratio value happens to be present,
+  rather than risk showing a confident color derived from an
+  unconfirmed session. `liquidity`/`volume_price`/`risk_quality` are
+  unaffected — their light is still directly the pool percentile —
+  and `momentum` is unaffected — it was already using
+  `bounded_momentum_score`'s absolute rule, never a percentile
 - `REPORT_DRY_RUN=true` prints the exact report text to stdout for
   manual inspection, with no LINE call and no database write — as of
   `text-v12`, when the report is split into multiple messages, each
@@ -448,7 +485,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v12`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v13`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -805,6 +842,30 @@ pytest -v
   regression test born directly from a real TPEx 520 incident
   encountered in production
 
+- Absolute Signal / Relative Score separation tests
+  (`test_absolute_signal.py`, `test_normalization.py`) covering the
+  institutional/fundamental gate boundaries (`>0`/`=0`/`<0`,
+  `>=10%`/`>=0%`/`<0%`, and `None` → unconfirmed rather than a guessed
+  color) in isolation, plus `relative_score_sample_size`/
+  `rank_within_pool`'s tie-handling and missing-value behavior;
+  `test_institutional_flow_builder.py` covering
+  `resolve_institutional_data_cutoff`'s three T-1 cases (confirmed
+  current, resolved-but-unconfirmed/stale, and unresolvable — no
+  trading-day history at all) independent of whether the ratio/3-day
+  calculations themselves succeed; `test_text_renderer.py` covering
+  the rendered Absolute-Signal-vs-Relative-Score disagreement case
+  (a negative raw value that still ranks best in the candidate pool
+  must never render 🟢), the small-sample percentile-to-rank degrade
+  at both threshold boundaries, and a dedicated regression test for
+  the T-1-stale defensive invariant (a present-but-unconfirmed raw
+  value must render ⚪, never the color its own sign would otherwise
+  imply); and end-to-end tests (`test_report_builder.py`,
+  `test_daily_ranking.py`) proving the full
+  `ScoredStock -> build_report_stocks() -> render_daily_report()`
+  chain — not each layer's own isolated unit tests — produces the
+  correct light and that `total_score` is provably unaffected by
+  which Absolute Signal ends up rendered
+
 See the badge at the top of this file for current test status.
 
 ---
@@ -824,6 +885,8 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   features.py               StockFeatures, including risk_missing_inputs
                             (carried through from RiskAssessment),
                             institutional_net_buy_3d_positive,
+                            institutional_data_cutoff (see
+                            institutional_flow_builder.py below),
                             technical_low_with_rising_signal,
                             fundamental_growth_sustained (revenue-only),
                             and eps_growth_sustained (its independent
@@ -838,7 +901,26 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   institutional_flow_builder.py
                              Institutional net-buy ratio (5-day, scoring
                              factor) and net-buy positive sign check
-                             (3-day, display-only) — both look-ahead-safe
+                             (3-day, display-only) — both look-ahead-safe;
+                             also resolve_institutional_data_cutoff(),
+                             which determines the explicit T-1 data-cutoff
+                             date to display alongside both of the above,
+                             independent of whether either calculation
+                             itself succeeds (FinMind's institutional-flow
+                             data for the report's own target date is
+                             never available at run time — see
+                             InstitutionalDataCutoff's own docstring)
+  absolute_signal.py         Maps a factor's RAW value (institutional
+                             net-buy ratio sign / revenue YoY vs. a 10%
+                             threshold) to its ABSOLUTE financial-meaning
+                             🟢/🟡/🔴/⚪, completely independent of the
+                             candidate pool — see Multi-Factor Scoring and
+                             Report Rendering above for why a percentile-
+                             best value isn't necessarily good in absolute
+                             terms. Scoped to institutional/fundamental
+                             only; momentum already uses an absolute rule
+                             via bounded_momentum_score and needs no gate
+                             here
   monthly_revenue_builder.py
                              Revenue YoY (look-ahead-safe via available_at,
                              scoring factor) and an independent
@@ -858,11 +940,18 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   scoring.py / normalization.py
                              Multi-factor scoring, Top-N selection,
                              risk_missing_inputs propagation to
-                             ScoredStock, and (normalization.py)
+                             ScoredStock, (normalization.py)
                              MOMENTUM_IDEAL_LOW/HIGH/DANGEROUS_HIGH as
                              named constants shared with
                              app.reports.signal_explainer so the scoring
-                             rule and its explanation never drift apart
+                             rule and its explanation never drift apart,
+                             and (scoring.py) relative_sample_size/
+                             relative_rank per RELATIVE_SCORE_FACTORS —
+                             additive report-layer metadata for the
+                             small-sample percentile-to-rank degrade (see
+                             Report Rendering above) that never feeds back
+                             into total_score/data_completeness/
+                             factor_scores itself
   eps_growth_builder.py       Standalone quarterly EPS YoY + sustained-growth
                             signal, and the revenue-OR-EPS tri-state OR
                             combiner used at the report-rendering layer
@@ -901,7 +990,7 @@ app/reports/           Report rendering
                             institutional_net_buy_3d_positive,
                             technical_low_with_rising_signal,
                             fundamental_growth_sustained,
-                            eps_growth_sustained, risk_missing_inputs, and
+                            eps_growth_sustained, risk_missing_inputs,
                             (as of text-v12) the raw per-factor inputs
                             (turnover, average_turnover_20d, return_5d,
                             return_20d, institutional_net_buy_ratio_5d,
@@ -909,7 +998,10 @@ app/reports/           Report rendering
                             signal_explainer.py needs to explain each
                             factor_scores value — revenue and EPS are
                             passed through as their OWN independent fields,
-                            never pre-combined here
+                            never pre-combined here — and (as of text-v13)
+                            institutional_data_cutoff/relative_sample_size/
+                            relative_rank, unchanged from StockFeatures/
+                            ScoredStock
   signal_explainer.py         Turns each of the six scoring factors' raw
                             input + its already-computed 0-100 score into
                             1-3 fixed-template, verifiable reasons — no
@@ -921,23 +1013,31 @@ app/reports/           Report rendering
                             only explains why a score landed where it did
   text_renderer.py            Fixed-template LINE-compatible text output:
                             per-factor signal lights (with a momentum-
-                            overheating override) each backed by
+                            overheating override; institutional/
+                            fundamental delegate their light to
+                            app.domain.absolute_signal as of text-v13 —
+                            see Report Rendering above) each backed by
                             signal_explainer's reasons, tri-state
                             regulatory status with distinct
                             per-day-announcement vs active-period wording,
                             a 法人籌碼 tri-state institutional net-buy
-                            display, a 技術面 tri-state low-position/
+                            display (with its own T-1 cutoff line as of
+                            text-v13), a 技術面 tri-state low-position/
                             early-rally display, a 基本面 section
                             combining revenue and EPS growth-sustained via
                             a tri-state OR at render time (with both
                             components still shown as sub-lines), limit-up
                             structure, a dynamically built risk_quality gap
-                            explanation, and (as of text-v12)
-                            render_daily_report_messages() /
-                            _pack_report_messages() for splitting a
-                            fully-populated report across multiple
-                            LINE messages when it exceeds the
-                            5000-UTF-16-unit single-message limit
+                            explanation, render_daily_report_messages() /
+                            _pack_report_messages() (as of text-v12) for
+                            splitting a fully-populated report across
+                            multiple LINE messages when it exceeds the
+                            5000-UTF-16-unit single-message limit, and
+                            (as of text-v13) the Relative Score display
+                            (_render_relative_score_lines, with its
+                            small-sample percentile-to-rank degrade) and
+                            the institutional T-1 cutoff line
+                            (_render_institutional_cutoff_line)
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client

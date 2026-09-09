@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
 
 @dataclass(frozen=True)
 class StockFeatures:
@@ -123,3 +125,27 @@ class StockFeatures:
     # sentence that stopped matching reality once attention/disposition
     # were wired in.
     risk_missing_inputs: tuple[str, ...] = field(default_factory=tuple)
+
+    # See app.domain.institutional_flow_builder.InstitutionalDataCutoff.
+    # Carried through so the report layer (later steps 5/6) can state
+    # an explicit data-cutoff date for every institutional-related
+    # field — the "institutional" factor's Absolute Signal, its
+    # candidate-pool relative score, the 3-day cumulative net-buy
+    # check, and the 5-day net-buy ratio — instead of leaving a reader
+    # to guess whether a figure like -6.3% already includes
+    # target_date's own activity.
+    #
+    # None covers two cases: (1) no historical trading-day data exists
+    # to anchor a T-1 date against, or (2) institutional-data
+    # fetch/parse itself failed this run and returned no rows. Both
+    # mean the same thing for reporting purposes ("cannot be
+    # confirmed"), so they are intentionally not distinguished further
+    # here.
+    #
+    # Intentionally last, defaulting to None: same dataclass convention
+    # as institutional_net_buy_3d_positive etc. above — once one field
+    # has a default, every field after it needs one too, so existing
+    # StockFeatures(...) call sites (e.g. daily_ranking.py) keep
+    # working unchanged. Wiring this into daily_ranking.py is step 7's
+    # job; intentionally left untouched here.
+    institutional_data_cutoff: InstitutionalDataCutoff | None = None

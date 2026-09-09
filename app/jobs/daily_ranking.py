@@ -205,6 +205,7 @@ from app.domain.eps_growth_builder import build_eps_growth_sustained_signal
 from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_positive,
     build_institutional_net_buy_ratio,
+    resolve_institutional_data_cutoff,
 )
 from app.domain.models import Market, RegulatoryRiskStatus, StockMaster, StockValuation
 from app.domain.monthly_revenue_builder import (
@@ -426,7 +427,7 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # uses deliver_many()/deliver_broadcast_many() with a per-part
 # idempotency identity (see app.delivery.service.build_message_part_version)
 # instead of a single deliver()/deliver_broadcast() call.
-MESSAGE_VERSION = "text-v12"
+MESSAGE_VERSION = "text-v13"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -858,6 +859,15 @@ def build_stock_features(
         # the ratio's failure handling below rather than needing its
         # own separate counters.
         institutional_net_buy_3d_positive = None
+        # Populated below from whatever institutional_rows we manage
+        # to fetch and parse, regardless of whether the ratio/3d-
+        # positive calculations themselves ultimately succeed —
+        # initialized here (same pattern as volume_by_date in block 1
+        # above) so resolve_institutional_data_cutoff() after the
+        # try/except can always compute a cutoff from whatever flow
+        # data was actually obtained this run, even on total fetch
+        # failure (empty list, same as "no flow data confirmed").
+        flow_points: list = []
 
         try:
             institutional_payload = finmind_client.fetch_stock_institutional_investors(
@@ -904,6 +914,25 @@ def build_stock_features(
                 "institutional_net_buy_ratio_5d remains None",
                 stock_id,
             )
+
+        # Resolved unconditionally from volume_by_date (always
+        # populated from block 1 above, independent of this block's
+        # own fetch/parse success) plus whatever flow_points we did
+        # manage to obtain (possibly [] on total failure or empty
+        # rows). See
+        # app.domain.institutional_flow_builder.resolve_institutional_data_cutoff's
+        # own docstring — this must be able to state an explicit T-1
+        # cutoff (or explicitly say it couldn't be confirmed) even
+        # when institutional_net_buy_ratio_5d itself ends up None,
+        # which is exactly the "3022 @ 2026/09/04"-style scenario the
+        # Absolute Signal / Relative Score rollout's requirements doc
+        # calls out: the report must never silently imply T-1 data is
+        # current when it isn't.
+        institutional_data_cutoff = resolve_institutional_data_cutoff(
+            target_date=target_date,
+            flow_points=flow_points,
+            volume_by_date=volume_by_date,
+        )
 
         # --- Independent block 3: monthly revenue YoY ---
         revenue_yoy = None
@@ -1098,6 +1127,7 @@ def build_stock_features(
             return_20d=return_20d,
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
+            institutional_data_cutoff=institutional_data_cutoff,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             revenue_yoy=revenue_yoy,
             fundamental_growth_sustained=fundamental_growth_sustained,
@@ -1113,6 +1143,8 @@ def build_stock_features(
             "volume_ratio_20d=%s return_5d=%s return_20d=%s "
             "institutional_net_buy_ratio_5d=%s "
             "institutional_net_buy_3d_positive=%s "
+            "institutional_data_cutoff_expected=%s "
+            "institutional_data_cutoff_confirmed=%s "
             "technical_low_with_rising_signal=%s revenue_yoy=%s "
             "fundamental_growth_sustained=%s eps_growth_sustained=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
@@ -1124,6 +1156,8 @@ def build_stock_features(
             stock_features.return_20d,
             stock_features.institutional_net_buy_ratio_5d,
             stock_features.institutional_net_buy_3d_positive,
+            stock_features.institutional_data_cutoff.expected_as_of_date,
+            stock_features.institutional_data_cutoff.confirmed_as_of_date,
             stock_features.technical_low_with_rising_signal,
             stock_features.revenue_yoy,
             stock_features.fundamental_growth_sustained,

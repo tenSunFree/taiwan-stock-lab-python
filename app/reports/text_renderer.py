@@ -14,15 +14,31 @@ As of text-v12 (explainable signals), the "訊號" block no longer just
 prints a bare word per factor — it delegates to
 app.reports.signal_explainer, which turns each factor's raw
 StockFeatures input + its already-computed 0-100 score into fixed,
-template-based, verifiable reasons. This module still owns 100% of
-the emoji/level-word decisions (_signal_emoji / _signal_word /
-_momentum_signal_word below) — signal_explainer only explains WHY a
-score landed where it did, it never decides the color or the word.
-Whether a score is "候選池相對" (pool-relative percentile) or "絕對
-規則" (an absolute rule, momentum only) is rendered here, directly
-next to the score, rather than as an extra reason bullet from
-signal_explainer — kept here rather than duplicated per-factor to
-stay within LINE's per-message character budget.
+template-based, verifiable reasons. This module owns the emoji/
+level-word decisions for liquidity/volume_price/momentum/risk_quality
+(_signal_emoji / _signal_word / _momentum_signal_word below);
+institutional/fundamental instead delegate that decision to
+app.domain.absolute_signal (see the Absolute Signal / Relative Score
+separation note below) — signal_explainer never decides the color or
+the word for any factor, only explains WHY a score/raw value landed
+where it did.
+
+As part of the Absolute Signal / Relative Score separation rollout,
+institutional/fundamental's 🟢/🟡/🔴/⚪ is decided by
+app.domain.absolute_signal from the factor's RAW value (the 5-day
+institutional net-buy ratio / latest-month revenue YoY), never from
+the candidate-pool percentile also carried in factor_scores — a
+percentile of 100 among today's candidates does not mean the
+underlying number is good in absolute terms (see that module's own
+docstring for the motivating bug). The percentile is still shown, just
+as its own separate "候選池相對分數" line via
+_render_relative_score_lines, degrading to a bare rank display when
+the candidate pool is too small for a percentile to be a meaningful
+statement (see MIN_SAMPLE_SIZE_FOR_WARNED_PERCENTILE below). This
+applies ONLY to institutional/fundamental — liquidity/volume_price/
+risk_quality keep their pre-existing "🟢/🟡/🔴 IS the pool-relative
+percentile" behavior unchanged, and momentum keeps its pre-existing
+absolute-rule behavior unchanged (see _momentum_signal_word).
 
 Also as of text-v12, the header/footer sections of the daily report
 are split out into their own render functions
@@ -45,7 +61,13 @@ import datetime as dt
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from app.domain.absolute_signal import (
+    AbsoluteSignal,
+    fundamental_absolute_signal,
+    institutional_absolute_signal,
+)
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.reports import signal_explainer as se
 
 DISCLAIMER = (
@@ -274,6 +296,41 @@ class ReportStockView:
     # to build an accurate sentence instead of a stale hardcoded one.
     risk_missing_inputs: tuple[str, ...] = field(default_factory=tuple)
 
+    # --- Absolute Signal / Relative Score separation ---------------
+    #
+    # See app.domain.absolute_signal's module docstring for the full
+    # rationale. institutional_data_cutoff carries
+    # app.domain.institutional_flow_builder.InstitutionalDataCutoff
+    # through so every institutional-derived line (the "訊號" block's
+    # "institutional" factor, AND the separate "法人籌碼" tri-state
+    # block) can state an explicit T-1 cutoff instead of leaving a
+    # reader to guess whether a figure already includes target_date's
+    # own activity. None means no trading-day history exists to anchor
+    # a cutoff against at all (distinct from "cutoff resolved but T-1
+    # flow itself missing" — see InstitutionalDataCutoff.is_current).
+    #
+    # Consumed by _render_signal_lines: when this cutoff resolves as
+    # stale (is_current is False), the institutional factor's Absolute
+    # Signal/Relative Score are both forced to show as unavailable
+    # for this render, regardless of whatever
+    # institutional_net_buy_ratio_5d itself holds — see that
+    # function's own comments for why.
+    institutional_data_cutoff: InstitutionalDataCutoff | None = None
+
+    # relative_sample_size[factor] / relative_rank[factor]: carried
+    # straight through from ScoredStock (see that dataclass's own
+    # docstring) for the small-sample Relative Score degrade rule
+    # (see MIN_SAMPLE_SIZE_FOR_WARNED_PERCENTILE /
+    # _render_relative_score_lines). Only meaningful for keys in
+    # app.domain.scoring.RELATIVE_SCORE_FACTORS — "momentum" is never a
+    # key in either dict, since it is scored by an absolute rule, not a
+    # pool percentile (see that constant's own docstring). Both default
+    # to {} so existing callers/tests that don't set them keep working
+    # unchanged (treated the same as a normal-sized pool — see
+    # _render_relative_score_lines).
+    relative_sample_size: dict[str, int] = field(default_factory=dict)
+    relative_rank: dict[str, int | None] = field(default_factory=dict)
+
 
 def top_factors(
     factor_scores: dict[str, float | None], limit: int = 2
@@ -371,26 +428,40 @@ def _render_factor_block(
     score: float | None,
     risk_flags: tuple[str, ...],
     explanation: se.FactorExplanation,
+    absolute: AbsoluteSignal | None = None,
+    sample_size: int | None = None,
+    rank: int | None = None,
+    cutoff_line: str | None = None,
 ) -> list[str]:
     """
-    One factor's full block: emoji + level word + score (+ pool-
-    relative/absolute-rule qualifier), then its verifiable reasons/
-    confirmed/missing/supplemental lines, then a data-status line
-    (omitted when data_status == "完整" — the common, unremarkable
-    case — to keep each block short; "部分缺失"/"資料不足" are the
-    cases a reader actually needs flagged). The emoji/word decision
-    stays entirely with _signal_emoji/_signal_word/_momentum_signal_word
-    above — this function (and signal_explainer) never re-derive or
-    override those.
+    One factor's full block: emoji + level word (+ pool-relative
+    score / absolute-rule qualifier, or a separate Relative Score
+    section — see below), then its verifiable reasons/confirmed/
+    missing/supplemental lines, then a data-status line (omitted when
+    data_status == "完整"), then an optional cutoff_line.
+
+    `absolute`, when given (institutional/fundamental only — see
+    app.domain.absolute_signal's module docstring), decides the
+    emoji/word from the factor's ABSOLUTE financial meaning instead of
+    _signal_emoji/_signal_word/_momentum_signal_word, and the
+    candidate-pool percentile (still real, still feeds total_score
+    unchanged) is rendered as its OWN "候選池相對..." line via
+    _render_relative_score_lines instead of an inline
+    "｜NN/100（候選池相對）" suffix on the header. For every other
+    factor (absolute=None) this function's behavior is exactly what it
+    was before this rollout.
     """
-    emoji = _signal_emoji(score)
-    word = (
-        _momentum_signal_word(score, risk_flags)
-        if key == "momentum"
-        else _signal_word(score)
-    )
+    if absolute is not None:
+        emoji, word = absolute.emoji, absolute.word
+    else:
+        emoji = _signal_emoji(score)
+        word = (
+            _momentum_signal_word(score, risk_flags)
+            if key == "momentum"
+            else _signal_word(score)
+        )
     header = f"{emoji} {label}：{word}"
-    if score is not None:
+    if absolute is None and score is not None:
         qualifier = "絕對規則" if key == "momentum" else "候選池相對"
         header += f"｜{score:.0f}/100（{qualifier}）"
 
@@ -408,7 +479,92 @@ def _render_factor_block(
         lines.extend(f"• {item}" for item in explanation.supplemental)
     if explanation.data_status != "完整":
         lines.append(f"資料狀態：{explanation.data_status}")
+
+    if cutoff_line is not None:
+        lines.append(cutoff_line)
+
+    if absolute is not None and score is not None:
+        lines.extend(
+            _render_relative_score_lines(
+                score=score, sample_size=sample_size, rank=rank
+            )
+        )
+
     return lines
+
+
+# --- Relative Score display (Absolute Signal / Relative Score separation) ---
+#
+# Small-sample degrade thresholds. n here is
+# ScoredStock.relative_sample_size[factor] (see that field's own
+# docstring): how many candidates in TODAY's pool had a non-missing
+# raw value for this factor — NOT len(ranked_stocks)/ranking_limit.
+# These specific numbers are not invented in this module — they come
+# from the original requirements doc's "小樣本 Relative Score 降級"
+# section:
+#   n >= 10        -> show the percentile normally
+#   5 <= n < 10     -> show the percentile, with a small-sample caveat
+#   n < 5           -> show a plain rank instead of a percentile
+MIN_SAMPLE_SIZE_FOR_NORMAL_PERCENTILE = 10
+MIN_SAMPLE_SIZE_FOR_WARNED_PERCENTILE = 5
+
+
+def _render_relative_score_lines(
+    *, score: float, sample_size: int | None, rank: int | None
+) -> list[str]:
+    """
+    Renders the candidate-pool Relative Score as its OWN line(s),
+    separate from the Absolute Signal header — see
+    app.domain.absolute_signal's module docstring for why the two must
+    never be collapsed into one number. This function ONLY decides
+    Relative Score display; it never touches the Absolute Signal
+    emoji/word.
+
+    sample_size is None whenever the caller wasn't able to supply it
+    (e.g. an older ScoredStock/test fixture built before this
+    rollout's relative_sample_size field existed) — treated the same
+    as a normal-sized pool (n >= 10) rather than triggering a spurious
+    small-sample warning purely from missing metadata.
+    """
+    if sample_size is not None and sample_size < MIN_SAMPLE_SIZE_FOR_WARNED_PERCENTILE:
+        if rank is not None:
+            return [f"候選池相對：第 {rank} / {sample_size}（樣本偏少）"]
+        # score is not None implies this stock's own raw value existed,
+        # which implies rank should also be set — this branch is a
+        # defensive fallback only, not an expected path.
+        return [f"候選池相對分數：{score:.0f}/100（樣本偏少）"]
+
+    if sample_size is not None and sample_size < MIN_SAMPLE_SIZE_FOR_NORMAL_PERCENTILE:
+        return [
+            f"候選池相對分數：{score:.0f}/100（樣本 {sample_size}）",
+            "⚠ 樣本偏少，相對結果僅供參考",
+        ]
+
+    if sample_size is not None:
+        return [f"候選池相對分數：{score:.0f}/100（樣本 {sample_size}）"]
+
+    return [f"候選池相對分數：{score:.0f}/100"]
+
+
+def _render_institutional_cutoff_line(cutoff: InstitutionalDataCutoff | None) -> str:
+    """
+    Renders the explicit T-1 data-cutoff disclosure required for the
+    institutional factor (see InstitutionalDataCutoff's own docstring).
+    Three distinct wordings so they can never be mistaken for one
+    another:
+
+        1. cutoff unresolved (no trading-day history, or this
+           ReportStockView was built before this rollout's
+           institutional_data_cutoff field was wired in) -> "資料不足"
+        2. T-1 confirmed present -> concrete date + "T-1"
+        3. T-1 confirmed missing -> explicit "資料尚未確認", NEVER a
+           date that could be mistaken for a confirmed T-1
+    """
+    if cutoff is None or cutoff.expected_as_of_date is None:
+        return "法人資料截止：資料不足"
+    if cutoff.is_current:
+        return f"法人資料截止：T-1（{cutoff.confirmed_as_of_date:%Y/%m/%d}）"
+    return f"法人資料截止：T-1（{cutoff.expected_as_of_date:%Y/%m/%d}）資料尚未確認"
 
 
 def _render_signal_lines(stock: ReportStockView) -> list[str]:
@@ -456,15 +612,63 @@ def _render_signal_lines(stock: ReportStockView) -> list[str]:
         ),
     }
 
+    # --- Absolute Signal / Relative Score separation ----------------
+    #
+    # institutional/fundamental delegate their emoji/word decision to
+    # app.domain.absolute_signal, using the RAW value rather than the
+    # candidate-pool percentile in `scores` (see that module's
+    # docstring). Every other factor keeps absolute=None, which makes
+    # _render_factor_block fall back to its pre-existing
+    # _signal_emoji/_signal_word/_momentum_signal_word behavior
+    # unchanged.
+    institutional_cutoff = stock.institutional_data_cutoff
+    # Defensive invariant: if the cutoff explicitly says T-1 flow data
+    # is stale/unconfirmed, the institutional Absolute Signal — and
+    # everything else about this factor for this render — must show
+    # ⚪ 資料不足, regardless of whatever institutional_net_buy_ratio_5d
+    # happens to hold (a fixture, an older caller, or a future bug
+    # could otherwise leave a stale/mismatched value in place). cutoff
+    # being None (an older ReportStockView built before this rollout's
+    # institutional_data_cutoff field existed) does NOT trigger this
+    # override — see the InstitutionalDataCutoff import's own
+    # docstring for why "resolved as stale" and "never resolved at
+    # all" are deliberately different states here.
+    institutional_is_stale = (
+        institutional_cutoff is not None and not institutional_cutoff.is_current
+    )
+    if institutional_is_stale:
+        explanations["institutional"] = se.FactorExplanation(data_status="資料不足")
+
+    absolutes: dict[str, AbsoluteSignal | None] = {
+        "institutional": institutional_absolute_signal(
+            None if institutional_is_stale else stock.institutional_net_buy_ratio_5d
+        ),
+        "fundamental": fundamental_absolute_signal(stock.revenue_yoy),
+    }
+    # Relative Score must never be shown alongside a stale-forced ⚪ —
+    # the whole institutional factor is being treated as unavailable
+    # for this render, not merely re-labeled.
+    display_scores = dict(scores)
+    if institutional_is_stale:
+        display_scores["institutional"] = None
+
     lines = ["訊號"]
     for key, label in _SIGNAL_FACTOR_ORDER:
         lines.extend(
             _render_factor_block(
                 key=key,
                 label=label,
-                score=scores.get(key),
+                score=display_scores.get(key),
                 risk_flags=risk_flags,
                 explanation=explanations[key],
+                absolute=absolutes.get(key),
+                sample_size=stock.relative_sample_size.get(key),
+                rank=stock.relative_rank.get(key),
+                cutoff_line=(
+                    _render_institutional_cutoff_line(institutional_cutoff)
+                    if key == "institutional"
+                    else None
+                ),
             )
         )
         lines.append("")  # 因子間空一行，避免整段黏在一起
@@ -565,14 +769,29 @@ def _render_regulatory_status_lines(stock: ReportStockView) -> list[str]:
 
 
 def _render_institutional_flow_lines(stock: ReportStockView) -> list[str]:
-    value = stock.institutional_net_buy_3d_positive
+    """
+    法人籌碼 tri-state 區塊 —— 顯示近 3 個交易日累積買超是否 > 0。
+
+    institutional_net_buy_3d_positive 跟「訊號」區塊裡籌碼因子用的
+    institutional_net_buy_ratio_5d 是同一組 flow_points/volume_by_date
+    算出來的，所以理論上兩者的 T-1 資料狀態應該一致。但這裡刻意不假設
+    這件事永遠成立——比照 _render_signal_lines 對籌碼因子做的
+    T-1 stale 防護，這個區塊也必須獨立檢查 cutoff：只要 cutoff 明確
+    表示 T-1 尚未確認，就強制顯示「資料不足」，不能信任
+    institutional_net_buy_3d_positive 本身碰巧仍有值（例如未來某次
+    計算邏輯調整、或測試 fixture 手動塞入不一致的資料）。
+    """
+    cutoff = stock.institutional_data_cutoff
+    is_stale = cutoff is not None and not cutoff.is_current
+
+    value = None if is_stale else stock.institutional_net_buy_3d_positive
     if value is None:
         line = "⚪ 近 3 個交易日累積買超 > 0：資料不足"
     elif value:
         line = "✅ 近 3 個交易日累積買超 > 0：是"
     else:
         line = "❌ 近 3 個交易日累積買超 > 0：否"
-    return ["法人籌碼", line]
+    return ["法人籌碼", line, _render_institutional_cutoff_line(cutoff)]
 
 
 # --- 技術面 (low-position + early-rally, display-only tri-state) --------------
@@ -786,6 +1005,7 @@ def _render_report_header_lines(
         "✅ 技術面：低檔且具起漲訊號",
         "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
         "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
+        "✅ 評分模型：絕對訊號與候選池相對分數分離",
         "⬜ 技術面：低檔首板",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
@@ -809,9 +1029,39 @@ def _render_report_footer_lines(*, strategy_version: str) -> list[str]:
         (
             "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
             "⚪ 代表該因子目前資料不足，並不代表負面訊號。分數後方標註"
-            "「候選池相對」或「絕對規則」——除動能因子（絕對規則，見下）外，"
+            "「候選池相對」或「絕對規則」——除動能因子（絕對規則）、"
+            "以及籌碼與基本面因子（改採絕對訊號，見下）外，"
             "其餘因子分數皆為與當日候選股互相比較後的相對名次，"
             "不代表對照市場整體或固定絕對門檻。"
+        ),
+        (
+            "「訊號」區塊中的籌碼、基本面因子，其燈號改為「絕對訊號」："
+            "直接依該因子的絕對金融語意判定（籌碼看近 5 日法人淨買超"
+            "占比之正負，基本面看最新月營收 YoY 是否達 10%），"
+            "不再由候選池相對排名直接決定，因此可能出現"
+            "「🔴 偏弱｜候選池相對分數 100/100」——代表絕對值仍為負向，"
+            "但在當日候選池中相對最佳，兩者並不矛盾。"
+        ),
+        (
+            "「候選池相對分數」僅表示該標的在當日有效候選池中的相對"
+            "位置，不代表對照市場整體的百分位、勝率或預期報酬率。"
+            "候選池樣本過少時（少於 10 檔）會加註樣本偏少警語；少於 5 "
+            "檔時改以「候選池排名」呈現，避免將小樣本排名誤讀為精準"
+            "評等。"
+        ),
+        (
+            "本次燈號語意調整不影響既有綜合分數計算公式；綜合分數仍"
+            "依原有候選池相對分數與權重加權計算，未因本次調整而改變。"
+        ),
+        (
+            "所有法人（籌碼）相關欄位——因子燈號、候選池相對分數、"
+            "近 3 個交易日累積買超、近 5 日法人淨買超占比——皆標示"
+            "實際資料截止日期。因法人買賣超資料到位時間晚於本系統"
+            "產生報表的時間，目標交易日當日（T）法人資料恆不可得，"
+            "固定以最近一個已確認有資料的交易日（T-1）為準；若 T-1 "
+            "資料尚未到位，則明確顯示「資料尚未確認」，不會以更早的"
+            "資料冒充為 T-1，也不會偷偷縮短或延長固定的近 3 日／近 5 "
+            "日窗口。"
         ),
         (
             "動能因子採非單調評分；顯示「漲多過熱」時，"
@@ -1052,6 +1302,7 @@ def render_no_qualified_stock_report(
             "✅ 技術面：低檔且具起漲訊號",
             "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
             "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
+            "✅ 評分模型：絕對訊號與候選池相對分數分離",
             "⬜ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",

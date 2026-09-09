@@ -186,3 +186,91 @@ def build_institutional_net_buy_positive(
         total_net_shares += net_shares
 
     return total_net_shares > 0
+
+
+# --- Data cutoff (T-1) resolution -------------------------------------------
+#
+# build_institutional_net_buy_ratio / build_institutional_net_buy_positive
+# above only ever return the computed value or None — neither one can
+# answer:
+#
+#   which trading date did this result actually cut off at?
+#   if it's None, is that because there's no trading-day history at
+#   all, or because T-1's institutional data simply hasn't landed yet?
+#
+# This section adds InstitutionalDataCutoff so the report layer can
+# state an explicit institutional-data cutoff date, instead of leaving
+# a reader to guess whether a figure like -6.3% already includes
+# target_date's own activity. Neither existing function above is
+# modified.
+
+
+@dataclass(frozen=True)
+class InstitutionalDataCutoff:
+    # The most recent trading date strictly before target_date, per
+    # the historical price/volume calendar — i.e. what "T-1" concretely
+    # refers to for this run, independent of whether institutional flow
+    # data for that date has actually been received. None only when
+    # there's no historical trading date at all to anchor against
+    # (e.g. empty volume_by_date).
+    expected_as_of_date: dt.date | None
+
+    # The most recent trading date (<= expected_as_of_date) for which
+    # institutional flow data IS confirmed present. None means even
+    # T-1 itself is missing — every institutional-derived report field
+    # must then render as "資料不足" (⚪), never a guessed value.
+    confirmed_as_of_date: dt.date | None
+
+    @property
+    def is_current(self) -> bool:
+        """True iff confirmed data reaches all the way to T-1 with no
+        gap. False covers both "stale" (older than T-1) and "entirely
+        absent" — both cases the report must flag explicitly, rather
+        than silently presenting confirmed_as_of_date as if it were
+        T-1."""
+        return (
+            self.expected_as_of_date is not None
+            and self.confirmed_as_of_date == self.expected_as_of_date
+        )
+
+
+def resolve_institutional_data_cutoff(
+    *,
+    target_date: dt.date,
+    flow_points: list[InstitutionalFlowPoint],
+    volume_by_date: dict[dt.date, float],
+) -> InstitutionalDataCutoff:
+    """
+    Determine the institutional-data cutoff to display alongside any
+    institutional-derived figure, regardless of whether that
+    particular figure could actually be computed.
+
+    Reuses the exact same "eligible trading day" rule as
+    build_institutional_net_buy_ratio / build_institutional_net_buy_positive
+    above, so the displayed cutoff can never drift from what those
+    functions actually used as their window boundary.
+    """
+    eligible_volume_dates = sorted(
+        trading_date
+        for trading_date, volume in volume_by_date.items()
+        if (trading_date < target_date and volume > 0)
+    )
+    expected_as_of_date = eligible_volume_dates[-1] if eligible_volume_dates else None
+
+    if expected_as_of_date is None:
+        return InstitutionalDataCutoff(
+            expected_as_of_date=None, confirmed_as_of_date=None
+        )
+
+    flow_dates = {
+        point.trading_date for point in flow_points if point.trading_date < target_date
+    }
+
+    confirmed_as_of_date = (
+        expected_as_of_date if expected_as_of_date in flow_dates else None
+    )
+
+    return InstitutionalDataCutoff(
+        expected_as_of_date=expected_as_of_date,
+        confirmed_as_of_date=confirmed_as_of_date,
+    )

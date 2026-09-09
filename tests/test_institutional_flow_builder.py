@@ -6,6 +6,7 @@ from app.domain.institutional_flow_builder import (
     InstitutionalFlowPoint,
     build_institutional_net_buy_positive,
     build_institutional_net_buy_ratio,
+    resolve_institutional_data_cutoff,
 )
 
 TARGET_DATE = dt.date(2026, 8, 13)
@@ -286,3 +287,74 @@ def test_positive_rejects_non_positive_window():
         build_institutional_net_buy_positive(
             target_date=TARGET_DATE, flow_points=[], volume_by_date={}, window=0
         )
+
+
+# --- resolve_institutional_data_cutoff ---------------------------------------
+
+
+def test_cutoff_is_current_when_t_minus_1_flow_present():
+    """T-1 (2026-08-12) has flow data -> is_current True, and
+    confirmed_as_of_date must equal expected_as_of_date exactly (not
+    merely "some date <= T-1")."""
+    volume_by_date = {
+        dt.date(2026, 8, 12): 100_000.0,
+        dt.date(2026, 8, 11): 100_000.0,
+        dt.date(2026, 8, 10): 100_000.0,
+    }
+    flow_points = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 12), net_shares=100),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 11), net_shares=100),
+    ]
+    cutoff = resolve_institutional_data_cutoff(
+        target_date=TARGET_DATE, flow_points=flow_points, volume_by_date=volume_by_date
+    )
+    assert cutoff.expected_as_of_date == dt.date(2026, 8, 12)
+    assert cutoff.confirmed_as_of_date == dt.date(2026, 8, 12)
+    assert cutoff.is_current is True
+
+
+def test_cutoff_is_not_current_when_t_minus_1_flow_missing():
+    """T-1 (2026-08-12) has NO flow data, only older sessions do. This
+    is the prototype of the "3022 @ 2026/09/04" scenario from the
+    requirements doc: when T-1's institutional data hasn't landed yet,
+    older data must never be presented as if it were T-1."""
+    volume_by_date = {
+        dt.date(2026, 8, 12): 100_000.0,
+        dt.date(2026, 8, 11): 100_000.0,
+        dt.date(2026, 8, 10): 100_000.0,
+    }
+    flow_points = [
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 11), net_shares=100),
+        InstitutionalFlowPoint(trading_date=dt.date(2026, 8, 10), net_shares=100),
+    ]
+    cutoff = resolve_institutional_data_cutoff(
+        target_date=TARGET_DATE, flow_points=flow_points, volume_by_date=volume_by_date
+    )
+    assert cutoff.expected_as_of_date == dt.date(2026, 8, 12)
+    assert cutoff.confirmed_as_of_date is None
+    assert cutoff.is_current is False
+
+
+def test_cutoff_ignores_flow_points_on_or_after_target_date():
+    """A stray flow row on/after target_date (shouldn't happen given
+    FinMind's real update timing, but must never be trusted even if it
+    appears) must not be treated as confirming T-1."""
+    volume_by_date = {dt.date(2026, 8, 12): 100_000.0}
+    flow_points = [
+        InstitutionalFlowPoint(trading_date=TARGET_DATE, net_shares=999),
+    ]
+    cutoff = resolve_institutional_data_cutoff(
+        target_date=TARGET_DATE, flow_points=flow_points, volume_by_date=volume_by_date
+    )
+    assert cutoff.expected_as_of_date == dt.date(2026, 8, 12)
+    assert cutoff.confirmed_as_of_date is None
+    assert cutoff.is_current is False
+
+
+def test_cutoff_none_when_no_trading_history_at_all():
+    cutoff = resolve_institutional_data_cutoff(
+        target_date=TARGET_DATE, flow_points=[], volume_by_date={}
+    )
+    assert cutoff.expected_as_of_date is None
+    assert cutoff.confirmed_as_of_date is None
+    assert cutoff.is_current is False
