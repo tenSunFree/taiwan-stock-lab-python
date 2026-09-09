@@ -769,14 +769,29 @@ def _render_regulatory_status_lines(stock: ReportStockView) -> list[str]:
 
 
 def _render_institutional_flow_lines(stock: ReportStockView) -> list[str]:
-    value = stock.institutional_net_buy_3d_positive
+    """
+    法人籌碼 tri-state 區塊 —— 顯示近 3 個交易日累積買超是否 > 0。
+
+    institutional_net_buy_3d_positive 跟「訊號」區塊裡籌碼因子用的
+    institutional_net_buy_ratio_5d 是同一組 flow_points/volume_by_date
+    算出來的，所以理論上兩者的 T-1 資料狀態應該一致。但這裡刻意不假設
+    這件事永遠成立——比照 _render_signal_lines 對籌碼因子做的
+    T-1 stale 防護，這個區塊也必須獨立檢查 cutoff：只要 cutoff 明確
+    表示 T-1 尚未確認，就強制顯示「資料不足」，不能信任
+    institutional_net_buy_3d_positive 本身碰巧仍有值（例如未來某次
+    計算邏輯調整、或測試 fixture 手動塞入不一致的資料）。
+    """
+    cutoff = stock.institutional_data_cutoff
+    is_stale = cutoff is not None and not cutoff.is_current
+
+    value = None if is_stale else stock.institutional_net_buy_3d_positive
     if value is None:
         line = "⚪ 近 3 個交易日累積買超 > 0：資料不足"
     elif value:
         line = "✅ 近 3 個交易日累積買超 > 0：是"
     else:
         line = "❌ 近 3 個交易日累積買超 > 0：否"
-    return ["法人籌碼", line]
+    return ["法人籌碼", line, _render_institutional_cutoff_line(cutoff)]
 
 
 # --- 技術面 (low-position + early-rally, display-only tri-state) --------------

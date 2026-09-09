@@ -374,6 +374,49 @@ def test_institutional_net_buy_unknown_shows_insufficient_data():
     assert "❌ 近 3 個交易日累積買超" not in report
 
 
+def test_institutional_net_buy_flow_block_also_forces_unknown_when_cutoff_is_stale():
+    """CodeRabbit regression test：「法人籌碼」tri-state 區塊跟「訊號」
+    區塊裡的籌碼因子共用同一組法人資料，必須套用一樣的 T-1 stale
+    防護。即使 institutional_net_buy_3d_positive 本身仍然有值
+    （True，理論上對應「是」），只要 institutional_data_cutoff 明確
+    表示 T-1 尚未確認，這個區塊也必須強制顯示「資料不足」，不能信任
+    這個未確認的舊/不一致資料畫出「是」——否則「訊號」區塊顯示
+    ⚪ 資料不足，但「法人籌碼」區塊卻顯示 ✅ 是，會是自相矛盾的報表。"""
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6), confirmed_as_of_date=None
+    )
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_3d_positive=True,
+            institutional_data_cutoff=cutoff,
+        )
+    )
+    assert "⚪ 近 3 個交易日累積買超 > 0：資料不足" in report
+    assert "✅ 近 3 個交易日累積買超" not in report
+    assert "法人資料截止：T-1（2026/08/06）資料尚未確認" in report
+
+
+def test_institutional_net_buy_flow_block_shows_cutoff_line_when_current():
+    """正常情況（T-1 已確認）下，「法人籌碼」區塊也要跟「訊號」區塊
+    一樣印出明確的資料截止日，而不是只有「訊號」區塊有這個揭露。"""
+    from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+
+    cutoff = InstitutionalDataCutoff(
+        expected_as_of_date=dt.date(2026, 8, 6),
+        confirmed_as_of_date=dt.date(2026, 8, 6),
+    )
+    report = _render(
+        _make_stock_view(
+            institutional_net_buy_3d_positive=True,
+            institutional_data_cutoff=cutoff,
+        )
+    )
+    assert "✅ 近 3 個交易日累積買超 > 0：是" in report
+    assert "法人資料截止：T-1（2026/08/06）" in report
+
+
 def test_institutional_net_buy_is_independent_of_institutional_score():
     """Absolute institutional signal、candidate-pool relative score，
     以及 3-day institutional display signal 是三件不同的事：即使
