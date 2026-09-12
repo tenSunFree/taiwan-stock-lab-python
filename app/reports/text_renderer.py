@@ -82,6 +82,49 @@ DISCLAIMER = (
 # https://developers.line.biz/en/docs/partner-docs/development-guidelines/
 MAX_LINE_TEXT_UTF16_UNITS = 5000
 
+# --- text-v14 (visual hierarchy) ----------------------------------------
+#
+# LINE text messages don't render Markdown (no real bold/headers), so
+# visual separation has to come from literal characters — but a line
+# in front of EVERY sub-block just turns into a ladder of identical
+# marks with no signal about which boundary actually matters more.
+# Instead this uses a deliberate 3-tier hierarchy:
+#
+#   STOCK_DIVIDER   — the biggest boundary: between the header and the
+#       first stock, between one stock and the next, and between the
+#       last stock and the closing "模型說明" section. Never used
+#       anywhere else.
+#   SECTION_DIVIDER — used ONLY in front of the two sub-blocks that are
+#       genuinely denser/more important than the rest within a single
+#       stock: "🚦 訊號" (the six-factor block, by far the longest) and
+#       "⚠️ 主要風險" (the closing risk list). Every other sub-block
+#       boundary (漲停結構／監管狀態／法人籌碼／技術面／基本面) is just
+#       a blank line — those are short, single-purpose blocks that
+#       don't need their own divider to stay readable.
+#   "" (blank line) — the default separator everywhere else.
+#
+# Both divider strings are pure display sugar — no data, never affect
+# scoring or the emoji/word decisions elsewhere in this module. They
+# ARE counted toward the existing MAX_LINE_TEXT_UTF16_UNITS budget the
+# same as any other line, but each is only ~10 UTF-16 units, so the
+# impact on the 5000-unit budget is negligible in practice — what
+# actually consumes the budget is the per-factor explanation text and
+# the 模型說明 footer.
+#
+# Width: 6 characters. Originally 10, shortened after a real
+# regression (see CHANGELOG/PR notes) — a fully-populated 5-stock
+# report (each carrying 3 divider lines: 1 STOCK_DIVIDER + 2
+# SECTION_DIVIDER) tipped a few units past MAX_LINE_TEXT_UTF16_UNITS
+# purely from divider decoration, breaking
+# render_daily_report()'s single-message contract for callers (e.g.
+# dry-run diffing, existing tests) that don't expect the visual-only
+# addition of dividers to change whether a report fits. 6 characters
+# is still unambiguous as a divider on a phone screen and buys back
+# ~60+ units across a 5-stock report — comfortably enough margin for
+# this to not recur from divider width alone as reports grow.
+STOCK_DIVIDER = "━━━━━━"
+SECTION_DIVIDER = "──────"
+
 
 def utf16_length(text: str) -> int:
     """Length of `text` as LINE counts it: UTF-16 code units."""
@@ -652,7 +695,7 @@ def _render_signal_lines(stock: ReportStockView) -> list[str]:
     if institutional_is_stale:
         display_scores["institutional"] = None
 
-    lines = ["訊號"]
+    lines = ["🚦 訊號"]
     for key, label in _SIGNAL_FACTOR_ORDER:
         lines.extend(
             _render_factor_block(
@@ -904,7 +947,7 @@ def _render_primary_risk_lines(stock: ReportStockView) -> list[str]:
         label = _PRIMARY_RISK_FLAG_LABELS.get(flag)
         if label and label not in labels:
             labels.append(label)
-    return ["主要風險", *(f"・{label}" for label in labels)]
+    return ["⚠️ 主要風險", *(f"・{label}" for label in labels)]
 
 
 # --- 資料缺口 -------------------------------------------------------------------
@@ -929,7 +972,15 @@ def _render_data_gap_line(stock: ReportStockView) -> str | None:
 
 
 def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str]:
+    # STOCK_DIVIDER marks "a new stock starts here" — the only major
+    # divider inside this function. There is deliberately no matching
+    # one at the end of the block: the caller (render_daily_report /
+    # render_daily_report_messages) already separates stocks with a
+    # blank line, and the NEXT stock's own leading STOCK_DIVIDER (or
+    # the footer's) provides the closing edge — avoiding two heavy
+    # dividers stacked back-to-back.
     lines = [
+        STOCK_DIVIDER,
         f"{stock.rank}. {stock.stock_name}（{stock.stock_id}）",
     ]
 
@@ -955,20 +1006,42 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
     if gap_line is not None:
         lines.append(gap_line)
 
+    # 3-tier spacing (see STOCK_DIVIDER/SECTION_DIVIDER's own module-
+    # level comment): SECTION_DIVIDER is reserved for the two sub-
+    # blocks that are genuinely denser/more important than the rest —
+    # "🚦 訊號" (the six-factor block) and "⚠️ 主要風險" (the closing
+    # risk list). 漲停結構／監管狀態／法人籌碼／技術面／基本面 are each
+    # short, single-purpose blocks that stay readable with just a
+    # blank line — adding a divider in front of every one of them
+    # would turn the report into a ladder of identical lines instead
+    # of highlighting the parts that actually deserve extra emphasis.
     lines.append("")
     lines.extend(_render_limit_up_structure_lines(stock))
+
     lines.append("")
+    lines.append(SECTION_DIVIDER)
     lines.extend(_render_signal_lines(stock))
+
     lines.append("")
+    lines.append(SECTION_DIVIDER)
     lines.extend(_render_regulatory_status_lines(stock))
+
     lines.append("")
     lines.extend(_render_institutional_flow_lines(stock))
+
     lines.append("")
     lines.extend(_render_technical_signal_lines(stock))
+
     lines.append("")
     lines.extend(_render_fundamental_growth_lines(stock))
+
     lines.append("")
+    lines.append(SECTION_DIVIDER)
     lines.extend(_render_primary_risk_lines(stock))
+
+    # Trailing blank line so this stock's last line never butts
+    # directly against the next stock's STOCK_DIVIDER (or the
+    # footer's) with no breathing room.
     lines.append("")
 
     return lines
@@ -1009,7 +1082,7 @@ def _render_report_header_lines(
         "⬜ 技術面：低檔首板",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
-        "資料概況",
+        "📊 資料概況",
         f"資料更新：{data_updated_at}",
         f"進入候選池：{candidate_count} 檔",
         f"通過資料完整度門檻：{eligible_count} 檔",
@@ -1020,7 +1093,8 @@ def _render_report_header_lines(
 
 def _render_report_footer_lines(*, strategy_version: str) -> list[str]:
     return [
-        "模型說明",
+        STOCK_DIVIDER,
+        "ℹ️ 模型說明",
         (
             f"綜合分數為各量化因子依 {strategy_version} "
             "加權計算後的相對評分，用於當日候選標的之間排序，"
@@ -1306,13 +1380,13 @@ def render_no_qualified_stock_report(
             "⬜ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
-            "資料概況",
+            "📊 資料概況",
             f"資料更新：{data_updated_at}",
             f"進入候選池：{candidate_count} 檔",
             f"今日無符合資料完整度門檻的候選股，暫無 Top {ranking_limit} 名單。",
             f"策略版本：{strategy_version}",
-            "",
-            "模型說明",
+            STOCK_DIVIDER,
+            "ℹ️ 模型說明",
             ("本清單依固定量化規則篩選候選標的；今日沒有標的通過資料完整度門檻。"),
             DISCLAIMER,
         ]
