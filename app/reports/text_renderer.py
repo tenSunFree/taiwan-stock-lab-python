@@ -797,7 +797,7 @@ def _managed_status_line(stock: ReportStockView) -> str:
 
 
 def _render_regulatory_status_lines(stock: ReportStockView) -> list[str]:
-    lines = ["監管狀態", _attention_status_line(stock)]
+    lines = ["🛡️ 監管狀態", _attention_status_line(stock)]
     lines.extend(_disposition_status_lines(stock))
     lines.append(_managed_status_line(stock))
     return lines
