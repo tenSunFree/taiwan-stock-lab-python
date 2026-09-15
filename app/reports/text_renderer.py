@@ -94,13 +94,17 @@ MAX_LINE_TEXT_UTF16_UNITS = 5000
 #       first stock, between one stock and the next, and between the
 #       last stock and the closing "模型說明" section. Never used
 #       anywhere else.
-#   SECTION_DIVIDER — used ONLY in front of the two sub-blocks that are
-#       genuinely denser/more important than the rest within a single
-#       stock: "🚦 訊號" (the six-factor block, by far the longest) and
-#       "⚠️ 主要風險" (the closing risk list). Every other sub-block
-#       boundary (漲停結構／監管狀態／法人籌碼／技術面／基本面) is just
-#       a blank line — those are short, single-purpose blocks that
-#       don't need their own divider to stay readable.
+#   SECTION_DIVIDER — marks the three boundaries that are genuinely
+#       more significant than a plain blank line within a single
+#       stock: "🚦 訊號" (the six-factor block, by far the longest),
+#       "🛡️ 監管狀態" (the entry point into the regulatory/reference
+#       cluster — 監管狀態／法人籌碼／技術面／基本面 are grouped
+#       together under this one divider rather than each getting its
+#       own), and "⚠️ 主要風險" (the closing risk list). Every other
+#       sub-block boundary WITHIN that cluster (法人籌碼／技術面／
+#       基本面) and before 漲停結構 is just a blank line — those are
+#       short, single-purpose blocks that don't need their own divider
+#       to stay readable.
 #   "" (blank line) — the default separator everywhere else.
 #
 # Both divider strings are pure display sugar — no data, never affect
@@ -1007,14 +1011,18 @@ def _render_stock_block(stock: ReportStockView, *, total_shown: int) -> list[str
         lines.append(gap_line)
 
     # 3-tier spacing (see STOCK_DIVIDER/SECTION_DIVIDER's own module-
-    # level comment): SECTION_DIVIDER is reserved for the two sub-
-    # blocks that are genuinely denser/more important than the rest —
-    # "🚦 訊號" (the six-factor block) and "⚠️ 主要風險" (the closing
-    # risk list). 漲停結構／監管狀態／法人籌碼／技術面／基本面 are each
-    # short, single-purpose blocks that stay readable with just a
-    # blank line — adding a divider in front of every one of them
-    # would turn the report into a ladder of identical lines instead
-    # of highlighting the parts that actually deserve extra emphasis.
+    # level comment): SECTION_DIVIDER marks the three boundaries that
+    # are genuinely more significant than a plain blank line —
+    # "🚦 訊號" (the six-factor block), "🛡️ 監管狀態" (the entry point
+    # into the regulatory/reference cluster: 監管狀態／法人籌碼／
+    # 技術面／基本面 are grouped together under this one divider rather
+    # than each getting its own), and "⚠️ 主要風險" (the closing risk
+    # list). Everything else — including the boundaries BETWEEN
+    # 監管狀態／法人籌碼／技術面／基本面 within that cluster, and the
+    # boundary before 漲停結構 — stays a blank line; a divider in front
+    # of every single sub-block would turn the report into a ladder of
+    # identical lines instead of highlighting the parts that actually
+    # deserve extra emphasis.
     lines.append("")
     lines.extend(_render_limit_up_structure_lines(stock))
 
