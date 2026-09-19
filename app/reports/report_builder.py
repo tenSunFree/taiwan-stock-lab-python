@@ -245,6 +245,9 @@ def build_report_stocks(
                 technical_low_with_rising_signal=(
                     features.technical_low_with_rising_signal
                 ),
+                technical_low_first_limit_up_signal=(
+                    features.technical_low_first_limit_up_signal
+                ),
                 fundamental_growth_sustained=(features.fundamental_growth_sustained),
                 eps_growth_sustained=(features.eps_growth_sustained),
                 risk_missing_inputs=scored.risk_missing_inputs,

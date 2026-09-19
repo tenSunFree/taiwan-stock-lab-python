@@ -1606,6 +1606,17 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     # the flat 100 history — the "起漲" crossover half does not hold,
     # so the combined signal must be False, not True.
     assert feature.technical_low_with_rising_signal is False
+    # Same fixture, different combination: today IS limit-up (fixture
+    # candidate always has is_close_limit_up=True), today's close sits
+    # at the bottom of the (degenerate) 20-day range same as above, AND
+    # the flat close=100 history means the immediately preceding
+    # session's own approximate limit-up check comes back False (100
+    # is not calculate_limit_up_price(100)=110) — i.e. genuinely a
+    # first board, not a continuation. All three conditions hold, so
+    # this must be True even though technical_low_with_rising_signal
+    # above is False for the same fixture — the two are independent.
+    assert feature.technical_low_first_limit_up_signal is not None
+    assert feature.technical_low_first_limit_up_signal.matched is True
     assert feature.revenue_yoy is not None
     assert feature.revenue_yoy == pytest.approx(0.30)  # 1,300,000,000/1,000,000,000-1
     # Only one calendar month (July) is eligible in this fixture — the
@@ -1743,6 +1754,7 @@ def test_build_stock_features_single_history_failure_does_not_abort_batch(caplog
     assert by_stock["2330"].return_5d is None
     assert by_stock["2330"].return_20d is None
     assert by_stock["2330"].technical_low_with_rising_signal is None
+    assert by_stock["2330"].technical_low_first_limit_up_signal is None
     # turnover itself still comes from today's real TWSE/TPEx data,
     # unaffected by the FinMind history failure
     assert by_stock["2330"].turnover == 100000000.0
@@ -1769,6 +1781,7 @@ def test_build_stock_features_empty_history_rows_leaves_factors_none():
     assert features[0].average_turnover_20d is None
     assert features[0].return_5d is None
     assert features[0].technical_low_with_rising_signal is None
+    assert features[0].technical_low_first_limit_up_signal is None
 
 
 def test_build_stock_features_institutional_failure_does_not_clear_price_factors():

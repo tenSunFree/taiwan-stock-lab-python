@@ -1,14 +1,25 @@
 import datetime as dt
+from decimal import Decimal
+
+import pytest
 
 from app.domain.feature_builder import HistoricalPricePoint
+from app.domain.price_ticks import calculate_limit_up_price
 from app.domain.technical_signal_builder import (
     MOVING_AVERAGE_WINDOW,
     RANGE_POSITION_LOW_THRESHOLD,
     RANGE_WINDOW,
+    LowFirstLimitUpSignal,
+    build_low_first_limit_up_signal,
     build_low_with_rising_signal,
+    estimate_previous_session_limit_up,
 )
 
 TARGET_DATE = dt.date(2026, 8, 27)
+
+
+def _approx_limit_up(reference_close: float) -> float:
+    return float(calculate_limit_up_price(Decimal(str(reference_close))))
 
 
 def _make_history(
@@ -414,3 +425,215 @@ def test_range_window_is_at_least_ma5_window_plus_one():
 
 def test_threshold_is_the_documented_30_percent():
     assert RANGE_POSITION_LOW_THRESHOLD == 0.30
+
+
+# =================================================================================
+# build_low_first_limit_up_signal() / estimate_previous_session_limit_up()
+# 「低檔首板」— now returns a structured LowFirstLimitUpSignal, not a bare
+# bool | None; `.matched` is the old tri-state result.
+# =================================================================================
+
+# --- short-circuit on is_close_limit_up -----------------------------------------
+
+
+def test_first_board_false_when_not_limit_up_today_even_with_insufficient_history():
+    """今天根本沒漲停時，整體結果就是 False，即使歷史資料不足以算低檔
+    區間——不需要為了一個已知為 False 的結論去湊資料。is_low／
+    previous_session_limit_up_estimated 這兩個子欄位在這個短路情境下
+    根本不會被嘗試計算，必須維持 None，不能被誤植成 False。"""
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=100.0,
+        is_close_limit_up=False,
+        history=_make_history([100.0] * (RANGE_WINDOW - 1)),
+    )
+    assert result == LowFirstLimitUpSignal(
+        matched=False,
+        is_low=None,
+        range_position=None,
+        is_close_limit_up=False,
+        previous_session_limit_up_estimated=None,
+    )
+
+
+def test_first_board_false_when_not_limit_up_today_even_in_low_range():
+    closes = [100 - i for i in range(RANGE_WINDOW)]
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=closes[-1] + 0.5,
+        is_close_limit_up=False,
+        history=_make_history(closes),
+    )
+    assert result.matched is False
+    assert result.is_low is None
+    assert result.previous_session_limit_up_estimated is None
+
+
+# --- happy path: limit-up + low + genuinely first board -------------------------
+
+
+def test_first_board_true_when_limit_up_low_and_previous_session_was_not_limit_up():
+    # 20 天從 100 一路跌到 50 後打平在低檔盤整，前一交易日收盤 50，跟
+    # 再前一日（同樣是 50）比較並不是漲停——今天從 50 漲停到約 55，
+    # 相對 20 日區間 [50, 100] 仍落在最低 30% 以內 -> 低檔 + 首板同時
+    # 成立，必須是 True，且結構化欄位要能各自對得上。
+    closes = [100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50] + [50.0] * 9
+    assert len(closes) == RANGE_WINDOW
+    history = _make_history(closes)
+    today_close = _approx_limit_up(closes[-1])  # today's close IS limit-up
+
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=today_close,
+        is_close_limit_up=True,
+        history=history,
+    )
+    assert result.matched is True
+    assert result.is_low is True
+    assert result.range_position == pytest.approx(0.1)
+    assert result.is_close_limit_up is True
+    assert result.previous_session_limit_up_estimated is False
+    assert result.previous_session_check_provisional is True
+
+
+# --- limit-up + low, but NOT the first board (previous session already up) ------
+
+
+def test_first_board_false_when_previous_session_was_already_a_limit_up():
+    """前一天自己就已經是（近似判定的）漲停——代表今天是連板，不是首
+    板。previous_session_limit_up_estimated 要明確顯示 True（是造成
+    結果為 False 的一個原因），而不是含糊地整包變 None。"""
+    day_before_previous_close = 90.0
+    previous_close = _approx_limit_up(day_before_previous_close)  # 前一天就漲停
+    closes = [100 - i for i in range(10)] + [90.0] * 9 + [previous_close]
+    history = _make_history(closes)
+    today_close = _approx_limit_up(float(previous_close))
+
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=today_close,
+        is_close_limit_up=True,
+        history=history,
+    )
+    assert result.matched is False
+    assert result.previous_session_limit_up_estimated is True
+
+
+# --- limit-up + first board, but NOT low in range --------------------------------
+
+
+def test_first_board_false_when_limit_up_and_first_board_but_not_in_low_range():
+    """今天漲停、也是首板，但目前股價落在近20日區間高檔——「低檔」條
+    件不成立，整體仍必須是 False，且 is_low 要明確為 False（是造成
+    結果為 False 的原因），previous_session_limit_up_estimated 則正常
+    解出 False（首板本身是成立的）。"""
+    closes = [80 + i for i in range(RANGE_WINDOW)]  # steadily rising, ends near high
+    previous_close = closes[-1]
+    today_close = _approx_limit_up(previous_close)
+
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=today_close,
+        is_close_limit_up=True,
+        history=_make_history(closes),
+    )
+    assert result.matched is False
+    assert result.is_low is False
+    assert result.previous_session_limit_up_estimated is False
+
+
+# --- insufficient data (only checked once is_close_limit_up is True) ------------
+
+
+def test_first_board_none_when_limit_up_today_but_not_enough_trailing_history():
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=110.0,
+        is_close_limit_up=True,
+        history=_make_history([100.0] * (RANGE_WINDOW - 1)),
+    )
+    assert result.matched is None
+    assert result.is_low is None
+    assert result.range_position is None
+
+
+def test_first_board_matched_none_but_previous_session_check_still_resolves():
+    """核心可解釋化行為：即使歷史資料不足以算 20 日區間（is_low 只能
+    是 None），只要至少有 2 筆有效歷史資料，
+    previous_session_limit_up_estimated 仍應獨立算出結果，不必被 is_low
+    的資料不足拖著一起變 None——這樣即使整體 matched 是 None，讀者仍
+    能看到「首板」這一半條件到底成不成立。"""
+    closes = [50.0] * (RANGE_WINDOW - 5)  # fewer than RANGE_WINDOW, but >= 2
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=110.0,
+        is_close_limit_up=True,
+        history=_make_history(closes),
+    )
+    assert result.matched is None
+    assert result.is_low is None
+    assert result.range_position is None
+    assert result.previous_session_limit_up_estimated is not None
+
+
+def test_first_board_none_when_today_close_is_non_positive_even_if_marked_limit_up():
+    """即使呼叫端誤傳 is_close_limit_up=True，today_close 本身不合法
+    (<= 0) 時仍必須整包回傳 None（含 previous_session 子欄位），不能
+    讓異常值進到低檔/首板計算。"""
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=0.0,
+        is_close_limit_up=True,
+        history=_make_history([100.0] * RANGE_WINDOW),
+    )
+    assert result == LowFirstLimitUpSignal(
+        matched=None,
+        is_low=None,
+        range_position=None,
+        is_close_limit_up=True,
+        previous_session_limit_up_estimated=None,
+    )
+
+
+def test_first_board_none_when_duplicate_trading_date_in_history():
+    """重複日期會讓整個歷史窗口不可信，因此 is_low 和
+    previous_session_limit_up_estimated 都必須是 None，不能只擋掉其中
+    一個。"""
+    history = _make_history([100.0] * RANGE_WINDOW)
+    history.append(
+        HistoricalPricePoint(
+            trading_date=history[-1].trading_date,
+            close=100.0,
+            volume=1000.0,
+            turnover=1000.0,
+        )
+    )
+    result = build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=110.0,
+        is_close_limit_up=True,
+        history=history,
+    )
+    assert result.matched is None
+    assert result.is_low is None
+    assert result.previous_session_limit_up_estimated is None
+
+
+# --- estimate_previous_session_limit_up() unit tests -----------------------------
+
+
+def test_estimate_previous_session_true_when_close_matches_approx_limit_up():
+    reference_close = 50.0
+    previous_close = _approx_limit_up(reference_close)
+    history = _make_history([reference_close, previous_close])
+    assert estimate_previous_session_limit_up(history) is True
+
+
+def test_estimate_previous_session_false_for_an_ordinary_move():
+    history = _make_history([50.0, 51.0])
+    assert estimate_previous_session_limit_up(history) is False
+
+
+def test_estimate_previous_session_none_with_fewer_than_two_points():
+    history = _make_history([50.0])
+    assert estimate_previous_session_limit_up(history) is None

@@ -138,9 +138,16 @@ a later phase (see [Roadmap](#roadmap)).
 
 - Trailing 20-day average turnover, 20-day volume ratio, and 5/20-day
   cumulative return, computed only from sessions strictly before the
-  target date, plus an independent "low position + early rally"
-  technical display signal (`bool | None`) computed from the same
-  trailing history — see Report Rendering below
+  target date, plus two independent, DISPLAY-ONLY technical signals
+  computed from that same trailing history — see Report Rendering
+  below for both:
+  - "low position + early rally" (`bool | None`)
+  - "low position + first limit-up board" (`LowFirstLimitUpSignal |
+    None` — a structured breakdown, not a bare `bool`, precisely
+    because it also reuses `CandidateBuilder`'s own
+    `is_close_limit_up` result and a PROVISIONAL previous-session
+    limit-up estimate; see Enrichment (FinMind) → 低檔首板 detail
+    below and Architecture's `technical_signal_builder.py` entry)
 - 5-day trailing institutional net-buy ratio, reusing the same volume
   data already fetched for price-history enrichment, plus an
   independent 3-day cumulative institutional net-buy sign check
@@ -167,6 +174,51 @@ a later phase (see [Roadmap](#roadmap)).
   revenue) fails **independently**: one FinMind endpoint being briefly
   unavailable never clears factors already computed from another
   successful fetch for the same stock
+
+#### 低檔首板 ("low position + first limit-up board") in detail
+
+A SIBLING of the low-position/early-rally signal above, not an OR'd
+variant of it (see `technical_signal_builder.py`'s own module
+docstring for why a second signal type gets its own function and its
+own reason rather than being merged into the first). It answers a
+different, more literal question: is today's close (a) the legal
+limit-up price (reusing `CandidateBuilder`'s own
+`is_close_limit_up` — never recomputed here), (b) near the low end of
+that same trailing 20-session range, AND (c) NOT a continuation of a
+limit-up that already happened on the immediately preceding trading
+session.
+
+(c) is the one genuinely new piece of data this project didn't
+already need: whether the PREVIOUS session itself closed at its own
+legal limit-up price. This project deliberately does **not**
+reconstruct a general `consecutive_limit_up_days` count from raw
+closes (see `risk_inputs.py`'s own module docstring and the "Known
+data gaps" note under Roadmap) — "previous close × 1.10" is unreliable
+on ex-rights/ex-dividend/capital-reduction days, precisely the days it
+matters most for a `RiskPolicy` scoring input.
+`estimate_previous_session_limit_up()` uses that exact same
+approximation, but scoped narrowly and explicitly:
+
+- a single trading day, not a general historical reconstruction
+- PROVISIONAL by name and by contract — the field is never called
+  `is_previous_session_limit_up`
+- never fed into `RiskPolicy`, `consecutive_limit_up_days`, or any
+  `FACTOR_WEIGHTS` scoring factor — display-only, same restriction as
+  every other technical/fundamental display signal in this project
+
+The result is a `LowFirstLimitUpSignal` dataclass (not a bare
+`bool | None`): `matched` is the overall tri-state result (the
+equivalent of the old plain bool, and the only field
+`text_renderer.py` currently reads), with `is_low`, `range_position`,
+`is_close_limit_up`, and `previous_session_limit_up_estimated` kept as
+their own fields alongside it — a caller can see *why* `matched` came
+out the way it did without recomputing anything. `is_low` and
+`previous_session_limit_up_estimated` are resolved **independently**:
+a stock with fewer than 20 valid trailing sessions can't have
+`is_low` computed, but may still have enough sessions (just 2) for
+`previous_session_limit_up_estimated` to resolve on its own, so
+`matched` staying `None` never hides a sub-result that was actually
+available.
 
 ### Enrichment (TWSE / TPEx Financial Statements — EPS)
 
@@ -468,6 +520,25 @@ a later phase (see [Roadmap](#roadmap)).
   unaffected — their light is still directly the pool percentile —
   and `momentum` is unaffected — it was already using
   `bounded_momentum_score`'s absolute rule, never a percentile
+- As of `text-v14`, the same 技術面 section gains a second, independent
+  tri-state line — **低檔首板 (low position + first limit-up
+  board)** — answering whether today's close is (a) the legal
+  limit-up price, (b) near the same trailing-range low end as the
+  `text-v9` line above, AND (c) NOT a continuation of a limit-up that
+  already happened on the immediately preceding trading session (see
+  Enrichment (FinMind) → 低檔首板 above for the full rule and the
+  PROVISIONAL previous-session estimate it relies on). The two 技術面
+  lines are fully independent of each other — a stock can be a
+  genuine first board without having crossed its MA5 yet, or vice
+  versa — and this line is likewise independent of the "momentum"
+  scoring factor. The "ℹ️ 模型說明" footer explicitly calls out that
+  the previous-session leg is an approximation, never presented as an
+  official historical determination. Rendering only ever reads the
+  underlying `LowFirstLimitUpSignal.matched` field — the richer
+  breakdown behind it (`is_low`, `range_position`,
+  `previous_session_limit_up_estimated`) is carried on
+  `StockFeatures`/`ReportStockView` for future explainability/
+  debugging/backtesting use, not rendered in the LINE report yet
 - `REPORT_DRY_RUN=true` prints the exact report text to stdout for
   manual inspection, with no LINE call and no database write — as of
   `text-v12`, when the report is split into multiple messages, each
@@ -485,7 +556,7 @@ a later phase (see [Roadmap](#roadmap)).
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v13`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v14`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
@@ -539,6 +610,10 @@ a later phase (see [Roadmap](#roadmap)).
   return, and transaction cost modeling. The report already carries a
   placeholder note ("歷史分位及 T+1／T+5 統計尚未納入目前版本") so
   readers aren't left guessing why these numbers don't appear yet.
+  `LowFirstLimitUpSignal.range_position` (a continuous value, not just
+  the rendered boolean) was deliberately kept on `StockFeatures` ahead
+  of this phase, so a future backtest doesn't need to recompute it
+  from raw history.
 - **Phase 8** — LLM-assisted report writing on top of the existing
   rule-based renderer, with strict JSON-schema validation and
   automatic fallback to the fixed template on any validation failure
@@ -560,7 +635,13 @@ a later phase (see [Roadmap](#roadmap)).
   `consecutive_limit_up_days` still has no reliable historical
   reference-price source and is not reconstructed from raw closing
   prices, since doing so would violate this project's own rule
-  against inferring limit-up status via "previous close × 1.10."
+  against inferring limit-up status via "previous close × 1.10." The
+  one deliberate, narrow exception is
+  `technical_low_first_limit_up_signal`'s single-day, PROVISIONAL
+  `previous_session_limit_up_estimated` leg (see Enrichment (FinMind)
+  → 低檔首板 above) — display-only, never fed into `RiskPolicy` or
+  treated as a real `consecutive_limit_up_days` value, unlike a
+  general reconstruction would be.
   EPS/financial-statement data is now ingested (TWSE's `t187ap06_L_ci`
   + TPEx's `t187ap06_O_ci` — see Enrichment above), so the report's
     基本面 section now answers the originally intended "revenue OR EPS"
@@ -718,6 +799,24 @@ pytest -v
   while is correctly distinguished from one just crossing above it
   today, and that a degenerate flat trading range never triggers a
   division-by-zero
+- Dedicated tests for the low-position/first-limit-up-board sibling
+  signal (`build_low_first_limit_up_signal`,
+  `estimate_previous_session_limit_up`) covering the short-circuit on
+  `is_close_limit_up=False` (the overall result is `False` without
+  even attempting the range/previous-session checks), the genuine
+  first-board happy path against the full
+  `LowFirstLimitUpSignal` breakdown (`is_low`, `range_position`,
+  `previous_session_limit_up_estimated`, and the always-`True`
+  `previous_session_check_provisional` marker), a stock whose previous
+  session was itself already a limit-up (a connected board, not a
+  first one), a stock that is a genuine first board but outside the
+  low-range threshold, the duplicate-trading-date defense leaving
+  BOTH sub-checks unresolved (not just the range one, since a
+  duplicate date makes the whole window untrustworthy), and — the
+  core explainability regression — a stock with fewer than 20 valid
+  trailing sessions but at least 2, confirming
+  `previous_session_limit_up_estimated` still resolves on its own
+  even though `is_low`/`matched` correctly stay `None`
 - Revenue-growth-sustained signal tests
   (`build_revenue_growth_sustained_signal`) confirming the 3-month
   window is built from STRICTLY CONSECUTIVE calendar months walking
@@ -791,16 +890,24 @@ pytest -v
   rendering test confirming it stays independent of the
   "institutional" signal-light score for the same stock, a 技術面
   tri-state rendering test confirming it stays independent of the
-  "momentum" signal-light score for the same stock, and a 基本面
-  tri-state rendering test confirming it stays independent of the
-  "fundamental" signal-light score for the same stock, dedicated tests
-  for the revenue-OR-EPS combined headline's tri-state-OR truth table
-  (including the case where one component is confirmed `False` and the
-  other is still unknown — the combined result must stay unconfirmed,
-  never prematurely resolve to "否" just because one side already has
-  an answer), and a progress-checklist regression test confirming the
-  "基本面" line correctly flips from ⬜ to ✅ with wording that no
-  longer claims EPS isn't wired in
+  "momentum" signal-light score for the same stock (both for the
+  `text-v9` low-position/early-rally line and the `text-v14`
+  low-position/first-board line — including a dedicated test proving
+  the two 技術面 lines are independent of EACH OTHER, not just of
+  momentum), a 基本面 tri-state rendering test confirming it stays
+  independent of the "fundamental" signal-light score for the same
+  stock, dedicated tests for the revenue-OR-EPS combined headline's
+  tri-state-OR truth table (including the case where one component is
+  confirmed `False` and the other is still unknown — the combined
+  result must stay unconfirmed, never prematurely resolve to "否" just
+  because one side already has an answer), a progress-checklist
+  regression test confirming the "基本面" line correctly flips from ⬜
+  to ✅ with wording that no longer claims EPS isn't wired in, and a
+  matching progress-checklist regression test (in both
+  `render_daily_report`'s and `render_no_qualified_stock_report`'s
+  independent checklists) confirming "低檔首板" flips from ⬜ to ✅
+  and that the footer explicitly names the previous-session check as
+  an approximation
 - Multi-message report-packing tests (`test_text_renderer.py`)
   confirming `render_daily_report_messages()` splits a
   no-longer-single-message-sized Top N report into multiple messages
@@ -888,6 +995,9 @@ app/domain/          Pure business logic — no I/O, no framework dependency
                             institutional_data_cutoff (see
                             institutional_flow_builder.py below),
                             technical_low_with_rising_signal,
+                            technical_low_first_limit_up_signal (its
+                            structured LowFirstLimitUpSignal sibling —
+                            see technical_signal_builder.py below),
                             fundamental_growth_sustained (revenue-only),
                             and eps_growth_sustained (its independent
                             EPS sibling — all display-only)
@@ -895,9 +1005,24 @@ app/domain/          Pure business logic — no I/O, no framework dependency
   valuation_filter.py       P/E ratio hard eligibility filter (0 < P/E <= 20)
   feature_builder.py        Trailing price-history factor computation
   technical_signal_builder.py
-                             Low-position (20-session range) + early-rally
-                             (5-session MA crossover) display signal —
-                             look-ahead-safe, not a scoring factor
+                             Two independent, look-ahead-safe display
+                             signals, neither a scoring factor:
+                             build_low_with_rising_signal() (20-session
+                             range position + 5-session MA crossover)
+                             and build_low_first_limit_up_signal()
+                             (today's legal limit-up price, reusing
+                             CandidateBuilder's own is_close_limit_up,
+                             + the same range check + a PROVISIONAL
+                             single-day estimate of whether the
+                             PREVIOUS session itself closed at its own
+                             limit-up price, via
+                             estimate_previous_session_limit_up()),
+                             which returns a structured
+                             LowFirstLimitUpSignal dataclass rather
+                             than a bare bool so is_low and the
+                             previous-session estimate stay visible
+                             even when the overall matched result is
+                             None
   institutional_flow_builder.py
                              Institutional net-buy ratio (5-day, scoring
                              factor) and net-buy positive sign check
@@ -989,6 +1114,10 @@ app/reports/           Report rendering
                             factor_scores, volume_ratio_20d,
                             institutional_net_buy_3d_positive,
                             technical_low_with_rising_signal,
+                            technical_low_first_limit_up_signal (the
+                            full LowFirstLimitUpSignal, not just its
+                            matched bool — carried through unchanged
+                            for future report/explainability use),
                             fundamental_growth_sustained,
                             eps_growth_sustained, risk_missing_inputs,
                             (as of text-v12) the raw per-factor inputs
@@ -1022,13 +1151,17 @@ app/reports/           Report rendering
                             per-day-announcement vs active-period wording,
                             a 法人籌碼 tri-state institutional net-buy
                             display (with its own T-1 cutoff line as of
-                            text-v13), a 技術面 tri-state low-position/
-                            early-rally display, a 基本面 section
-                            combining revenue and EPS growth-sustained via
-                            a tri-state OR at render time (with both
-                            components still shown as sub-lines), limit-up
-                            structure, a dynamically built risk_quality gap
-                            explanation, render_daily_report_messages() /
+                            text-v13), a 技術面 section with two
+                            independent tri-state lines (low-position/
+                            early-rally as of text-v9, low-position/
+                            first-limit-up-board as of text-v14 — reading
+                            only LowFirstLimitUpSignal.matched), a 基本面
+                            section combining revenue and EPS
+                            growth-sustained via a tri-state OR at render
+                            time (with both components still shown as
+                            sub-lines), limit-up structure, a dynamically
+                            built risk_quality gap explanation,
+                            render_daily_report_messages() /
                             _pack_report_messages() (as of text-v12) for
                             splitting a fully-populated report across
                             multiple LINE messages when it exceeds the

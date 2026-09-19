@@ -68,6 +68,7 @@ from app.domain.absolute_signal import (
 )
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 from app.reports import signal_explainer as se
 
 DISCLAIMER = (
@@ -295,6 +296,32 @@ class ReportStockView:
     # carried via factor_scores (a completely different calculation —
     # a price-range/moving-average check, not a return-based one).
     technical_low_with_rising_signal: bool | None = None
+
+    # From StockFeatures — SIBLING of technical_low_with_rising_signal
+    # above, for the SAME "技術面" block: whether today's close is (a)
+    # the legal limit-up price, (b) near the low end of its own
+    # trailing 20-session trading range, AND (c) NOT a continuation of
+    # a limit-up that already happened on the immediately preceding
+    # trading session (see
+    # app.domain.technical_signal_builder.build_low_first_limit_up_signal).
+    # Carried through as the FULL LowFirstLimitUpSignal, not just its
+    # `.matched` bool — this module currently only renders `.matched`
+    # (the rendered "低檔首板：是／否／資料不足" line is unchanged from
+    # before this became a structured type), but keeping the full
+    # breakdown on this view model means a future report change (or a
+    # debugging session) doesn't need to thread new fields through
+    # report_builder.py again. (c) relies on a PROVISIONAL, single-day
+    # approximation (see
+    # app.domain.technical_signal_builder.estimate_previous_session_limit_up's
+    # own docstring), so the rendered footer explicitly calls that
+    # caveat out rather than presenting it as an official
+    # determination. Independent of technical_low_with_rising_signal
+    # itself — a stock can be True on one and False/None on the other
+    # (e.g. a stock that's low + first-board but has NOT yet crossed
+    # its own MA5). None means this was never computed at all this run
+    # (see StockFeatures.technical_low_first_limit_up_signal's own
+    # docstring for exactly when).
+    technical_low_first_limit_up_signal: LowFirstLimitUpSignal | None = None
 
     # From StockFeatures — ANOTHER DISPLAY-ONLY signal, for the
     # "基本面" block: whether monthly revenue YoY growth has been
@@ -841,29 +868,61 @@ def _render_institutional_flow_lines(stock: ReportStockView) -> list[str]:
     return ["法人籌碼", line, _render_institutional_cutoff_line(cutoff)]
 
 
-# --- 技術面 (low-position + early-rally, display-only tri-state) --------------
+# --- 技術面 (low-position + early-rally / low-position-first-board, ------------
+#     display-only tri-states) --------------------------------------------------
 #
 # This is intentionally NOT the same thing as the "momentum" entry in
 # factor_scores/訊號 above: that is a 0-100 normalized score built from
 # 5-day/20-day cumulative RETURNS, used in the weighted total score.
-# This block instead answers a much narrower, literal question — "is
-# today's close both near the bottom of its own recent trading range
-# AND has it just crossed above its own 5-day moving average today" —
-# as a plain yes/no/unknown fact, independent of scoring. See
-# app.domain.technical_signal_builder.build_low_with_rising_signal for
-# the exact thresholds, crossover definition, and no-look-ahead /
-# strict-window rules.
+# This block instead answers two much narrower, literal questions,
+# each as its own plain yes/no/unknown fact, independent of scoring
+# and independent of EACH OTHER (per this module's own design
+# decision — see app.domain.technical_signal_builder's module
+# docstring for why a second signal type carries its own line rather
+# than being silently OR'd into the first):
+#
+#   低檔且具起漲訊號 — "is today's close both near the bottom of its
+#       own recent trading range AND has it just crossed above its own
+#       5-day moving average today" (see
+#       app.domain.technical_signal_builder.build_low_with_rising_signal).
+#
+#   低檔首板 — "is today's close (a) the legal limit-up price, (b)
+#       near the bottom of that same trading range, AND (c) NOT a
+#       continuation of a limit-up that already happened on the
+#       immediately preceding trading session" (see
+#       app.domain.technical_signal_builder.build_low_first_limit_up_signal).
+#       (c) relies on a PROVISIONAL, single-day approximation — see
+#       estimate_previous_session_limit_up's own docstring — so the
+#       footer explicitly calls this out as an approximation, never
+#       presented as an official historical determination.
 
 
 def _render_technical_signal_lines(stock: ReportStockView) -> list[str]:
-    value = stock.technical_low_with_rising_signal
-    if value is None:
-        line = "⚪ 低檔且具起漲訊號：資料不足"
-    elif value:
-        line = "✅ 低檔且具起漲訊號：是"
+    lines = ["技術面"]
+
+    rising = stock.technical_low_with_rising_signal
+    if rising is None:
+        lines.append("⚪ 低檔且具起漲訊號：資料不足")
+    elif rising:
+        lines.append("✅ 低檔且具起漲訊號：是")
     else:
-        line = "❌ 低檔且具起漲訊號：否"
-    return ["技術面", line]
+        lines.append("❌ 低檔且具起漲訊號：否")
+
+    # technical_low_first_limit_up_signal is a full LowFirstLimitUpSignal
+    # (see that dataclass's own docstring), not a bare bool | None —
+    # this block only ever renders `.matched`, the exact same tri-state
+    # bool it used to receive directly, so the rendered text below is
+    # byte-for-byte unchanged from before that type became structured.
+    first_board = stock.technical_low_first_limit_up_signal
+    first_board_matched = first_board.matched if first_board is not None else None
+    if first_board_matched is None:
+        lines.append("⚪ 低檔首板：資料不足")
+    elif first_board_matched:
+        lines.append("✅ 低檔首板：是")
+    else:
+        lines.append("❌ 低檔首板：否")
+
+    return lines
 
 
 # --- 基本面 (revenue-or-EPS-growth-sustained, display-only tri-state) --------
@@ -1087,7 +1146,7 @@ def _render_report_header_lines(
         "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
         "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
         "✅ 評分模型：絕對訊號與候選池相對分數分離",
-        "⬜ 技術面：低檔首板",
+        "✅ 技術面：低檔首板",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
         "📊 資料概況",
@@ -1167,6 +1226,15 @@ def _render_report_footer_lines(*, strategy_version: str) -> list[str]:
             "「今日剛站上 5 日均線」兩項條件，"
             "同樣為獨立於綜合分數之外的參考訊號，"
             "不會改變「訊號」區塊中動能因子的評分結果。"
+        ),
+        (
+            "「低檔首板」進一步顯示今日是否同時符合「收盤漲停」"
+            "「位於近 20 個交易日價格區間下緣」及"
+            "「前一交易日未漲停」三項條件；"
+            "其中「前一交易日是否漲停」目前以前一交易日收盤價"
+            "近似平盤價回推計算，屬於近似判定，"
+            "非官方漲停資料，僅供參考，"
+            "同樣不會改變「訊號」區塊中任何因子的評分結果。"
         ),
         (
             "「基本面」區塊顯示營收與 EPS 各自的持續成長判斷（營收看最近"
@@ -1385,7 +1453,7 @@ def render_no_qualified_stock_report(
             "✅ 基本面：營收或 EPS YoY ≥ 10%，且具持續性",
             "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
             "✅ 評分模型：絕對訊號與候選池相對分數分離",
-            "⬜ 技術面：低檔首板",
+            "✅ 技術面：低檔首板",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
             "📊 資料概況",

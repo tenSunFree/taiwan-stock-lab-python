@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 from app.reports.text_renderer import (
     DISCLAIMER,
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -15,6 +16,21 @@ from app.reports.text_renderer import (
 )
 
 TRADING_DATE = dt.date(2026, 8, 7)
+
+
+def _first_board(matched: bool | None) -> LowFirstLimitUpSignal:
+    """Minimal LowFirstLimitUpSignal fixture for renderer tests that
+    only care about the rendered `.matched` tri-state — the renderer
+    itself only reads that one field (see
+    _render_technical_signal_lines), so the other sub-fields here are
+    dummy values, not meant to be internally consistent."""
+    return LowFirstLimitUpSignal(
+        matched=matched,
+        is_low=None,
+        range_position=None,
+        is_close_limit_up=True,
+        previous_session_limit_up_estimated=None,
+    )
 
 
 def _make_stock_view(**overrides) -> ReportStockView:
@@ -143,9 +159,27 @@ def test_report_shows_daily_rank_denominator_matches_stocks_actually_listed():
     """更貼近真實情境的回歸測試：即使 ranking_limit 設定為 10，只要
     今天實際只有 5 檔股票符合門檻進入 ranked_stocks，每一檔的「今日
     排名」分母都必須是 5，不是 10——這正是使用者回報過的真實案例
-    （通過資料完整度門檻：5 檔，但排名卻顯示 1 / 10 的落差）。"""
+    （通過資料完整度門檻：5 檔，但排名卻顯示 1 / 10 的落差）。
+
+    以 render_daily_report_messages() 而非 render_daily_report() render
+    ——5 檔股票、每個因子都帶完整可解釋原因的報告，加上「低檔首板」
+    這個新的技術面子訊號後已經真實超過 LINE 單則訊息上限，這正是
+    本模組自己文件所說的「a fully-populated Top N report can now
+    genuinely exceed LINE's single-message limit...which is now an
+    expected outcome」，而不是這個測試本身想驗證的事——分頁邏輯本來
+    就保證同一檔股票的區塊不會被切開，所以合併所有訊息後再斷言，跟
+    用單一字串斷言的效果完全一樣。"""
     stocks = [_make_stock_view(rank=i) for i in range(1, 6)]
-    report = _render(*stocks, ranking_limit=10)
+    messages = render_daily_report_messages(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=18,
+        eligible_count=12,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+    report = "\n\n".join(messages)
     for rank in range(1, 6):
         assert f"今日排名：{rank} / 5" in report
     assert "/ 10" not in report
@@ -154,9 +188,19 @@ def test_report_shows_daily_rank_denominator_matches_stocks_actually_listed():
 def test_report_top_display_line_still_reflects_configured_ranking_limit():
     """「顯示 Top N」與「展示範圍：綜合分數 Top N」這兩行描述的是設定
     的顯示上限本身，跟今天實際入榜幾檔無關，不應該被上面那個分母的
-    修正影響。"""
+    修正影響。同樣改用 render_daily_report_messages()——理由見上一個
+    測試的說明。"""
     stocks = [_make_stock_view(rank=i) for i in range(1, 6)]
-    report = _render(*stocks, ranking_limit=10)
+    messages = render_daily_report_messages(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=18,
+        eligible_count=12,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+    report = "\n\n".join(messages)
     assert "✅ 顯示 Top 10" in report
     assert "展示範圍：綜合分數 Top 10" in report
 
@@ -489,6 +533,70 @@ def test_technical_signal_is_independent_of_momentum_score():
     assert "✅ 低檔且具起漲訊號：是" in report
 
 
+# --- 技術面：低檔首板（display-only tri-state，獨立於低檔起漲訊號） -----------
+
+
+def test_first_board_signal_shows_yes():
+    report = _render(
+        _make_stock_view(technical_low_first_limit_up_signal=_first_board(True))
+    )
+    assert "✅ 低檔首板：是" in report
+
+
+def test_first_board_signal_shows_no():
+    report = _render(
+        _make_stock_view(technical_low_first_limit_up_signal=_first_board(False))
+    )
+    assert "❌ 低檔首板：否" in report
+
+
+def test_first_board_signal_shows_insufficient_data():
+    """預設值（未提供時）、明確傳入 None（整個訊號都沒算出來），以及
+    傳入一個 matched=None 的 LowFirstLimitUpSignal（算出來了但資料不
+    足以判定 matched）都必須顯示「資料不足」，不能因為 Python 的
+    falsy 判斷把 None 誤判成 False（否）——理由跟低檔起漲那個 tri-state
+    欄位完全一樣。"""
+    report = _render(_make_stock_view(technical_low_first_limit_up_signal=None))
+    assert "⚪ 低檔首板：資料不足" in report
+    assert "✅ 低檔首板" not in report
+    assert "❌ 低檔首板" not in report
+
+    report_matched_none = _render(
+        _make_stock_view(technical_low_first_limit_up_signal=_first_board(None))
+    )
+    assert "⚪ 低檔首板：資料不足" in report_matched_none
+
+
+def test_first_board_signal_is_independent_of_low_with_rising_signal():
+    """「低檔首板」跟「低檔且具起漲訊號」是兩個完全獨立的 tri-state
+    欄位——一檔股票可以是低檔首板成立、但還沒站上 MA5（起漲訊號為
+    False 或 None），兩者不應互相覆蓋。"""
+    report = _render(
+        _make_stock_view(
+            technical_low_with_rising_signal=False,
+            technical_low_first_limit_up_signal=_first_board(True),
+        )
+    )
+    assert "❌ 低檔且具起漲訊號：否" in report
+    assert "✅ 低檔首板：是" in report
+
+
+def test_progress_checklist_shows_first_board_as_done():
+    """功能上線後，「📌 功能進度」清單裡的「低檔首板」項目要從 ⬜ 改成
+    ✅。"""
+    report = _render(_make_stock_view())
+    assert "✅ 技術面：低檔首板" in report
+    assert "⬜ 技術面：低檔首板" not in report
+
+
+def test_footer_mentions_first_board_is_a_provisional_approximation():
+    """「低檔首板」倚賴前一交易日漲停狀態的近似回推，模型說明必須明
+    確標示這是近似判定，不能讓讀者誤以為是官方漲停資料。"""
+    report = _render(_make_stock_view())
+    assert "近似" in report
+    assert "前一交易日未漲停" in report
+
+
 # --- 基本面（display-only tri-state：營收 OR EPS，獨立於 fundamental 評分因子）
 
 
@@ -780,6 +888,8 @@ def test_no_qualified_stock_report_also_shows_absolute_signal_rollout_as_done():
     )
     assert "✅ 評分模型：絕對訊號與候選池相對分數分離" in report
     assert "⬜ 評分模型：絕對訊號與候選池相對分數分離" not in report
+    assert "✅ 技術面：低檔首板" in report
+    assert "⬜ 技術面：低檔首板" not in report
 
 
 # --- Standalone utilities (unchanged) -----------------------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,49 @@ class StockFeatures:
     # dataclass-field-ordering reason as institutional_net_buy_3d_positive
     # above, not because it's thematically related to risk quality.
     technical_low_with_rising_signal: bool | None = None
+
+    # technical / price-structure — SIBLING of
+    # technical_low_with_rising_signal above, a SEPARATE DISPLAY-ONLY
+    # signal (see app.domain.technical_signal_builder's own module
+    # docstring for why this is a standalone field rather than OR'd
+    # into the existing one, per that module's own stated design
+    # decision): whether today's close is (a) the legal limit-up
+    # price, (b) near the low end of its own trailing 20-session
+    # trading range, AND (c) NOT a continuation of a limit-up that
+    # already happened on the immediately preceding trading session
+    # (see
+    # app.domain.technical_signal_builder.build_low_first_limit_up_signal).
+    #
+    # A LowFirstLimitUpSignal, NOT a bare bool | None — this carries
+    # the FULL breakdown (is_low, range_position, is_close_limit_up,
+    # previous_session_limit_up_estimated,
+    # previous_session_check_provisional), not just the collapsed
+    # tri-state result, so downstream layers (report explainer,
+    # future backtest/debug tooling) can see WHY the overall result
+    # came out the way it did without recomputing anything — see that
+    # dataclass's own docstring. Read `.matched` for the equivalent of
+    # the old plain tri-state bool (this is exactly what
+    # app.reports.text_renderer's rendered "低檔首板" line does; the
+    # rendered report text itself is unchanged by this richer type).
+    #
+    # (c) relies on estimate_previous_session_limit_up()'s PROVISIONAL,
+    # single-day approximation (previous close as an approximate
+    # reference price, same convention app.ingestion.finmind_mapper
+    # already uses for today's own reference_price) — see that
+    # function's own docstring for exactly which days it is wrong on
+    # (ex-rights/ex-dividend/capital-reduction/newly-listed days). This
+    # field must therefore NEVER be fed into RiskPolicy,
+    # consecutive_limit_up_days, or any FACTOR_WEIGHTS scoring factor
+    # — same restriction as technical_low_with_rising_signal above, on
+    # top of the PROVISIONAL caveat that field doesn't carry.
+    #
+    # None (the OUTER None, distinct from any of the dataclass's own
+    # None sub-fields) means this was never computed at all this run
+    # — e.g. the FinMind historical-price fetch failed or returned no
+    # usable rows for this stock (see
+    # app.jobs.daily_ranking.build_stock_features's block 1) — same
+    # convention as every other optional signal in this dataclass.
+    technical_low_first_limit_up_signal: LowFirstLimitUpSignal | None = None
 
     # fundamentals — ANOTHER DISPLAY-ONLY signal, for the "基本面"
     # block: whether monthly revenue YoY growth has been sustained over
