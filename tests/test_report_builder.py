@@ -10,6 +10,7 @@ from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.limit_up import LimitUpResult, LimitUpSource
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 from app.domain.scoring import FACTOR_WEIGHTS, ScoredStock
+from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import render_daily_report
 
@@ -510,6 +511,65 @@ def test_build_report_stocks_technical_low_with_rising_signal_defaults_to_none()
     )
 
     assert result[0].technical_low_with_rising_signal is None
+
+
+def test_build_report_stocks_carries_technical_low_first_limit_up_signal():
+    """features_by_stock 的 technical_low_first_limit_up_signal 必須
+    原封不動地(完整結構,不只是 .matched)帶到 ReportStockView，供「技
+    術面」區塊的「低檔首板」子訊號使用——這是獨立於
+    technical_low_with_rising_signal 之外的另一個 display-only 欄位，
+    見 app.domain.technical_signal_builder 的模組說明。"""
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+    signal = LowFirstLimitUpSignal(
+        matched=True,
+        is_low=True,
+        range_position=0.1,
+        is_close_limit_up=True,
+        previous_session_limit_up_estimated=False,
+    )
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features("1101", technical_low_first_limit_up_signal=signal)
+        },
+    )
+
+    assert result[0].technical_low_first_limit_up_signal == signal
+    assert result[0].technical_low_first_limit_up_signal.matched is True
+
+
+def test_build_report_stocks_technical_low_first_limit_up_signal_defaults_to_none():
+    scored = [
+        ScoredStock(
+            stock_id="1101",
+            total_score=80.0,
+            factor_scores={"liquidity": 90.0},
+            risk_flags=(),
+            data_completeness=0.90,
+        )
+    ]
+    candidate = _make_candidate(stock_id="1101")
+
+    result = build_report_stocks(
+        ranked_stocks=scored,
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+
+    assert result[0].technical_low_first_limit_up_signal is None
 
 
 def test_build_report_stocks_carries_fundamental_growth_sustained():

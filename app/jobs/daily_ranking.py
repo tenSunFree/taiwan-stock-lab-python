@@ -140,6 +140,20 @@ KNOWN LIMITATIONS in this checkpoint:
     - reference_price on both markets remains provisional (see each
       mapper's module docstring for the exact caveats — ex-rights
       days, no-trade days, etc.).
+    - technical_low_first_limit_up_signal's "首板" (first board) leg
+      relies on estimate_previous_session_limit_up()'s PROVISIONAL,
+      single-day approximation of whether the PREVIOUS trading session
+      itself closed at its own legal limit-up price — it uses the same
+      "previous close as approximate reference price" convention as
+      reference_price above, so it is wrong on the exact same days
+      (ex-rights/ex-dividend/capital-reduction/newly-listed days). This
+      is DISPLAY-ONLY and deliberately narrower than the general
+      consecutive_limit_up_days gap below — see
+      app.domain.technical_signal_builder's module docstring for why
+      this narrow, explicitly-labeled approximation is acceptable for
+      a single non-scoring report line, while a general
+      consecutive_limit_up_days reconstruction (fed into RiskPolicy)
+      is not.
     - If TPEx fails to fetch, has no usable rows, or its mapper
       filters out every row for target_date, the entire run fails
       rather than silently falling back to TWSE-only candidates (and
@@ -215,7 +229,10 @@ from app.domain.monthly_revenue_builder import (
 from app.domain.risk_inputs import is_ky_stock, is_one_price_limit_up
 from app.domain.risk_policy import RiskPolicy, build_risk_quality_raw
 from app.domain.scoring import ScoredStock, score_candidates, select_top_n
-from app.domain.technical_signal_builder import build_low_with_rising_signal
+from app.domain.technical_signal_builder import (
+    build_low_first_limit_up_signal,
+    build_low_with_rising_signal,
+)
 from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
@@ -427,7 +444,48 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # uses deliver_many()/deliver_broadcast_many() with a per-part
 # idempotency identity (see app.delivery.service.build_message_part_version)
 # instead of a single deliver()/deliver_broadcast() call.
-MESSAGE_VERSION = "text-v13"
+#
+# NOTE: app.reports.text_renderer's own module comments describe a
+# "text-v14 (visual hierarchy)" STOCK_DIVIDER/SECTION_DIVIDER change
+# that has no matching changelog entry (or version bump) here — this
+# was discovered while adding text-v14 below, not introduced by it.
+# Worth reconciling separately (was that divider change ever actually
+# shipped under text-v13, or is this changelog simply out of sync with
+# text_renderer.py?) — out of scope for this change.
+#
+# text-v14: adds the "低檔首板" sub-signal to the existing "技術面"
+# block (see
+# app.domain.technical_signal_builder.build_low_first_limit_up_signal).
+# This IS a new field on both StockFeatures and ReportStockView
+# (technical_low_first_limit_up_signal), but it is DISPLAY-ONLY, same
+# as technical_low_with_rising_signal above — it does not participate
+# in FACTOR_WEIGHTS, does not touch the existing "momentum" scoring
+# factor, and does not alter RiskPolicy. Computed from the same
+# history_points/today_close already fetched for block 1, plus
+# candidate.limit_up.is_close_limit_up (already computed by
+# CandidateBuilder, not recomputed here) — no second FinMind call.
+# Tri-state, rendered explicitly, same convention as every other
+# optional signal in this report. The "📌 功能進度" checklist line
+# changes from "⬜ 技術面：低檔首板" to "✅ 技術面：低檔首板" in both
+# render_daily_report()/render_daily_report_messages() and
+# render_no_qualified_stock_report(), and the "ℹ️ 模型說明" footer
+# gains a sentence explaining that the previous-session limit-up check
+# this relies on is a PROVISIONAL approximation (see
+# app.domain.technical_signal_builder.estimate_previous_session_limit_up's
+# own docstring for why).
+#
+# POST-text-v14 (no new MESSAGE_VERSION needed): StockFeatures.
+# technical_low_first_limit_up_signal / ReportStockView's field of the
+# same name were later upgraded from a bare bool | None to a
+# structured app.domain.technical_signal_builder.LowFirstLimitUpSignal
+# carrying the is_low / range_position / previous_session_limit_up_estimated
+# breakdown behind `.matched` — purely for future explainability/
+# debugging/backtesting. The RENDERED report text is unchanged
+# (app.reports.text_renderer only ever reads `.matched`, which is
+# exactly the old bool), so this did not need its own message_version
+# bump per this file's own idempotency rule — no visible content
+# changed, only an internal data shape.
+MESSAGE_VERSION = "text-v14"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -800,6 +858,13 @@ def build_stock_features(
         # shares this block's try/except and success/failure counters
         # rather than needing its own.
         technical_low_with_rising_signal = None
+        # SIBLING DISPLAY-ONLY signal for the same "技術面" block — see
+        # app.domain.technical_signal_builder.build_low_first_limit_up_signal.
+        # Also computed from history_points/today_close already fetched
+        # here, PLUS candidate.limit_up.is_close_limit_up (already
+        # computed by CandidateBuilder, never recomputed) — still no
+        # second FinMind call, still shares this block's try/except.
+        technical_low_first_limit_up_signal = None
 
         try:
             history_payload = finmind_client.fetch_stock_price_history(
@@ -837,6 +902,12 @@ def build_stock_features(
                 technical_low_with_rising_signal = build_low_with_rising_signal(
                     target_date=target_date,
                     today_close=float(today_close),
+                    history=history_points,
+                )
+                technical_low_first_limit_up_signal = build_low_first_limit_up_signal(
+                    target_date=target_date,
+                    today_close=float(today_close),
+                    is_close_limit_up=candidate.limit_up.is_close_limit_up,
                     history=history_points,
                 )
                 price_success_count += 1
@@ -1129,6 +1200,7 @@ def build_stock_features(
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             institutional_data_cutoff=institutional_data_cutoff,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
+            technical_low_first_limit_up_signal=technical_low_first_limit_up_signal,
             revenue_yoy=revenue_yoy,
             fundamental_growth_sustained=fundamental_growth_sustained,
             eps_growth_sustained=eps_growth_sustained,
@@ -1145,7 +1217,8 @@ def build_stock_features(
             "institutional_net_buy_3d_positive=%s "
             "institutional_data_cutoff_expected=%s "
             "institutional_data_cutoff_confirmed=%s "
-            "technical_low_with_rising_signal=%s revenue_yoy=%s "
+            "technical_low_with_rising_signal=%s "
+            "technical_low_first_limit_up_signal=%s revenue_yoy=%s "
             "fundamental_growth_sustained=%s eps_growth_sustained=%s "
             "risk_quality_raw=%s risk_flags=%s risk_missing_inputs=%s",
             stock_id,
@@ -1159,6 +1232,7 @@ def build_stock_features(
             stock_features.institutional_data_cutoff.expected_as_of_date,
             stock_features.institutional_data_cutoff.confirmed_as_of_date,
             stock_features.technical_low_with_rising_signal,
+            stock_features.technical_low_first_limit_up_signal,
             stock_features.revenue_yoy,
             stock_features.fundamental_growth_sustained,
             stock_features.eps_growth_sustained,
