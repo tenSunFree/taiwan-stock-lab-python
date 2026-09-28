@@ -2,33 +2,146 @@ name: daily-limit-up-ranking
 
 on:
   schedule:
-    # UTC 08:17 / 08:47 / 09:17 = Taiwan time 16:17 / 16:47 / 17:17
-    - cron: "17 8 * * 1-5"
-    - cron: "47 8 * * 1-5"
-    - cron: "17 9 * * 1-5"
+    # Taiwan time 18:00 / 18:30 / ... / 23:30, Monday-Friday.
+    #
+    # Deliberately stops at 23:30: TARGET_TRADING_DATE is left empty for
+    # scheduled runs so daily_ranking.py resolves "today" itself —
+    # retrying past midnight Taiwan time would silently start chasing a
+    # DIFFERENT calendar day than this evening's retries were for.
+    #
+    # Each trigger first runs the `gate` job, which checks whether an
+    # earlier SCHEDULED run today already succeeded:
+    #   - no prior success  -> run the real `ranking` job
+    #   - already succeeded -> skip `ranking` entirely (fast no-op)
+    # This is a compute-saving layer ON TOP of app.delivery.service's
+    # own database idempotency (DATABASE_URL), never a replacement for it.
+    - cron: "0,30 18-23 * * 1-5"
+      timezone: "Asia/Taipei"
 
   workflow_dispatch:
     inputs:
       trading_date:
-        description: "Manually specify the target trading date (YYYY-MM-DD); leave empty to use today"
+        description: "Target trading date (YYYY-MM-DD); leave empty to use today"
         required: false
+        type: string
+      dry_run:
+        description: "Preview report only — forces LINE_DELIVERY_MODE=off regardless of delivery_mode below"
+        required: true
+        default: true
+        type: boolean
+      delivery_mode:
+        description: "LINE delivery mode when dry_run=false (broadcast = send to every OA friend)"
+        required: true
+        default: "off"
+        type: choice
+        # "push" is deliberately NOT offered: this repo has no
+        # LINE_TARGET_ID secret (broadcast-only delivery), and
+        # daily_ranking.py exits 1 if LINE_DELIVERY_MODE=push is
+        # selected without one.
+        options:
+          - "off"
+          - broadcast
 
-# Prevents the three scheduled runs (16:17/16:47/17:17) or a manual
-# trigger from overlapping with each other. A new run under the same
-# concurrency group does not cancel an older one, it just waits — the
-# job still needs its own "already completed / already pushed today"
-# check internally; this concurrency setting only solves "running at
-# the same time," not "duplicate push after a successful rerun."
+# Nothing granted at the workflow level; each job below requests only
+# what it actually needs (least privilege).
+permissions: {}
+
+# Prevents overlapping runs. A new trigger WAITS for the running one
+# instead of cancelling it, so a later scheduled attempt's `gate` job
+# only ever sees fully-finished earlier runs. Keyed by trading_date so a
+# manual backfill for a different date gets its own lane.
+#
+# This only prevents concurrent execution. Duplicate-LINE-send
+# protection comes from app.delivery.service's database idempotency.
 concurrency:
   group: daily-limit-up-ranking-${{ github.event.inputs.trading_date || 'scheduled' }}
   cancel-in-progress: false
 
+env:
+  GCP_PROJECT_ID: travel-audio-guide-508205
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/1088235476550/locations/global/workloadIdentityPools/github/providers/taiwan-stock-lab
+  GCP_SERVICE_ACCOUNT: github-taiwan-stock-lab@travel-audio-guide-508205.iam.gserviceaccount.com
+  CLOUD_SQL_INSTANCE_CONNECTION_NAME: travel-audio-guide-508205:asia-east1:travel-db
+  # Pinned Cloud SQL Auth Proxy release + its officially published
+  # SHA-256 (from the GitHub release notes for v2.25.4). Bump both
+  # together when upgrading.
+  CLOUD_SQL_PROXY_VERSION: v2.25.4
+  CLOUD_SQL_PROXY_SHA256: b780c0d2c445ffd5d2fdba0925f2722c19fcd0d2c27c538e85713732698561f2
+
 jobs:
+  # --------------------------------------------------------------------
+  # Job 1: decide whether tonight's ranking pipeline needs to run at all
+  # --------------------------------------------------------------------
+  gate:
+    name: Check for an earlier successful scheduled run today
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read   # query this workflow's own past runs
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check today's scheduled runs
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Manual runs always execute (dry-run preview, backfill, or an
+          # intentional extra live attempt).
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "workflow_dispatch run — always executes."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The schedule window (18:00-23:30 Taipei) maps to 10:00-15:30
+          # UTC of the SAME calendar day, so filtering the API's UTC-based
+          # `created` parameter by the Taiwan date is safe for this window.
+          # Recompute if the window is ever moved to cross UTC midnight.
+          TODAY_TW="$(TZ=Asia/Taipei date +%F)"
+          echo "Taiwan date: ${TODAY_TW}"
+
+          SUCCESS_COUNT="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/daily-limit-up-ranking.yml/runs?event=schedule&created=${TODAY_TW}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'
+          )"
+          echo "Successful scheduled runs today: ${SUCCESS_COUNT}"
+
+          if [[ "${SUCCESS_COUNT}" -gt 0 ]]; then
+            echo "Already succeeded today — skipping the ranking job."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No success yet today — running the ranking job."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------------------------
+  # Job 2: Cloud SQL connectivity + ranking pipeline + LINE delivery
+  #
+  # Connection chain:
+  #   GitHub OIDC -> Workload Identity Federation -> impersonate
+  #   github-taiwan-stock-lab SA (roles/cloudsql.client) -> Cloud SQL
+  #   Auth Proxy on this runner -> 127.0.0.1:5432 -> DATABASE_URL
+  #
+  # DATABASE_URL intentionally points at 127.0.0.1:5432 — that address
+  # only becomes valid once the proxy below is listening on this runner.
+  # --------------------------------------------------------------------
   ranking:
+    name: Run daily ranking
+    needs: [gate]
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read   # actions/checkout
+      id-token: write  # GitHub OIDC token for Workload Identity Federation
 
     steps:
+      # Must come BEFORE google-github-actions/auth: auth writes its
+      # credentials file into $GITHUB_WORKSPACE, which checkout creates.
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -39,12 +152,141 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tests
-        run: pytest -x --tb=short
+      # NOTE: pytest is deliberately NOT run here — tests.yml already runs
+      # the full suite on every push/PR to main, and this workflow only
+      # ever runs code already on main.
 
-      - name: Run Phase 1 ingestion job
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          # Default create_credentials_file=true exports
+          # GOOGLE_APPLICATION_CREDENTIALS, which the proxy picks up.
+
+      - name: Download Cloud SQL Auth Proxy (checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cloud-sql-proxy \
+            "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          echo "${CLOUD_SQL_PROXY_SHA256}  cloud-sql-proxy" | sha256sum --check --strict
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --version
+
+      - name: Start Cloud SQL Auth Proxy on 127.0.0.1:5432
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Uses the instance's public IP path by default; no authorized
+          # networks are needed (the proxy authenticates via IAM + mTLS).
+          nohup ./cloud-sql-proxy \
+            --address 127.0.0.1 \
+            --port 5432 \
+            "${CLOUD_SQL_INSTANCE_CONNECTION_NAME}" \
+            > "${RUNNER_TEMP}/cloud-sql-proxy.log" 2>&1 &
+          echo "PROXY_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait up to 30s for the local listener.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+              echo "Cloud SQL Auth Proxy is listening on 127.0.0.1:5432"
+              exit 0
+            fi
+            if ! kill -0 "$!" 2>/dev/null; then
+              echo "::error::Cloud SQL Auth Proxy exited early"
+              cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::Cloud SQL Auth Proxy did not start listening within 30s"
+          cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+          exit 1
+
+      # A listening port only proves the proxy started; IAM/credential/DB
+      # password problems only surface on the first real connection.
+      # Fail fast here with a clear error instead of minutes later deep in
+      # the pipeline.
+      - name: Verify database connectivity (SELECT 1)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as conn:
+              conn.execute(text("SELECT 1"))
+          print("Database connectivity OK via Cloud SQL Auth Proxy")
+          PY
+
+      # ----------------------------------------------------------------
+      # Resolve REPORT_DRY_RUN / LINE_DELIVERY_MODE.
+      #
+      # VERIFIED AGAINST app/jobs/daily_ranking.py: these two flags are
+      # checked in two SEPARATE `if` blocks, not mutually exclusive.
+      # REPORT_DRY_RUN=true does NOT suppress a real broadcast on its
+      # own — a genuine preview-only run must force LINE_DELIVERY_MODE=off.
+      # ----------------------------------------------------------------
+      - name: Resolve execution mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "Scheduled production run: live broadcast."
+            echo "REPORT_DRY_RUN=false" >> "$GITHUB_ENV"
+            echo "LINE_DELIVERY_MODE=broadcast" >> "$GITHUB_ENV"
+
+          elif [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            echo "Manual dry-run: LINE delivery forced off."
+            echo "REPORT_DRY_RUN=true" >> "$GITHUB_ENV"
+            echo "LINE_DELIVERY_MODE=off" >> "$GITHUB_ENV"
+
+          else
+            echo "Manual live run: delivery_mode=${{ github.event.inputs.delivery_mode }}"
+            echo "REPORT_DRY_RUN=false" >> "$GITHUB_ENV"
+            echo "LINE_DELIVERY_MODE=${{ github.event.inputs.delivery_mode }}" >> "$GITHUB_ENV"
+          fi
+
+      # ----------------------------------------------------------------
+      # Exit codes from app.jobs.daily_ranking.run():
+      #   0 -> success / non-trading-day skip
+      #   1 -> fatal error
+      #   2 -> WAITING_FOR_DATA
+      # Any non-zero exit fails this run, so the next scheduled attempt's
+      # `gate` job retries.
+      #
+      # NOTE: EPS observation rows are written to DATABASE_URL during
+      # feature-building regardless of REPORT_DRY_RUN (benign,
+      # append-only, revision-safe).
+      # ----------------------------------------------------------------
+      - name: Run daily ranking
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           TARGET_TRADING_DATE: ${{ github.event.inputs.trading_date }}
-        run: python -m app.jobs.daily_ranking
+        run: |
+          echo "event=${{ github.event_name }} target_date=${TARGET_TRADING_DATE:-today} dry_run=${REPORT_DRY_RUN} delivery_mode=${LINE_DELIVERY_MODE}"
+          python -m app.jobs.daily_ranking
+
+      - name: Show Cloud SQL Auth Proxy log
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP}/cloud-sql-proxy.log" ]]; then
+            cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+          fi
+
+      - name: Stop Cloud SQL Auth Proxy
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${PROXY_PID:-}" ]]; then
+            kill "${PROXY_PID}" 2>/dev/null || true
+          fi
