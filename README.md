@@ -762,8 +762,9 @@ excluded and covered by tests (`tests/test_text_renderer.py`).
   having a public IP (no authorized networks needed — the proxy
   authenticates via IAM), a `roles/iam.workloadIdentityUser` binding on
   the service account scoped to this repository's
-  `attribute.repository`, and `roles/cloudsql.client` on the service
-  account.
+  `attribute.repository`, a provider attribute condition limiting
+  tokens to this repository's `refs/heads/main`, and
+  `roles/cloudsql.client` on the service account.
 
 ## Local Development
 
@@ -1272,17 +1273,23 @@ app/jobs/              Scheduled job entry points
   - `daily-limit-up-ranking.yml` — the production pipeline, triggered
     every 30 minutes from 18:00 to 23:30 Asia/Taipei on weekdays
     (`cron: "0,30 18-23 * * 1-5"` with `timezone: "Asia/Taipei"`).
-    Stops at 23:30 on purpose: scheduled runs let the job resolve
-    "today" itself, so retrying past midnight would silently chase a
-    different trading date. Structured as two jobs:
-    - `gate` (`actions: read` only) queries this workflow's own run
-      history and skips everything if a scheduled run already
-      succeeded today — so a failure (exit 1, or exit 2
-      `WAITING_FOR_DATA`) is retried 30 minutes later, and the first
-      success ends the evening's attempts without re-fetching
-      TWSE/TPEx/FinMind or re-scoring
-    - `ranking` (`contents: read` + `id-token: write` only)
-      authenticates to GCP via Workload Identity Federation, starts
+    Stops at 23:30 so every attempt belongs to one Taiwan calendar
+    day. Structured as two jobs:
+    - `gate` (`actions: read` only) refuses any ref other than
+      `refs/heads/main`, then pins the intended trading date from the
+      run's own `created_at` timestamp rather than the current clock —
+      GitHub can delay scheduled triggers, so a trigger created outside
+      the 18:00–23:59 Taipei window (e.g. a 23:30 run delayed past
+      midnight) is skipped instead of processing the next day. It then
+      queries this workflow's run history and skips everything if a
+      scheduled run already succeeded for that date — so a failure
+      (exit 1, or exit 2 `WAITING_FOR_DATA`) is retried 30 minutes
+      later, and the first success ends the evening's attempts without
+      re-fetching TWSE/TPEx/FinMind or re-scoring. The pinned date is
+      passed to `ranking` as `TARGET_TRADING_DATE`, so a run that
+      starts late still processes the evening it was scheduled for
+    - `ranking` (`contents: read` + `id-token: write` only; runs only
+      on `refs/heads/main`) authenticates to GCP via Workload Identity Federation, starts
       the checksum-verified Cloud SQL Auth Proxy on `127.0.0.1:5432`,
       runs a `SELECT 1` connectivity check to fail fast on
       IAM/credential problems, then runs `python -m app.jobs.daily_ranking`.
@@ -1298,7 +1305,13 @@ app/jobs/              Scheduled job entry points
     LINE send even if the pipeline does re-run, including per-part
     crash recovery), and the per-request `X-Line-Retry-Key` (avoids
     LINE processing one in-flight HTTP retry twice). The `concurrency`
-    group only prevents overlapping execution
+    group (with `queue: max`, so a pending retry is queued rather than
+    replaced by the next trigger) only prevents overlapping execution
+  - Production credentials are main-only on both sides: the workflow
+    refuses non-main refs, and the GCP Workload Identity provider's
+    attribute condition restricts `assertion.ref` to
+    `refs/heads/main` — the GCP-side condition is the real enforcement
+    boundary, since another branch could edit the workflow file itself
 - Automated AI-assisted code review via CodeRabbit on every Pull
   Request to identify potential bugs, security concerns,
   maintainability issues, and consistency violations before merging

@@ -4,10 +4,15 @@ on:
   schedule:
     # Taiwan time 18:00 / 18:30 / ... / 23:30, Monday-Friday.
     #
-    # Deliberately stops at 23:30: TARGET_TRADING_DATE is left empty for
-    # scheduled runs so daily_ranking.py resolves "today" itself —
-    # retrying past midnight Taiwan time would silently start chasing a
-    # DIFFERENT calendar day than this evening's retries were for.
+    # Deliberately stops at 23:30 so every attempt belongs to the same
+    # Taiwan calendar day. GitHub can DELAY scheduled triggers, so the
+    # `gate` job does not trust the wall clock: it derives the intended
+    # trading date from this run's own created_at timestamp, skips any
+    # trigger created outside the 18:00-23:59 Taipei window (e.g. a 23:30
+    # trigger delayed past midnight), and passes that pinned date to the
+    # `ranking` job as TARGET_TRADING_DATE — so a run that starts late
+    # (scheduler delay or waiting in the concurrency queue) still
+    # processes the evening it was scheduled for, never the next day.
     #
     # Each trigger first runs the `gate` job, which checks whether an
     # earlier SCHEDULED run today already succeeded:
@@ -51,11 +56,18 @@ permissions: {}
 # only ever sees fully-finished earlier runs. Keyed by trading_date so a
 # manual backfill for a different date gets its own lane.
 #
+# `queue: max`: by default GitHub keeps only ONE pending run per group
+# and cancels it when another trigger arrives. With `max`, up to 100
+# pending runs wait and execute in FIFO order, so no retry is silently
+# dropped; once one succeeds, the remaining queued ones exit quickly at
+# `gate`. (`queue: max` cannot be combined with cancel-in-progress: true.)
+#
 # This only prevents concurrent execution. Duplicate-LINE-send
 # protection comes from app.delivery.service's database idempotency.
 concurrency:
   group: daily-limit-up-ranking-${{ github.event.inputs.trading_date || 'scheduled' }}
   cancel-in-progress: false
+  queue: max
 
 env:
   GCP_PROJECT_ID: travel-audio-guide-508205
@@ -79,6 +91,9 @@ jobs:
       actions: read   # query this workflow's own past runs
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
+      # Pinned Taiwan trading date for scheduled runs; empty for manual
+      # runs (which use their own trading_date input instead).
+      trading_date: ${{ steps.check.outputs.trading_date }}
     steps:
       - name: Check today's scheduled runs
         id: check
@@ -88,6 +103,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "trading_date=" >> "$GITHUB_OUTPUT"
+
+          # Production credentials are only ever handed to code on main.
+          # Scheduled runs always use the default branch; this blocks a
+          # manual workflow_dispatch from any other branch. (The real
+          # enforcement boundary is the GCP-side WIF attribute condition
+          # restricting assertion.ref to refs/heads/main, since a branch
+          # could edit this file — this check prevents accidents.)
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::warning::Refusing to run on ${GITHUB_REF}; production runs are main-only."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Manual runs always execute (dry-run preview, backfill, or an
           # intentional extra live attempt).
           if [[ "${{ github.event_name }}" != "schedule" ]]; then
@@ -96,26 +125,41 @@ jobs:
             exit 0
           fi
 
-          # The schedule window (18:00-23:30 Taipei) maps to 10:00-15:30
-          # UTC of the SAME calendar day, so filtering the API's UTC-based
-          # `created` parameter by the Taiwan date is safe for this window.
-          # Recompute if the window is ever moved to cross UTC midnight.
-          TODAY_TW="$(TZ=Asia/Taipei date +%F)"
-          echo "Taiwan date: ${TODAY_TW}"
+          # Derive the intended date from THIS run's creation time, not
+          # the current clock: created_at is fixed when the scheduler
+          # creates the run, so time spent waiting for a runner or in the
+          # concurrency queue cannot shift it to the next day.
+          CREATED_AT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.created_at')"
+          INTENDED_DATE="$(TZ=Asia/Taipei date -d "${CREATED_AT}" +%F)"
+          CREATED_HOUR_TW="$(TZ=Asia/Taipei date -d "${CREATED_AT}" +%H)"
+          echo "Run created at ${CREATED_AT} (Taipei ${INTENDED_DATE} ${CREATED_HOUR_TW}h)"
 
+          # Every legitimate trigger is created between 18:00 and 23:59
+          # Taipei. Anything else is a delayed trigger that crossed
+          # midnight — skip it rather than process a different day.
+          if (( 10#${CREATED_HOUR_TW} < 18 )); then
+            echo "::warning::Trigger created outside the 18:00-23:59 Taipei window (likely delayed past midnight) — skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The window (18:00-23:59 Taipei) maps to 10:00-15:59 UTC of the
+          # SAME calendar day, so filtering the API's UTC-based `created`
+          # parameter by the Taiwan date is safe for this window.
           SUCCESS_COUNT="$(
             gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/daily-limit-up-ranking.yml/runs?event=schedule&created=${TODAY_TW}&per_page=100" \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/daily-limit-up-ranking.yml/runs?event=schedule&created=${INTENDED_DATE}&per_page=100" \
               --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'
           )"
-          echo "Successful scheduled runs today: ${SUCCESS_COUNT}"
+          echo "Successful scheduled runs for ${INTENDED_DATE}: ${SUCCESS_COUNT}"
 
           if [[ "${SUCCESS_COUNT}" -gt 0 ]]; then
-            echo "Already succeeded today — skipping the ranking job."
+            echo "Already succeeded for ${INTENDED_DATE} — skipping the ranking job."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No success yet today — running the ranking job."
+            echo "No success yet for ${INTENDED_DATE} — running the ranking job."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "trading_date=${INTENDED_DATE}" >> "$GITHUB_OUTPUT"
           fi
 
   # --------------------------------------------------------------------
@@ -132,7 +176,9 @@ jobs:
   ranking:
     name: Run daily ranking
     needs: [gate]
-    if: needs.gate.outputs.should_run == 'true'
+    # Defense in depth alongside the gate's own branch check: this job
+    # holds the production credentials, so it never runs outside main.
+    if: needs.gate.outputs.should_run == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -270,7 +316,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          TARGET_TRADING_DATE: ${{ github.event.inputs.trading_date }}
+          # Scheduled: the date pinned by `gate` from created_at.
+          # Manual: the trading_date input (empty -> today in Taipei).
+          TARGET_TRADING_DATE: ${{ github.event_name == 'schedule' && needs.gate.outputs.trading_date || github.event.inputs.trading_date }}
         run: |
           echo "event=${{ github.event_name }} target_date=${TARGET_TRADING_DATE:-today} dry_run=${REPORT_DRY_RUN} delivery_mode=${LINE_DELIVERY_MODE}"
           python -m app.jobs.daily_ranking
