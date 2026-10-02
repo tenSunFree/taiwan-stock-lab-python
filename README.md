@@ -1,11 +1,13 @@
 # taiwan-stock-lab-python
 
 [![Tests](https://github.com/tenSunFree/taiwan-stock-lab-python/actions/workflows/tests.yml/badge.svg)](https://github.com/tenSunFree/taiwan-stock-lab-python/actions/workflows/tests.yml)
+[![Daily Ranking](https://github.com/tenSunFree/taiwan-stock-lab-python/actions/workflows/daily-limit-up-ranking.yml/badge.svg?event=schedule)](https://github.com/tenSunFree/taiwan-stock-lab-python/actions/workflows/daily-limit-up-ranking.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org)
 [![Architecture](https://img.shields.io/badge/Architecture-Layered%20Domain%20Design-4CAF50)](#architecture)
-[![Data](https://img.shields.io/badge/Data-PostgreSQL%20%2B%20Raw%20Snapshots-336791?logo=postgresql&logoColor=white)](#data-pipeline)
-[![Scheduling](https://img.shields.io/badge/Scheduling-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](#git-workflow--cicd)
-[![Delivery](https://img.shields.io/badge/Delivery-LINE%20Push%20%2B%20Broadcast-06C755?logo=line&logoColor=white)](#delivery)
+[![Data](https://img.shields.io/badge/Data-Cloud%20SQL%20PostgreSQL%20%2B%20Raw%20Snapshots-336791?logo=postgresql&logoColor=white)](#environment)
+[![Auth](https://img.shields.io/badge/GCP%20Auth-Workload%20Identity%20Federation-4285F4?logo=googlecloud&logoColor=white)](#environment)
+[![Scheduling](https://img.shields.io/badge/Scheduling-GitHub%20Actions%20%C2%B7%2030--min%20Retry-2088FF?logo=githubactions&logoColor=white)](#git-workflow--cicd)
+[![Delivery](https://img.shields.io/badge/Delivery-LINE%20Broadcast%20%2B%20Push-06C755?logo=line&logoColor=white)](#delivery)
 [![Testing](https://img.shields.io/badge/Testing-pytest-0A9EDC?logo=pytest&logoColor=white)](#testing)
 [![CodeRabbit Reviews](https://img.shields.io/badge/Code%20Review-CodeRabbit-FF6B35)](https://coderabbit.ai)
 [![style: strategy-versioned](https://img.shields.io/badge/config-strategy--versioned-B22C89.svg)](#configuration)
@@ -540,10 +542,21 @@ available.
   `StockFeatures`/`ReportStockView` for future explainability/
   debugging/backtesting use, not rendered in the LINE report yet
 - `REPORT_DRY_RUN=true` prints the exact report text to stdout for
-  manual inspection, with no LINE call and no database write — as of
-  `text-v12`, when the report is split into multiple messages, each
-  is printed as its own numbered preview block (`REPORT_DRY_RUN
-  preview N/M`)
+  manual inspection — as of `text-v12`, when the report is split into
+  multiple messages, each is printed as its own numbered preview block
+  (`REPORT_DRY_RUN preview N/M`). **`REPORT_DRY_RUN` and
+  `LINE_DELIVERY_MODE` are independent switches**, not mutually
+  exclusive: `app/jobs/daily_ranking.py` checks them in two separate
+  `if` blocks, so `REPORT_DRY_RUN=true` combined with
+  `LINE_DELIVERY_MODE=broadcast` prints the preview AND performs a real
+  broadcast. A genuine preview-only run requires `REPORT_DRY_RUN=true`
+  together with `LINE_DELIVERY_MODE=off` — which is exactly what the
+  scheduled workflow's manual `dry_run` input enforces (see Git
+  Workflow & CI/CD below). Dry-run also does not mean "zero database
+  writes": EPS observation rows are still written to `DATABASE_URL`
+  during feature-building whenever it is configured (benign,
+  append-only, revision-safe — see Enrichment (TWSE / TPEx Financial
+  Statements) above)
 
 ### Delivery
 
@@ -551,7 +564,11 @@ available.
   side effect), `push` (send to a single `LINE_TARGET_ID` — for
   testing a report-format change without notifying every subscriber),
   or `broadcast` (send to every friend of the Official Account — the
-  real daily delivery to subscribers)
+  real daily delivery to subscribers). The scheduled GitHub Actions
+  workflow is broadcast-only: it deliberately does not offer `push` as
+  a manual option and does not configure `LINE_TARGET_ID`, since
+  `daily_ranking.py` exits 1 if `push` is selected without one. `push`
+  remains available for local testing
 - Report content is deterministic for a given trading date/strategy
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
@@ -701,9 +718,17 @@ excluded and covered by tests (`tests/test_text_renderer.py`).
 - **pytest** — unit and integration tests across data ingestion, risk
   policy, scoring, report rendering, and LINE delivery (push +
   broadcast)
-- **GitHub Actions** — scheduled daily job with `concurrency` guards
-  and manual `workflow_dispatch` trigger for backfilling a specific
-  trading date or testing in dry-run mode
+- **GitHub Actions** — scheduled weekday job (every 30 minutes from
+  18:00 to 23:30 Asia/Taipei, via the native `schedule.timezone`
+  field) with a success-gate job, `concurrency` guards, and a manual
+  `workflow_dispatch` trigger for backfilling a specific trading date
+  or running a safe dry-run preview
+- **Google Cloud SQL for PostgreSQL** — the persistent production
+  database, reached from GitHub-hosted runners via the **Cloud SQL
+  Auth Proxy** (checksum-pinned release) authenticated through
+  **Workload Identity Federation** (`google-github-actions/auth`) — no
+  long-lived service account key and no public database port opened to
+  the internet
 
 ---
 
@@ -711,11 +736,35 @@ excluded and covered by tests (`tests/test_text_renderer.py`).
 
 - Python: `3.12+`
 - PostgreSQL: for delivery idempotency tracking (`message_deliveries`
-  table). **Must be an externally reachable, persistent database** —
-  not a local SQLite file — for any scheduled/CI environment, since
+  table) and revision-safe EPS observations
+  (`eps_cumulative_observations`). **Must be a persistent database**
+  — not a local SQLite file — for any scheduled/CI environment, since
   GitHub Actions runners are ephemeral and a fresh SQLite file every
   run would defeat idempotency entirely. SQLite is fine for local
   manual testing only.
+- Production database: **Google Cloud SQL for PostgreSQL**, accessed
+  from GitHub Actions through the Cloud SQL Auth Proxy running on the
+  runner itself. The `DATABASE_URL` secret therefore intentionally
+  points at `127.0.0.1:5432` — that address only becomes valid once the
+  workflow has started the proxy (see Git Workflow & CI/CD below).
+  Connection chain:
+
+  ```
+  GitHub Actions OIDC token
+    -> Workload Identity Federation
+    -> impersonate a dedicated service account (roles/cloudsql.client only)
+    -> Cloud SQL Auth Proxy on the runner (IAM + mTLS to the instance's public IP)
+    -> 127.0.0.1:5432
+    -> DATABASE_URL (postgresql+psycopg://...)
+  ```
+
+  GCP prerequisites: the Cloud SQL Admin API enabled, the instance
+  having a public IP (no authorized networks needed — the proxy
+  authenticates via IAM), a `roles/iam.workloadIdentityUser` binding on
+  the service account scoped to this repository's
+  `attribute.repository`, a provider attribute condition limiting
+  tokens to this repository's `refs/heads/main`, and
+  `roles/cloudsql.client` on the service account.
 
 ## Local Development
 
@@ -749,12 +798,12 @@ Environment variables consumed by the job (see
 | Variable                    | Purpose                                                                                      |
 |-----------------------------|------------------------------------------------------------------------------------------------|
 | `FINMIND_TOKEN`             | FinMind API token                                                                            |
-| `DATABASE_URL`              | PostgreSQL connection string (delivery idempotency tracking)                                 |
+| `DATABASE_URL`              | PostgreSQL connection string (delivery idempotency + EPS observations); in CI, `127.0.0.1:5432` via Cloud SQL Auth Proxy |
 | `TARGET_TRADING_DATE`       | Manual override for `workflow_dispatch` backfills; defaults to today                         |
-| `REPORT_DRY_RUN`            | `true` → render and print the report to stdout only; no LINE call, no DB write               |
+| `REPORT_DRY_RUN`            | `true` → also print the report to stdout. Independent of `LINE_DELIVERY_MODE` — set that to `off` for a genuine preview-only run |
 | `LINE_DELIVERY_MODE`        | `off` (default) / `push` (single target) / `broadcast` (all OA friends)                      |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Required when `LINE_DELIVERY_MODE` is `push` or `broadcast`                                  |
-| `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` — the single LINE user/group/room to deliver to |
+| `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` (local testing only; not configured in CI)      |
 
 > **Note:** TWSE's `announcement/notice` (attention) endpoint only
 > ever reports the current calendar day's data — it has no verified
@@ -1221,17 +1270,59 @@ app/jobs/              Scheduled job entry points
   - `tests.yml` — runs the full test suite on every push/PR, no
     external credentials required; this is what the Tests badge above
     reflects
-  - `daily-limit-up-ranking.yml` — runs the full pipeline on a
-    three-attempt schedule (16:17 / 16:47 / 17:17 Taiwan time) with a
-    `concurrency` group to prevent overlapping runs, plus a
-    `workflow_dispatch` input for manually backfilling a specific
-    trading date or testing in dry-run mode before going live
+  - `daily-limit-up-ranking.yml` — the production pipeline, triggered
+    every 30 minutes from 18:00 to 23:30 Asia/Taipei on weekdays
+    (`cron: "0,30 18-23 * * 1-5"` with `timezone: "Asia/Taipei"`).
+    Stops at 23:30 so every attempt belongs to one Taiwan calendar
+    day. Structured as two jobs:
+    - `gate` (`actions: read` only) refuses any ref other than
+      `refs/heads/main`, then pins the intended trading date from the
+      run's own `created_at` timestamp rather than the current clock —
+      GitHub can delay scheduled triggers, so a trigger created outside
+      the 18:00–23:59 Taipei window (e.g. a 23:30 run delayed past
+      midnight) is skipped instead of processing the next day. It then
+      queries this workflow's run history and skips everything if a
+      scheduled run's `ranking` job (not merely the workflow run, since
+      GitHub reports skipped jobs as success) already succeeded for that
+      date — so a failure
+      (exit 1, or exit 2 `WAITING_FOR_DATA`) is retried 30 minutes
+      later, and the first success ends the evening's attempts without
+      re-fetching TWSE/TPEx/FinMind or re-scoring. The pinned date is
+      passed to `ranking` as `TARGET_TRADING_DATE`, so a run that
+      starts late still processes the evening it was scheduled for
+    - `ranking` (`contents: read` + `id-token: write` only; runs only
+      on `refs/heads/main`) authenticates to GCP via Workload Identity Federation, starts
+      the checksum-verified Cloud SQL Auth Proxy on `127.0.0.1:5432`,
+      runs a `SELECT 1` connectivity check to fail fast on
+      IAM/credential problems, then runs `python -m app.jobs.daily_ranking`.
+      Scheduled runs are always a live broadcast; pytest is not
+      re-run here since `tests.yml` already gates `main`
+    - Manual `workflow_dispatch` accepts `trading_date`, `dry_run`
+      (default on — forces `LINE_DELIVERY_MODE=off`, since the two
+      flags are independent in code) and `delivery_mode` (`off` /
+      `broadcast`)
+  - Three independent layers prevent duplicate sends: the `gate` job
+    (avoids re-running the pipeline after a success), the
+    `message_deliveries` database idempotency key (avoids a duplicate
+    LINE send even if the pipeline does re-run, including per-part
+    crash recovery), and the per-request `X-Line-Retry-Key` (avoids
+    LINE processing one in-flight HTTP retry twice). The `concurrency`
+    group (with `queue: max`, so a pending retry is queued rather than
+    replaced by the next trigger) only prevents overlapping execution
+  - Production credentials are main-only on both sides: the workflow
+    refuses non-main refs, and the GCP Workload Identity provider's
+    attribute condition restricts `assertion.ref` to
+    `refs/heads/main` — the GCP-side condition is the real enforcement
+    boundary, since another branch could edit the workflow file itself
 - Automated AI-assisted code review via CodeRabbit on every Pull
   Request to identify potential bugs, security concerns,
   maintainability issues, and consistency violations before merging
-- Secrets (`FINMIND_TOKEN`, `DATABASE_URL`, `LINE_CHANNEL_ACCESS_TOKEN`,
-  `LINE_TARGET_ID`) are injected via GitHub Actions secrets and never
-  committed to the repository
+- Secrets (`FINMIND_TOKEN`, `DATABASE_URL`, `LINE_CHANNEL_ACCESS_TOKEN`)
+  are injected via GitHub Actions secrets and never committed to the
+  repository. GCP access uses Workload Identity Federation, so no
+  service account key is stored as a secret at all; the non-secret
+  GCP identifiers (project, WIF provider, service account, Cloud SQL
+  instance connection name) live in the workflow's top-level `env:`
 
 ---
 
