@@ -93,7 +93,7 @@ MAX_LINE_TEXT_UTF16_UNITS = 5000
 #
 #   STOCK_DIVIDER   — the biggest boundary: between the header and the
 #       first stock, between one stock and the next, and between the
-#       last stock and the closing "模型說明" section. Never used
+#       last stock and the closing disclaimer footer. Never used
 #       anywhere else.
 #   SECTION_DIVIDER — marks the three boundaries that are genuinely
 #       more significant than a plain blank line within a single
@@ -113,8 +113,8 @@ MAX_LINE_TEXT_UTF16_UNITS = 5000
 # ARE counted toward the existing MAX_LINE_TEXT_UTF16_UNITS budget the
 # same as any other line, but each is only ~10 UTF-16 units, so the
 # impact on the 5000-unit budget is negligible in practice — what
-# actually consumes the budget is the per-factor explanation text and
-# the 模型說明 footer.
+# actually consumes the budget is the per-factor explanation text (the
+# long 模型說明 footer was removed in text-v15).
 #
 # Width: 6 characters. Originally 10, shortened after a real
 # regression (see CHANGELOG/PR notes) — a fully-populated 5-stock
@@ -1158,97 +1158,27 @@ def _render_report_header_lines(
     ]
 
 
-def _render_report_footer_lines(*, strategy_version: str) -> list[str]:
+# text-v15: the long "ℹ️ 模型說明" (model explanation) block is no longer
+# rendered in the LINE report — the full methodology is documented in
+# README.md. Two lines are deliberately KEPT, because they are
+# disclosures rather than explanations:
+#
+#   - FIRST_BOARD_APPROXIMATION_NOTE: "低檔首板" relies on a PROVISIONAL
+#     previous-session limit-up estimate (see
+#     app.domain.technical_signal_builder.estimate_previous_session_limit_up);
+#     without this line a reader could mistake it for official
+#     limit-up data.
+#   - DISCLAIMER: required verbatim in every report (see README's
+#     Disclaimer section); never remove it from any report variant.
+FIRST_BOARD_APPROXIMATION_NOTE = (
+    "註：「低檔首板」之前一交易日未漲停為近似判定，非官方漲停資料。"
+)
+
+
+def _render_report_footer_lines() -> list[str]:
     return [
         STOCK_DIVIDER,
-        "ℹ️ 模型說明",
-        (
-            f"綜合分數為各量化因子依 {strategy_version} "
-            "加權計算後的相對評分，用於當日候選標的之間排序，"
-            "不代表預測報酬率、上漲機率或目標價。"
-        ),
-        (
-            "「訊號」依各因子的標準化分數區間呈現（🟢強／🟡普通／🔴偏弱）；"
-            "⚪ 代表該因子目前資料不足，並不代表負面訊號。分數後方標註"
-            "「候選池相對」或「絕對規則」——除動能因子（絕對規則）、"
-            "以及籌碼與基本面因子（改採絕對訊號，見下）外，"
-            "其餘因子分數皆為與當日候選股互相比較後的相對名次，"
-            "不代表對照市場整體或固定絕對門檻。"
-        ),
-        (
-            "「訊號」區塊中的籌碼、基本面因子，其燈號改為「絕對訊號」："
-            "直接依該因子的絕對金融語意判定（籌碼看近 5 日法人淨買超"
-            "占比之正負，基本面看最新月營收 YoY 是否達 10%），"
-            "不再由候選池相對排名直接決定，因此可能出現"
-            "「🔴 偏弱｜候選池相對分數 100/100」——代表絕對值仍為負向，"
-            "但在當日候選池中相對最佳，兩者並不矛盾。"
-        ),
-        (
-            "「候選池相對分數」僅表示該標的在當日有效候選池中的相對"
-            "位置，不代表對照市場整體的百分位、勝率或預期報酬率。"
-            "候選池樣本過少時（少於 10 檔）會加註樣本偏少警語；少於 5 "
-            "檔時改以「候選池排名」呈現，避免將小樣本排名誤讀為精準"
-            "評等。"
-        ),
-        (
-            "本次燈號語意調整不影響既有綜合分數計算公式；綜合分數仍"
-            "依原有候選池相對分數與權重加權計算，未因本次調整而改變。"
-        ),
-        (
-            "所有法人（籌碼）相關欄位——因子燈號、候選池相對分數、"
-            "近 3 個交易日累積買超、近 5 日法人淨買超占比——皆標示"
-            "實際資料截止日期。因法人買賣超資料到位時間晚於本系統"
-            "產生報表的時間，目標交易日當日（T）法人資料恆不可得，"
-            "固定以最近一個已確認有資料的交易日（T-1）為準；若 T-1 "
-            "資料尚未到位，則明確顯示「資料尚未確認」，不會以更早的"
-            "資料冒充為 T-1，也不會偷偷縮短或延長固定的近 3 日／近 5 "
-            "日窗口。"
-        ),
-        (
-            "動能因子採非單調評分；顯示「漲多過熱」時，"
-            "代表近期累積漲幅已達短線過熱門檻，"
-            "反映追價風險升高，並非代表近期沒有上漲動能。"
-        ),
-        (
-            "各因子下方列出的原因僅呈現「實際參與該因子評分」的數值；"
-            "若某項資訊有參考價值但未參與評分（例如流動性的 20 日均量倍數、"
-            "動能的 20 日累積報酬率、風險品質中目前尚未扣分的監管旗標），"
-            "會另外列於「補充」，不與計分原因混在一起。"
-        ),
-        (
-            "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0，"
-            "為獨立於綜合分數之外的參考訊號，"
-            "不會改變「訊號」區塊中籌碼因子的評分結果。"
-        ),
-        (
-            "「技術面」區塊顯示今日收盤是否同時符合"
-            "「位於近 20 個交易日價格區間下緣」及"
-            "「今日剛站上 5 日均線」兩項條件，"
-            "同樣為獨立於綜合分數之外的參考訊號，"
-            "不會改變「訊號」區塊中動能因子的評分結果。"
-        ),
-        (
-            "「低檔首板」進一步顯示今日是否同時符合「收盤漲停」"
-            "「位於近 20 個交易日價格區間下緣」及"
-            "「前一交易日未漲停」三項條件；"
-            "其中「前一交易日是否漲停」目前以前一交易日收盤價"
-            "近似平盤價回推計算，屬於近似判定，"
-            "非官方漲停資料，僅供參考，"
-            "同樣不會改變「訊號」區塊中任何因子的評分結果。"
-        ),
-        (
-            "「基本面」區塊顯示營收與 EPS 各自的持續成長判斷（營收看最近"
-            "連續 3 個曆月已公布月營收，EPS 看最近連續季的財報 YoY），"
-            "並以兩者的「或」關係判斷整體是否具持續性——只要營收或 EPS "
-            "任一項成立即視為是；若其中任一月／任一季缺漏或無法計算，"
-            "該項即顯示「資料不足」，不會以較早的期間遞補湊滿窗口。"
-            "為獨立於綜合分數之外的參考訊號，"
-            "不會改變「訊號」區塊中基本面因子的評分結果。"
-        ),
-        (
-            "歷史分位及 T+1／T+5 統計尚未納入目前版本，"
-            "待累積足夠歷史樣本及建立回測流程後提供。"
-        ),
+        FIRST_BOARD_APPROXIMATION_NOTE,
         DISCLAIMER,
     ]
 
@@ -1310,7 +1240,7 @@ def render_daily_report(
     for stock in ranked_stocks:
         lines.extend(_render_stock_block(stock, total_shown=total_shown))
 
-    lines.extend(_render_report_footer_lines(strategy_version=strategy_version))
+    lines.extend(_render_report_footer_lines())
 
     result = "\n".join(lines)
 
@@ -1414,7 +1344,7 @@ def render_daily_report_messages(
         strategy_version=strategy_version,
         ranking_limit=ranking_limit,
     )
-    footer_lines = _render_report_footer_lines(strategy_version=strategy_version)
+    footer_lines = _render_report_footer_lines()
 
     total_shown = len(ranked_stocks)
     stock_blocks = [
@@ -1462,8 +1392,9 @@ def render_no_qualified_stock_report(
             f"今日無符合資料完整度門檻的候選股，暫無 Top {ranking_limit} 名單。",
             f"策略版本：{strategy_version}",
             STOCK_DIVIDER,
-            "ℹ️ 模型說明",
-            ("本清單依固定量化規則篩選候選標的；今日沒有標的通過資料完整度門檻。"),
+            # text-v15: the "ℹ️ 模型說明" heading is no longer rendered;
+            # the disclaimer is mandatory in every report variant and
+            # stays (see README's Disclaimer section).
             DISCLAIMER,
         ]
     )

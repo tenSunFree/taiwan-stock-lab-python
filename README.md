@@ -533,14 +533,25 @@ available.
   lines are fully independent of each other — a stock can be a
   genuine first board without having crossed its MA5 yet, or vice
   versa — and this line is likewise independent of the "momentum"
-  scoring factor. The "ℹ️ 模型說明" footer explicitly calls out that
-  the previous-session leg is an approximation, never presented as an
-  official historical determination. Rendering only ever reads the
+  scoring factor. The report footer explicitly calls out that the
+  previous-session leg is an approximation, never presented as an
+  official historical determination (originally a sentence in the
+  "ℹ️ 模型說明" footer; a dedicated one-line note since `text-v15`). Rendering only ever reads the
   underlying `LowFirstLimitUpSignal.matched` field — the richer
   breakdown behind it (`is_low`, `range_position`,
   `previous_session_limit_up_estimated`) is carried on
   `StockFeatures`/`ReportStockView` for future explainability/
   debugging/backtesting use, not rendered in the LINE report yet
+- As of `text-v15`, the long "ℹ️ 模型說明" methodology footer is no
+  longer rendered in the LINE report — the methodology lives in this
+  README instead, keeping every daily message shorter. The footer is
+  reduced to two lines that are disclosures rather than explanations
+  and are therefore kept: a one-line note that 低檔首板's
+  previous-session check is an approximation
+  (`FIRST_BOARD_APPROXIMATION_NOTE`), and the verbatim disclaimer
+  (see [Disclaimer](#disclaimer)), which is always the report's last
+  line. The "📌 功能進度" checklist at the top is unchanged. This is a
+  display-only change; scoring, ranking, and signals are unaffected
 - `REPORT_DRY_RUN=true` prints the exact report text to stdout for
   manual inspection — as of `text-v12`, when the report is split into
   multiple messages, each is printed as its own numbered preview block
@@ -573,7 +584,7 @@ available.
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v14`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `text-v15`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
