@@ -485,7 +485,18 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # exactly the old bool), so this did not need its own message_version
 # bump per this file's own idempotency rule — no visible content
 # changed, only an internal data shape.
-MESSAGE_VERSION = "text-v14"
+#
+# text-v15: removes the long "ℹ️ 模型說明" methodology footer from every
+# rendered report (the methodology is documented in README.md
+# instead). The footer is reduced to two lines that are disclosures
+# rather than explanations and are therefore kept:
+# app.reports.text_renderer.FIRST_BOARD_APPROXIMATION_NOTE ("低檔首板"
+# relies on a PROVISIONAL previous-session estimate) and DISCLAIMER
+# (required verbatim in every report). Applies to both
+# render_daily_report()/render_daily_report_messages() and
+# render_no_qualified_stock_report(). The "📌 功能進度" checklist is
+# unchanged. No scoring, ranking, or signal logic changed.
+MESSAGE_VERSION = "text-v15"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST

@@ -6,6 +6,7 @@ import pytest
 from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 from app.reports.text_renderer import (
     DISCLAIMER,
+    FIRST_BOARD_APPROXIMATION_NOTE,
     MAX_LINE_TEXT_UTF16_UNITS,
     ReportStockView,
     render_daily_report,
@@ -823,25 +824,54 @@ def test_primary_risks_do_not_duplicate_regulatory_flags():
 # --- 模型說明 ------------------------------------------------------------------
 
 
-def test_report_model_explanation_reflects_new_template():
+def test_report_footer_is_compact_and_keeps_required_disclosures():
+    """text-v15：LINE 報表不再顯示冗長的「ℹ️ 模型說明」，但兩行揭露
+    必須保留——免責聲明（每份報表都必須逐字包含）以及「低檔首板」屬於
+    近似判定的提醒（避免讀者誤以為是官方漲停資料）。「📌 功能進度」
+    清單不受影響，照常顯示。"""
     report = _render(_make_stock_view())
-    assert "模型說明" in report
-    assert "rule-v1.2.0" in report
-    assert "不代表預測報酬率、上漲機率或目標價" in report
-    assert "「訊號」依各因子的標準化分數區間呈現" in report
-    assert "動能因子採非單調評分" in report
-    assert "並非代表近期沒有上漲動能" in report
-    assert "「法人籌碼」區塊顯示近 3 個交易日法人累積買超是否 > 0" in report
-    assert "「技術面」區塊顯示今日收盤是否同時符合" in report
-    assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" in report
-    # old text-v5 section is gone
-    assert "「主要得分來源」" not in report
-    # Absolute Signal / Relative Score separation model description
-    assert "改採絕對訊號，見下" in report
-    assert "「訊號」區塊中的籌碼、基本面因子，其燈號改為「絕對訊號」" in report
-    assert "本次燈號語意調整不影響既有綜合分數計算公式" in report
-    assert "候選池樣本過少時" in report
-    assert "資料尚未到位，則明確顯示「資料尚未確認」" in report
+    assert "模型說明" not in report
+    assert "動能因子採非單調評分" not in report
+    assert "歷史分位及 T+1／T+5 統計尚未納入目前版本" not in report
+    assert FIRST_BOARD_APPROXIMATION_NOTE in report
+    assert DISCLAIMER in report
+    assert "📌 功能進度" in report
+    # strategy version is still visible in the 資料概況 header block
+    assert "策略版本：rule-v1.2.0" in report
+
+
+def test_report_disclaimer_is_the_last_line():
+    report = _render(_make_stock_view())
+    assert report.rstrip().splitlines()[-1] == DISCLAIMER
+
+
+def test_multi_message_report_has_no_model_explanation():
+    stocks = [_make_stock_view(rank=i) for i in range(1, 6)]
+    messages = render_daily_report_messages(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=18,
+        eligible_count=12,
+        strategy_version="rule-v1.2.0",
+        ranked_stocks=stocks,
+        ranking_limit=10,
+    )
+    joined = "\n\n".join(messages)
+    assert "模型說明" not in joined
+    assert "📌 功能進度" in messages[0]
+    assert messages[-1].rstrip().splitlines()[-1] == DISCLAIMER
+
+
+def test_no_qualified_stock_report_has_no_model_explanation_but_keeps_disclaimer():
+    report = render_no_qualified_stock_report(
+        trading_date=TRADING_DATE,
+        data_updated_at="16:47",
+        candidate_count=5,
+        strategy_version="rule-v1.2.0",
+    )
+    assert "模型說明" not in report
+    assert "📌 功能進度" in report
+    assert report.rstrip().splitlines()[-1] == DISCLAIMER
 
 
 def test_progress_checklist_shows_absolute_signal_rollout_as_done():
