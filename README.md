@@ -1282,7 +1282,9 @@ app/jobs/              Scheduled job entry points
       the 18:00–23:59 Taipei window (e.g. a 23:30 run delayed past
       midnight) is skipped instead of processing the next day. It then
       queries this workflow's run history and skips everything if a
-      scheduled run already succeeded for that date — so a failure
+      scheduled run's `ranking` job (not merely the workflow run, since
+      GitHub reports skipped jobs as success) already succeeded for that
+      date — so a failure
       (exit 1, or exit 2 `WAITING_FOR_DATA`) is retried 30 minutes
       later, and the first success ends the evening's attempts without
       re-fetching TWSE/TPEx/FinMind or re-scoring. The pinned date is

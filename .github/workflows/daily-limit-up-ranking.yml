@@ -15,7 +15,8 @@ on:
     # processes the evening it was scheduled for, never the next day.
     #
     # Each trigger first runs the `gate` job, which checks whether an
-    # earlier SCHEDULED run today already succeeded:
+    # earlier SCHEDULED run's `ranking` job already succeeded for the
+    # pinned trading date:
     #   - no prior success  -> run the real `ranking` job
     #   - already succeeded -> skip `ranking` entirely (fast no-op)
     # This is a compute-saving layer ON TOP of app.delivery.service's
@@ -143,15 +144,42 @@ jobs:
             exit 0
           fi
 
-          # The window (18:00-23:59 Taipei) maps to 10:00-15:59 UTC of the
-          # SAME calendar day, so filtering the API's UTC-based `created`
-          # parameter by the Taiwan date is safe for this window.
-          SUCCESS_COUNT="$(
+          # Count runs whose `ranking` JOB actually succeeded — never a
+          # run's overall conclusion. A run where `gate` skipped `ranking`
+          # (already done, or a delayed trigger outside the window) still
+          # concludes "success" because GitHub reports skipped jobs as
+          # success; counting those could let a trigger delayed into the
+          # next day (e.g. created at 12:00 Taipei = 04:00 UTC of the NEXT
+          # UTC date) suppress that whole evening.
+          #
+          # Only runs whose ranking job really ran can count, and those
+          # were all created 18:00-23:59 Taipei = 10:00-15:59 UTC of the
+          # SAME UTC date, so filtering the API's UTC-based `created`
+          # parameter by INTENDED_DATE finds exactly the right candidates.
+          #
+          # NOTE: must match the `ranking` job's `name:` below exactly.
+          RANKING_JOB_NAME="Run daily ranking"
+
+          CANDIDATE_RUN_IDS="$(
             gh api \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/daily-limit-up-ranking.yml/runs?event=schedule&created=${INTENDED_DATE}&per_page=100" \
-              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'
+              --jq '.workflow_runs[] | select(.conclusion == "success") | .id'
           )"
-          echo "Successful scheduled runs for ${INTENDED_DATE}: ${SUCCESS_COUNT}"
+
+          SUCCESS_COUNT=0
+          for RUN_ID in ${CANDIDATE_RUN_IDS}; do
+            RANKING_OK="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+                | jq --arg name "${RANKING_JOB_NAME}" \
+                    '[.jobs[] | select(.name == $name and .conclusion == "success")] | length'
+            )"
+            if (( RANKING_OK > 0 )); then
+              echo "Run ${RUN_ID}: '${RANKING_JOB_NAME}' succeeded."
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              break
+            fi
+          done
+          echo "Scheduled runs with a successful ranking job for ${INTENDED_DATE}: ${SUCCESS_COUNT}"
 
           if [[ "${SUCCESS_COUNT}" -gt 0 ]]; then
             echo "Already succeeded for ${INTENDED_DATE} — skipping the ranking job."
@@ -174,6 +202,8 @@ jobs:
   # only becomes valid once the proxy below is listening on this runner.
   # --------------------------------------------------------------------
   ranking:
+    # NOTE: `gate` matches this exact name to detect a completed ranking
+    # (RANKING_JOB_NAME). Rename both together.
     name: Run daily ranking
     needs: [gate]
     # Defense in depth alongside the gate's own branch check: this job
