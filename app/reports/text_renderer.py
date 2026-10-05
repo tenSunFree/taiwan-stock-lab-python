@@ -68,6 +68,11 @@ from app.domain.absolute_signal import (
 )
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
+from app.domain.momentum_signal import (
+    WEAK_MOMENTUM_SCORE_THRESHOLD,
+    build_momentum_overheated_status,
+)
+from app.domain.signal_status import SignalStatus
 from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 from app.reports import signal_explainer as se
 
@@ -440,7 +445,9 @@ def _signal_emoji(score: float | None) -> str:
 # _signal_word 的「普通／強」分界值。_momentum_signal_word 的過熱覆寫
 # 只在分數落在這個分界值以下（即會被標成「偏弱」的區間）時才生效，
 # 所以兩處共用同一個常數，避免未來各自改動、產生分界不一致的 bug。
-_WEAK_SIGNAL_THRESHOLD = 40
+_WEAK_SIGNAL_THRESHOLD = (
+    WEAK_MOMENTUM_SCORE_THRESHOLD  # single source: app.domain.momentum_signal
+)
 
 
 def _signal_word(score: float | None) -> str:
@@ -490,7 +497,13 @@ def _momentum_signal_word(score: float | None, risk_flags: tuple[str, ...]) -> s
     """
     if score is None:
         return "資料不足"
-    if score < _WEAK_SIGNAL_THRESHOLD and "HIGH_FIVE_DAY_RETURN" in risk_flags:
+    # The rule itself lives in the Domain (app.domain.momentum_signal) so
+    # the chart and Flex layers share it; this function only maps the
+    # result to report wording.
+    if (
+        build_momentum_overheated_status(momentum_score=score, risk_flags=risk_flags)
+        is SignalStatus.TRUE
+    ):
         return "漲多過熱"
     return _signal_word(score)
 
@@ -1147,6 +1160,7 @@ def _render_report_header_lines(
         "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
         "✅ 評分模型：絕對訊號與候選池相對分數分離",
         "✅ 技術面：低檔首板",
+        "⬜ 日K線圖",
         "⬜ 產業題材：電子業且具 AI 相關性",
         "",
         "📊 資料概況",
@@ -1384,6 +1398,7 @@ def render_no_qualified_stock_report(
             "✅ 六大因子可解釋訊號（燈號＋判定依據＋缺失說明）",
             "✅ 評分模型：絕對訊號與候選池相對分數分離",
             "✅ 技術面：低檔首板",
+            "⬜ 日K線圖",
             "⬜ 產業題材：電子業且具 AI 相關性",
             "",
             "📊 資料概況",

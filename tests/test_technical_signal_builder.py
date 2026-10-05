@@ -36,6 +36,29 @@ def _make_history(
     ]
 
 
+def _make_candle_history(
+    closes: list[float],
+    *,
+    spread: float = 1.0,
+    start: dt.date = dt.date(2026, 7, 1),
+) -> list[HistoricalPricePoint]:
+    """Full OHLC history (open=close, high=close+spread, low=close-spread).
+    低檔首板 needs real High/Low (price_structure), so its tests must use
+    this instead of the close-only _make_history()."""
+    return [
+        HistoricalPricePoint(
+            trading_date=start + dt.timedelta(days=i),
+            close=close,
+            volume=1000.0,
+            turnover=1000.0,
+            open=close,
+            high=close + spread,
+            low=close - spread,
+        )
+        for i, close in enumerate(closes)
+    ]
+
+
 # --- happy path: low position + fresh MA5 crossover ---------------------------
 
 
@@ -473,13 +496,14 @@ def test_first_board_false_when_not_limit_up_today_even_in_low_range():
 
 
 def test_first_board_true_when_limit_up_low_and_previous_session_was_not_limit_up():
-    # 20 天從 100 一路跌到 50 後打平在低檔盤整，前一交易日收盤 50，跟
-    # 再前一日（同樣是 50）比較並不是漲停——今天從 50 漲停到約 55，
-    # 相對 20 日區間 [50, 100] 仍落在最低 30% 以內 -> 低檔 + 首板同時
+    # 20 天從 100 一路跌到 50 後打平在低檔盤整，前一交易日(T-1)收盤 50，
+    # 跟再前一日（同樣是 50）比較並不是漲停。低檔位置以 T-1 收盤對
+    # T-20~T-1 的 High/Low 區間 [49, 101] 計算（不含今天、不用今天的
+    # 漲停收盤）-> (50-49)/(101-49) ≈ 0.019 <= 0.30，低檔 + 首板同時
     # 成立，必須是 True，且結構化欄位要能各自對得上。
     closes = [100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50] + [50.0] * 9
     assert len(closes) == RANGE_WINDOW
-    history = _make_history(closes)
+    history = _make_candle_history(closes)
     today_close = _approx_limit_up(closes[-1])  # today's close IS limit-up
 
     result = build_low_first_limit_up_signal(
@@ -490,7 +514,7 @@ def test_first_board_true_when_limit_up_low_and_previous_session_was_not_limit_u
     )
     assert result.matched is True
     assert result.is_low is True
-    assert result.range_position == pytest.approx(0.1)
+    assert result.range_position == pytest.approx((50 - 49) / (101 - 49))
     assert result.is_close_limit_up is True
     assert result.previous_session_limit_up_estimated is False
     assert result.previous_session_check_provisional is True
@@ -506,7 +530,7 @@ def test_first_board_false_when_previous_session_was_already_a_limit_up():
     day_before_previous_close = 90.0
     previous_close = _approx_limit_up(day_before_previous_close)  # 前一天就漲停
     closes = [100 - i for i in range(10)] + [90.0] * 9 + [previous_close]
-    history = _make_history(closes)
+    history = _make_candle_history(closes)
     today_close = _approx_limit_up(float(previous_close))
 
     result = build_low_first_limit_up_signal(
@@ -535,7 +559,7 @@ def test_first_board_false_when_limit_up_and_first_board_but_not_in_low_range():
         target_date=TARGET_DATE,
         today_close=today_close,
         is_close_limit_up=True,
-        history=_make_history(closes),
+        history=_make_candle_history(closes),
     )
     assert result.matched is False
     assert result.is_low is False
@@ -637,3 +661,93 @@ def test_estimate_previous_session_false_for_an_ordinary_move():
 def test_estimate_previous_session_none_with_fewer_than_two_points():
     history = _make_history([50.0])
     assert estimate_previous_session_limit_up(history) is None
+
+
+# --- 低檔首板 now uses price_structure: T-20~T-1 High/Low + Close[T-1] ---------
+
+
+def _first_board_signal(history, *, today_close=55.0):
+    return build_low_first_limit_up_signal(
+        target_date=TARGET_DATE,
+        today_close=today_close,
+        is_close_limit_up=True,
+        history=history,
+    )
+
+
+def test_first_board_position_is_measured_at_t_minus_1_not_todays_close():
+    """Regression: the position must NOT depend on today's (limit-up)
+    close. Two very different today_close values -> identical position."""
+    closes = [100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50] + [50.0] * 9
+    history = _make_candle_history(closes)
+    low_close = _first_board_signal(history, today_close=55.0)
+    high_close = _first_board_signal(history, today_close=500.0)
+    assert low_close.range_position == high_close.range_position
+    assert low_close.is_low is high_close.is_low is True
+
+
+def test_first_board_todays_row_never_enters_the_prior_20d_range():
+    """Regression: a caller that mistakenly includes today's row (huge
+    High, tiny Low) must not stretch the pre-event range."""
+    closes = [100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50] + [50.0] * 9
+    history = _make_candle_history(closes)
+    baseline = _first_board_signal(history)
+    poisoned = history + [
+        HistoricalPricePoint(
+            trading_date=TARGET_DATE,
+            close=55.0,
+            volume=1.0,
+            turnover=1.0,
+            open=50.0,
+            high=999.0,
+            low=1.0,
+        )
+    ]
+    assert _first_board_signal(poisoned).range_position == baseline.range_position
+
+
+def test_first_board_range_uses_high_low_not_closes():
+    """A long upper wick inside the window raises range_20d_high even
+    though no CLOSE reached it — the old close-only range could not see it."""
+    closes = [60.0] * RANGE_WINDOW
+    history = _make_candle_history(closes, spread=1.0)
+    history[5] = HistoricalPricePoint(
+        trading_date=history[5].trading_date,
+        close=60.0,
+        volume=1000.0,
+        turnover=1000.0,
+        open=60.0,
+        high=100.0,  # wick
+        low=59.0,
+    )
+    result = _first_board_signal(history, today_close=66.0)
+    assert result.range_position == pytest.approx((60 - 59) / (100 - 59))
+    assert result.is_low is True
+
+
+def test_first_board_none_when_history_has_no_high_low():
+    """Close-only history can no longer prove 低檔 -> unresolved (None),
+    never silently False."""
+    closes = [100 - i for i in range(RANGE_WINDOW)]
+    result = _first_board_signal(_make_history(closes))
+    assert result.matched is None
+    assert result.is_low is None
+    assert result.range_position is None
+
+
+def test_first_board_none_when_a_window_row_lacks_high_low():
+    history = _make_candle_history([70.0] * RANGE_WINDOW)
+    history[10] = HistoricalPricePoint(
+        trading_date=history[10].trading_date,
+        close=70.0,
+        volume=1000.0,
+        turnover=1000.0,
+    )
+    assert _first_board_signal(history, today_close=77.0).matched is None
+
+
+def test_first_board_flat_range_is_unresolved_not_a_division_by_zero():
+    history = _make_candle_history([100.0] * RANGE_WINDOW, spread=0.0)
+    result = _first_board_signal(history, today_close=110.0)
+    assert result.matched is None
+    assert result.range_position is None

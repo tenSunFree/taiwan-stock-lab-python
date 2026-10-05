@@ -1571,7 +1571,21 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     candidates = [
         _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
     ]
-    history_rows = _make_history_rows(20, close="100", volume="1000000")
+    # 低檔首板 needs real High/Low (app.domain.price_structure): a steadily
+    # falling OHLC series ending at 102, so Close[T-1]=102 sits at the
+    # bottom of the T-20..T-1 High/Low range [101, 141]. (The old flat,
+    # close-only fixture relied on "flat range counts as low", which the
+    # spec replaced with "flat/missing High-Low -> insufficient data".)
+    history_rows = [
+        {
+            **row,
+            "open": str(140 - 2 * i),
+            "max": str(141 - 2 * i),
+            "min": str(139 - 2 * i),
+            "close": str(140 - 2 * i),
+        }
+        for i, row in enumerate(_make_history_rows(20, volume="1000000"))
+    ]
     client = FakeHistoryFinMindClient(
         rows_by_stock={"1101": history_rows},
         institutional_rows_by_stock={
@@ -1607,14 +1621,14 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     # so the combined signal must be False, not True.
     assert feature.technical_low_with_rising_signal is False
     # Same fixture, different combination: today IS limit-up (fixture
-    # candidate always has is_close_limit_up=True), today's close sits
-    # at the bottom of the (degenerate) 20-day range same as above, AND
-    # the flat close=100 history means the immediately preceding
-    # session's own approximate limit-up check comes back False (100
-    # is not calculate_limit_up_price(100)=110) — i.e. genuinely a
-    # first board, not a continuation. All three conditions hold, so
-    # this must be True even though technical_low_with_rising_signal
-    # above is False for the same fixture — the two are independent.
+    # candidate always has is_close_limit_up=True), Close[T-1]=102 sits
+    # at the bottom of the T-20..T-1 High/Low range, AND the falling
+    # history means the immediately preceding session's own approximate
+    # limit-up check comes back False (102 is not
+    # calculate_limit_up_price(104)) — i.e. genuinely a first board, not
+    # a continuation. All three conditions hold, so this must be True
+    # even though technical_low_with_rising_signal above is False for
+    # the same fixture — the two are independent.
     assert feature.technical_low_first_limit_up_signal is not None
     assert feature.technical_low_first_limit_up_signal.matched is True
     assert feature.revenue_yoy is not None
