@@ -131,3 +131,89 @@ def test_missing_ohlc_in_the_hidden_warmup_zone_is_tolerated():
         trading_date=history[3].trading_date, close=100.0, volume=1.0, turnover=1.0
     )
     assert build_stock_chart_data(history=history, today=pt(110)) is not None
+
+
+# --- today's candle from the official TWSE/TPEx DailyPrice --------------------
+
+
+def _daily_price(**overrides):
+    from decimal import Decimal
+
+    from app.domain.models import DailyPrice
+
+    fields = dict(
+        trading_date=START + dt.timedelta(days=30),
+        stock_id="1101",
+        reference_price=Decimal("40.60"),
+        open_price=Decimal("41.00"),
+        high_price=Decimal("44.65"),
+        low_price=Decimal("40.90"),
+        close_price=Decimal("44.65"),
+        volume=3_000_000,
+        turnover=Decimal("130000000"),
+    )
+    fields.update(overrides)
+    return DailyPrice(**fields)
+
+
+def test_today_point_maps_the_official_candle():
+    from app.domain.chart_data import today_point_from_daily_price
+
+    point = today_point_from_daily_price(_daily_price())
+    assert point == HistoricalPricePoint(
+        trading_date=START + dt.timedelta(days=30),
+        open=41.0,
+        high=44.65,
+        low=40.9,
+        close=44.65,
+        volume=3_000_000.0,
+        turnover=130000000.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "volume",
+        "turnover",
+    ],
+)
+def test_today_point_is_none_when_any_official_field_is_missing(missing):
+    from app.domain.chart_data import today_point_from_daily_price
+
+    assert today_point_from_daily_price(_daily_price(**{missing: None})) is None
+
+
+def test_chart_is_capped_at_60_display_bars_for_every_series():
+    data = build_stock_chart_data(history=flat(119), today=pt(119))
+    assert len(data.bars) == 60
+    for series in (data.ma5, data.ma20, data.ma60, data.avg_volume_20):
+        assert len(series) == 60
+    assert data.ma60[0] is not None  # warmed up by the 60 hidden sessions
+
+
+@pytest.mark.parametrize(
+    "history_count, last_ma60, first_ma60",
+    [
+        (20, False, False),
+        (58, False, False),  # 59 sessions in total: MA60 not reachable
+        (59, True, False),  # 60 sessions: only the LAST bar has MA60
+        (60, True, False),
+        (117, True, False),  # 118 sessions: first shown bar is index 58
+        (118, True, True),  # 119 sessions: first shown bar is index 59 -> MA60
+        (119, True, True),
+        (250, True, True),  # capped at 120 sessions, still 60 bars
+    ],
+)
+def test_ma60_availability_boundaries(history_count, last_ma60, first_ma60):
+    """MA60 needs 60 closes, so bar index i has it iff i >= 59. The FIRST
+    displayed bar is full[len(full)-60], hence 'first_ma60' flips at 119
+    total sessions (118 history + today), not at 60."""
+    data = build_stock_chart_data(history=flat(history_count), today=pt(history_count))
+    assert len(data.bars) == min(60, history_count + 1)
+    assert (data.ma60[-1] is not None) is last_ma60
+    assert (data.ma60[0] is not None) is first_ma60

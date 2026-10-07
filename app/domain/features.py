@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.domain.chart_data import StockChartData
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 
@@ -193,3 +194,19 @@ class StockFeatures:
     # working unchanged. Wiring this into daily_ranking.py is step 7's
     # job; intentionally left untouched here.
     institutional_data_cutoff: InstitutionalDataCutoff | None = None
+
+    # Drawable K-line series for the LINE chart/Flex card (see
+    # app.domain.chart_data): up to 120 sessions of FinMind history
+    # (strictly before T) + today's official TWSE/TPEx candle, already
+    # sliced to the last 60 bars with MA5/20/60, prior-20 average volume
+    # and the T-20..T-1 High/Low range. Pure presentation data — it never
+    # feeds scoring or RiskPolicy.
+    #
+    # None means "no valid chart can be drawn" (history fetch failed or
+    # empty, today's official candle incomplete, duplicate dates, or an
+    # incoherent OHLC in the displayed window). Consumers render a card
+    # WITHOUT a hero image in that case, never a guessed chart.
+    #
+    # Last field, defaulting to None, for the same dataclass-ordering
+    # reason as every other optional field above.
+    chart_data: StockChartData | None = None

@@ -48,8 +48,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.domain.momentum_signal import build_momentum_overheated_status
 from app.domain.normalization import MOMENTUM_IDEAL_HIGH, MOMENTUM_IDEAL_LOW
 from app.domain.risk_policy import RISK_FLAG_PENALTIES
+from app.domain.signal_status import SignalStatus
 
 _RISK_FLAG_LABELS: dict[str, str] = {
     "ATTENTION_STOCK": "今日注意股",
@@ -171,10 +173,13 @@ def explain_momentum(
 
     reasons = [f"近 5 日累積報酬率 {_pct(return_5d)}"]
 
-    # Uses the exact same thresholds as
-    # text_renderer._momentum_signal_word, so the two never drift out
-    # of sync when the thresholds are tuned.
-    if score < 40 and "HIGH_FIVE_DAY_RETURN" in risk_flags:
+    # Same single Domain rule as the text report's level word and the
+    # chart/Flex marker (app.domain.momentum_signal) — no threshold is
+    # re-implemented here, so the three can never drift apart.
+    if (
+        build_momentum_overheated_status(momentum_score=score, risk_flags=risk_flags)
+        is SignalStatus.TRUE
+    ):
         reasons.append("短線漲幅過高，非單調動能模型已進入過熱扣分區")
     elif MOMENTUM_IDEAL_LOW <= return_5d <= MOMENTUM_IDEAL_HIGH:
         reasons.append(

@@ -1325,11 +1325,16 @@ class FakeHistoryFinMindClient:
         self.calls: list[str] = []
         self.institutional_calls: list[str] = []
         self.revenue_calls: list[str] = []
+        # (start_date, end_date) of every request, to pin the separate
+        # price (200d) vs institutional (60d) lookback windows.
+        self.price_ranges: list[tuple[dt.date, dt.date]] = []
+        self.institutional_ranges: list[tuple[dt.date, dt.date]] = []
 
     def fetch_stock_price_history(
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
         self.calls.append(stock_id)
+        self.price_ranges.append((start_date, end_date))
         if stock_id in self.failing_stock_ids:
             raise RuntimeError(f"simulated history failure: {stock_id}")
 
@@ -1355,6 +1360,7 @@ class FakeHistoryFinMindClient:
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
         self.institutional_calls.append(stock_id)
+        self.institutional_ranges.append((start_date, end_date))
         if stock_id in self.institutional_failing_stock_ids:
             raise RuntimeError(f"simulated institutional failure: {stock_id}")
 
@@ -3032,3 +3038,154 @@ def test_run_line_delivery_mode_broadcast_does_not_require_target_id(
     assert result == 0
     assert len(call_log) == 1
     assert call_log[0].endswith("/v2/bot/message/broadcast")
+
+
+# --- K-line chart wiring: lookback split + chart_data in StockFeatures --------
+
+
+def _trading_dates(count: int, *, start: dt.date) -> list[dt.date]:
+    """`count` weekday dates from `start` — real sessions, no Sat/Sun rows
+    (the K-line chart counts 60 bars = 60 trading sessions)."""
+    dates: list[dt.date] = []
+    current = start
+    while len(dates) < count:
+        if current.weekday() < 5:
+            dates.append(current)
+        current += dt.timedelta(days=1)
+    return dates
+
+
+def _make_ohlc_history_rows(count: int, *, start=dt.date(2026, 6, 1)):
+    """Falling OHLC series (140, 138, ...), one row per TRADING session."""
+    return [
+        {
+            "date": trading_date.isoformat(),
+            "open": str(140 - i),
+            "max": str(141 - i),
+            "min": str(139 - i),
+            "close": str(140 - i),
+            "Trading_Volume": "1000000",
+            "Trading_money": "100000000",
+        }
+        for i, trading_date in enumerate(_trading_dates(count, start=start))
+    ]
+
+
+def test_trading_dates_helper_skips_weekends():
+    dates = _trading_dates(10, start=dt.date(2026, 6, 1))  # a Monday
+    assert all(d.weekday() < 5 for d in dates)
+    assert dates[5] == dt.date(2026, 6, 8)  # Fri 6/5 -> next Mon 6/8
+
+
+def _run_build_stock_features(history_rows, *, candidates=None):
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = candidates or [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": history_rows},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=1000, sell=200
+            )
+        },
+        revenue_rows_by_stock={"1101": _make_monthly_revenue_rows(stock_id="1101")},
+    )
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+    return client, features
+
+
+def test_price_history_uses_200_day_window_but_institutional_keeps_60():
+    client, _ = _run_build_stock_features(_make_ohlc_history_rows(30))
+
+    expected_end = TARGET_DATE - dt.timedelta(days=1)
+    assert client.price_ranges == [(TARGET_DATE - dt.timedelta(days=200), expected_end)]
+    assert client.institutional_ranges == [
+        (TARGET_DATE - dt.timedelta(days=60), expected_end)
+    ]
+
+
+def test_build_stock_features_attaches_chart_data_with_todays_official_candle():
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+    chart = features[0].chart_data
+
+    assert chart is not None
+    assert len(chart.bars) == 31  # 30 FinMind sessions + today
+    today = chart.bars[-1]
+    # Today's candle is the official TWSE/TPEx one from the candidate
+    # (open=reference 40.60, high=close 44.65), never from FinMind.
+    assert today.trading_date == TARGET_DATE
+    assert (today.open, today.high, today.low, today.close) == (
+        40.6,
+        44.65,
+        40.6,
+        44.65,
+    )
+    assert today.volume == 3_000_000.0
+    # range = T-20..T-1 of the FinMind history only (today excluded).
+    assert chart.range_20d is not None
+    last_20 = _make_ohlc_history_rows(30)[-20:]
+    assert chart.range_20d.high == max(float(r["max"]) for r in last_20)
+    assert chart.range_20d.low == min(float(r["min"]) for r in last_20)
+    assert chart.ma5[-1] is not None
+
+
+def test_chart_range_and_first_board_signal_share_one_price_basis():
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+    chart = features[0].chart_data
+    signal = features[0].technical_low_first_limit_up_signal
+
+    low_level_position = (chart.bars[-2].close - chart.range_20d.low) / (
+        chart.range_20d.high - chart.range_20d.low
+    )
+    assert signal.range_position == pytest.approx(low_level_position)
+
+
+def test_chart_data_is_none_when_history_has_no_ohlc_but_factors_still_compute():
+    rows = [
+        {k: v for k, v in row.items() if k not in {"open", "max", "min"}}
+        for row in _make_ohlc_history_rows(30)
+    ]
+    _, features = _run_build_stock_features(rows)
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d is not None  # price factors unaffected
+    assert features[0].technical_low_first_limit_up_signal.matched is None
+
+
+def test_chart_data_is_none_when_todays_official_candle_is_incomplete():
+    from dataclasses import replace
+
+    candidate = _make_candidate(
+        "1101", close="44.65", turnover="100000000", volume=3_000_000
+    )
+    broken = replace(
+        candidate, price=replace(candidate.price, open_price=None, low_price=None)
+    )
+    _, features = _run_build_stock_features(
+        _make_ohlc_history_rows(30), candidates=[broken]
+    )
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d is not None
+
+
+def test_chart_assembly_failure_never_clears_price_factors(monkeypatch):
+    import app.jobs.daily_ranking as daily_ranking
+
+    def boom(**_kwargs):
+        raise RuntimeError("simulated chart failure")
+
+    monkeypatch.setattr(daily_ranking, "build_stock_chart_data", boom)
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d == pytest.approx(3.0)
+    assert features[0].technical_low_first_limit_up_signal.matched is True

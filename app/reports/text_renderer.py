@@ -66,6 +66,7 @@ from app.domain.absolute_signal import (
     fundamental_absolute_signal,
     institutional_absolute_signal,
 )
+from app.domain.chart_data import StockChartData
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.momentum_signal import (
@@ -409,6 +410,31 @@ class ReportStockView:
     # _render_relative_score_lines).
     relative_sample_size: dict[str, int] = field(default_factory=dict)
     relative_rank: dict[str, int | None] = field(default_factory=dict)
+
+    # --- K-line chart / Flex card (single report model for all renderers) ---
+    #
+    # The Text renderer, the Chart renderer and the Flex builder all read
+    # THESE fields; none of them may re-derive a signal. Every judgement
+    # is a three-state SignalStatus decided exactly once in the Domain
+    # (INSUFFICIENT_DATA must never be rendered as "否"). They are
+    # populated by app.reports.report_builder.build_report_stocks; the
+    # defaults below mean "not computed" for callers/tests that build a
+    # ReportStockView by hand.
+    #
+    # chart_data: drawable series + the T-20..T-1 High/Low range (see
+    # app.domain.chart_data). None -> render a card without a hero image.
+    chart_data: StockChartData | None = None
+    # Today closed at the legal limit-up price (CandidateBuilder's own
+    # determination, never re-derived from change_percent).
+    limit_up_status: SignalStatus = SignalStatus.INSUFFICIENT_DATA
+    # Stock sat in the low zone BEFORE today's limit-up: Close[T-1] within
+    # the T-20..T-1 High/Low range (app.domain.price_structure).
+    low_level_status: SignalStatus = SignalStatus.INSUFFICIENT_DATA
+    # 低檔首板 overall result (same value the text report's 低檔首板 line
+    # shows, as a SignalStatus).
+    low_level_first_limit_up_status: SignalStatus = SignalStatus.INSUFFICIENT_DATA
+    # 漲多過熱 (app.domain.momentum_signal).
+    momentum_overheated_status: SignalStatus = SignalStatus.INSUFFICIENT_DATA
 
 
 def top_factors(

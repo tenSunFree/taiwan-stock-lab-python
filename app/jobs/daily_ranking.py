@@ -208,6 +208,7 @@ import sys
 from decimal import Decimal
 
 from app.domain.candidate_builder import Candidate, CandidateBuilder
+from app.domain.chart_data import build_stock_chart_data, today_point_from_daily_price
 from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.clients.line_client import LineMessagingClient
@@ -508,10 +509,21 @@ MESSAGE_VERSION = "text-v15"
 # instead.
 DATA_UPDATED_LABEL = "收盤後"
 
-# Retrieval buffer only — historical factors still use the trailing
-# 5/20 actual trading-day observations; 60 calendar days simply gives
-# FinMind enough room to cover weekends and market holidays.
-HISTORY_LOOKBACK_CALENDAR_DAYS = 60
+# Retrieval buffers only — the real windows are counted in trading
+# sessions, these calendar spans just give FinMind enough room to cover
+# weekends and market holidays.
+#
+# PRICE history feeds the 5/20-session factors AND the K-line chart,
+# which needs up to 120 sessions (60 displayed + MA60 warm-up): 200
+# calendar days ~= 135-140 sessions after weekends/holidays. It is the
+# SAME request as before (one FinMind call per candidate) — only the
+# date range is wider; FinMind already returns open/max/min in it.
+PRICE_HISTORY_LOOKBACK_CALENDAR_DAYS = 200
+
+# INSTITUTIONAL flow keeps its original 60-day window: it only needs the
+# trailing 5 sessions, so widening it together with the price window
+# would just download ~3x more rows per candidate for nothing.
+INSTITUTIONAL_LOOKBACK_CALENDAR_DAYS = 60
 
 # Retrieval buffer only. ~18 months ensures the response normally
 # contains both the latest disclosed revenue month and the same
@@ -816,7 +828,12 @@ def build_stock_features(
         logger.info("No candidates require enrichment")
         return []
 
-    history_start_date = target_date - dt.timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
+    price_history_start_date = target_date - dt.timedelta(
+        days=PRICE_HISTORY_LOOKBACK_CALENDAR_DAYS
+    )
+    institutional_start_date = target_date - dt.timedelta(
+        days=INSTITUTIONAL_LOOKBACK_CALENDAR_DAYS
+    )
     history_end_date = target_date - dt.timedelta(days=1)
 
     revenue_start_date = target_date - dt.timedelta(days=REVENUE_LOOKBACK_CALENDAR_DAYS)
@@ -876,12 +893,17 @@ def build_stock_features(
         # computed by CandidateBuilder, never recomputed) — still no
         # second FinMind call, still shares this block's try/except.
         technical_low_first_limit_up_signal = None
+        # K-line series for the LINE chart (display-only, never scored).
+        # Built from the SAME history_points as the signals above, plus
+        # today's official TWSE/TPEx candle, so the chart's High/Low
+        # range and the 低檔首板 signal share one price basis.
+        chart_data = None
 
         try:
             history_payload = finmind_client.fetch_stock_price_history(
                 ingestion_run_id=ingestion_run_id,
                 stock_id=stock_id,
-                start_date=history_start_date,
+                start_date=price_history_start_date,
                 end_date=history_end_date,
                 target_date=target_date,
             )
@@ -923,6 +945,31 @@ def build_stock_features(
                 )
                 price_success_count += 1
 
+                # Own try/except (same independence policy as the
+                # blocks below): a chart-assembly failure must never
+                # clear the price factors/signals computed above.
+                try:
+                    today_point = today_point_from_daily_price(candidate.price)
+                    if today_point is not None:
+                        chart_data = build_stock_chart_data(
+                            history=history_points, today=today_point
+                        )
+                    if chart_data is None:
+                        logger.warning(
+                            "chart_data_unavailable stock_id=%s report_date=%s "
+                            "today_candle_complete=%s",
+                            stock_id,
+                            target_date,
+                            today_point is not None,
+                        )
+                except Exception:
+                    chart_data = None
+                    logger.exception(
+                        "chart_data_failed stock_id=%s report_date=%s",
+                        stock_id,
+                        target_date,
+                    )
+
         except Exception:
             price_failure_count += 1
             logger.exception(
@@ -955,7 +1002,7 @@ def build_stock_features(
             institutional_payload = finmind_client.fetch_stock_institutional_investors(
                 ingestion_run_id=ingestion_run_id,
                 stock_id=stock_id,
-                start_date=history_start_date,
+                start_date=institutional_start_date,
                 end_date=history_end_date,
                 target_date=target_date,
             )
@@ -1210,6 +1257,7 @@ def build_stock_features(
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             institutional_data_cutoff=institutional_data_cutoff,
+            chart_data=chart_data,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             technical_low_first_limit_up_signal=technical_low_first_limit_up_signal,
             revenue_yoy=revenue_yoy,

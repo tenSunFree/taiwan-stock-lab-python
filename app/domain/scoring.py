@@ -24,12 +24,14 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from app.domain.features import StockFeatures
+from app.domain.momentum_signal import build_momentum_overheated_status
 from app.domain.normalization import (
     bounded_momentum_score,
     percentile_score,
     rank_within_pool,
     relative_score_sample_size,
 )
+from app.domain.signal_status import SignalStatus
 
 FACTOR_WEIGHTS: dict[str, float] = {
     "liquidity": 0.25,
@@ -106,6 +108,20 @@ class ScoredStock:
     #   that same population (1 = best), or None if this stock's own
     #   value for that factor was missing.
     relative_rank: dict[str, int | None] = field(default_factory=dict)
+
+    @property
+    def momentum_overheated_status(self) -> SignalStatus:
+        """ "漲多過熱", decided HERE in the Domain object (see
+        app.domain.momentum_signal for the rule) from this stock's own
+        momentum score and risk flags. A derived property rather than a
+        stored field so it can never disagree with factor_scores /
+        risk_flags, including on hand-built fixtures. The report builder
+        only carries this value through; Text / Chart / Flex read it and
+        never re-derive it."""
+        return build_momentum_overheated_status(
+            momentum_score=self.factor_scores.get("momentum"),
+            risk_flags=self.risk_flags,
+        )
 
 
 def _build_factor_frame(features: list[StockFeatures]) -> pd.DataFrame:

@@ -924,3 +924,168 @@ def test_total_score_unaffected_by_absolute_signal_rendering_end_to_end():
     assert "綜合分數：88.80" in report_positive
     assert "綜合分數：88.80" in report_negative
     assert sum(FACTOR_WEIGHTS.values()) == pytest.approx(1.0)
+
+
+# --- K-line chart / Flex: chart_data + three-state statuses -------------------
+
+
+def _build_one(*, features_overrides=None, scored_overrides=None, candidate=None):
+    scored_kwargs = dict(
+        stock_id="1101",
+        total_score=80.0,
+        factor_scores={"liquidity": 90.0, "momentum": 80.0},
+        risk_flags=(),
+        data_completeness=0.90,
+    )
+    scored_kwargs.update(scored_overrides or {})
+    candidate = candidate or _make_candidate(stock_id="1101")
+    (view,) = build_report_stocks(
+        ranked_stocks=[ScoredStock(**scored_kwargs)],
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={
+            "1101": _make_features("1101", **(features_overrides or {}))
+        },
+    )
+    return view
+
+
+def _first_board(*, matched, is_low):
+    return LowFirstLimitUpSignal(
+        matched=matched,
+        is_low=is_low,
+        range_position=0.1 if is_low else None,
+        is_close_limit_up=True,
+        previous_session_limit_up_estimated=False,
+    )
+
+
+def test_statuses_map_true_signal():
+    from app.domain.signal_status import SignalStatus
+
+    view = _build_one(
+        features_overrides={
+            "technical_low_first_limit_up_signal": _first_board(
+                matched=True, is_low=True
+            )
+        }
+    )
+    assert view.limit_up_status is SignalStatus.TRUE
+    assert view.low_level_status is SignalStatus.TRUE
+    assert view.low_level_first_limit_up_status is SignalStatus.TRUE
+
+
+def test_statuses_map_false_signal():
+    from app.domain.signal_status import SignalStatus
+
+    view = _build_one(
+        features_overrides={
+            "technical_low_first_limit_up_signal": _first_board(
+                matched=False, is_low=False
+            )
+        }
+    )
+    assert view.low_level_status is SignalStatus.FALSE
+    assert view.low_level_first_limit_up_status is SignalStatus.FALSE
+
+
+def test_unresolved_signal_is_insufficient_data_never_false():
+    from app.domain.signal_status import SignalStatus
+
+    view = _build_one(
+        features_overrides={
+            "technical_low_first_limit_up_signal": _first_board(
+                matched=None, is_low=None
+            )
+        }
+    )
+    assert view.low_level_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.low_level_first_limit_up_status is SignalStatus.INSUFFICIENT_DATA
+
+
+def test_signal_never_computed_is_insufficient_data():
+    from app.domain.signal_status import SignalStatus
+
+    view = _build_one()  # StockFeatures default: signal is None
+    assert view.low_level_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.low_level_first_limit_up_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.limit_up_status is SignalStatus.TRUE  # candidate is limit-up
+
+
+def test_momentum_overheated_status_comes_from_the_domain_rule():
+    from app.domain.signal_status import SignalStatus
+
+    overheated = _build_one(
+        scored_overrides={
+            "factor_scores": {"momentum": 10.0},
+            "risk_flags": ("HIGH_FIVE_DAY_RETURN",),
+        }
+    )
+    not_overheated = _build_one(
+        scored_overrides={
+            "factor_scores": {"momentum": 85.0},
+            "risk_flags": ("HIGH_FIVE_DAY_RETURN",),
+        }
+    )
+    unknown = _build_one(scored_overrides={"factor_scores": {"liquidity": 90.0}})
+    assert overheated.momentum_overheated_status is SignalStatus.TRUE
+    assert not_overheated.momentum_overheated_status is SignalStatus.FALSE
+    assert unknown.momentum_overheated_status is SignalStatus.INSUFFICIENT_DATA
+
+
+def test_chart_data_is_carried_through_unchanged():
+    from app.domain.chart_data import StockChartData
+
+    chart = StockChartData(
+        bars=(), ma5=(), ma20=(), ma60=(), avg_volume_20=(), range_20d=None
+    )
+    assert _build_one(features_overrides={"chart_data": chart}).chart_data is chart
+    assert _build_one().chart_data is None
+
+
+def test_report_view_defaults_mean_not_computed():
+    from app.domain.signal_status import SignalStatus
+    from app.reports.text_renderer import ReportStockView
+
+    view = ReportStockView(
+        rank=1,
+        stock_id="1101",
+        stock_name="x",
+        total_score=1.0,
+        data_completeness=1.0,
+        top_factor_names=(),
+        risk_flags=(),
+    )
+    assert view.chart_data is None
+    assert view.limit_up_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.low_level_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.low_level_first_limit_up_status is SignalStatus.INSUFFICIENT_DATA
+    assert view.momentum_overheated_status is SignalStatus.INSUFFICIENT_DATA
+
+
+def test_report_builder_carries_scored_stocks_momentum_status_without_rederiving():
+    """The builder must hand through whatever the Domain object says —
+    proven by swapping in a ScoredStock whose property is overridden."""
+    from app.domain.signal_status import SignalStatus
+
+    class _StubScored(ScoredStock):
+        @property
+        def momentum_overheated_status(self):  # deliberately NOT derivable
+            return SignalStatus.TRUE
+
+    candidate = _make_candidate(stock_id="1101")
+    (view,) = build_report_stocks(
+        ranked_stocks=[
+            _StubScored(
+                stock_id="1101",
+                total_score=1.0,
+                data_completeness=1.0,
+                factor_scores={"momentum": 99.0},  # rule alone would say FALSE
+                risk_flags=(),
+            )
+        ],
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": _make_features("1101")},
+    )
+    assert view.momentum_overheated_status is SignalStatus.TRUE

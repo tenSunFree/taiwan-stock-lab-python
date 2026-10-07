@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from app.domain.feature_builder import HistoricalPricePoint
+from app.domain.models import DailyPrice
 from app.domain.price_structure import (
     PriceRange20d,
     build_range_20d,
@@ -61,6 +62,35 @@ class StockChartData:
     ma60: tuple[float | None, ...]
     avg_volume_20: tuple[float | None, ...]
     range_20d: PriceRange20d | None  # T-20..T-1, None if not computable
+
+
+def today_point_from_daily_price(price: DailyPrice) -> HistoricalPricePoint | None:
+    """Today's (T) candle from the OFFICIAL TWSE/TPEx daily data.
+
+    FinMind is deliberately never the source of today's bar (its
+    aggregation can lag the exchange feeds on the same day). Any missing
+    OHLCV/turnover field -> None: the chart is then unavailable rather
+    than drawn from a guessed candle.
+    """
+    required = (
+        price.open_price,
+        price.high_price,
+        price.low_price,
+        price.close_price,
+        price.volume,
+        price.turnover,
+    )
+    if any(value is None for value in required):
+        return None
+    return HistoricalPricePoint(
+        trading_date=price.trading_date,
+        open=float(price.open_price),
+        high=float(price.high_price),
+        low=float(price.low_price),
+        close=float(price.close_price),
+        volume=float(price.volume),
+        turnover=float(price.turnover),
+    )
 
 
 def moving_average_series(values: Sequence[float], window: int) -> list[float | None]:

@@ -95,6 +95,14 @@ to ReportStockView unchanged (see those fields' own docstrings). Same
 required-not-optional status as the rest of StockFeatures/ScoredStock
 above. Not yet consumed by any rendering function — wiring these into
 the actual report output is a later step in this rollout.
+
+As of the K-line chart rollout, also carries StockFeatures.chart_data and
+the four three-state statuses (limit_up / low_level / low_level_first_
+limit_up / momentum_overheated) through to ReportStockView. Every one is a
+Domain decision carried through unchanged (the only work done here is the
+bool|None -> SignalStatus type conversion at the boundary), so the Text,
+Chart and Flex renderers share one answer and none of them re-derives a
+signal.
 """
 
 from __future__ import annotations
@@ -104,6 +112,7 @@ from app.domain.features import StockFeatures
 from app.domain.models import RegulatoryRiskStatus, StockMaster
 from app.domain.risk_inputs import is_one_price_limit_up
 from app.domain.scoring import FACTOR_WEIGHTS, ScoredStock
+from app.domain.signal_status import SignalStatus
 from app.reports.text_renderer import FACTOR_DISPLAY_NAMES, ReportStockView
 
 
@@ -196,6 +205,25 @@ def build_report_stocks(
 
         regulatory = regulatory_by_stock.get(scored.stock_id)
 
+        # Three-state statuses for the chart / Flex layers. This builder
+        # DECIDES NOTHING: low-level / first-board come from the Domain's
+        # LowFirstLimitUpSignal, limit-up from CandidateBuilder, and
+        # momentum-overheated from ScoredStock.momentum_overheated_status.
+        # The only work here is the bool|None -> SignalStatus type
+        # conversion at the boundary. A signal that was never computed
+        # this run (e.g. the FinMind history fetch failed -> signal is
+        # None) becomes INSUFFICIENT_DATA, never FALSE.
+        first_board = features.technical_low_first_limit_up_signal
+        low_level_status = SignalStatus.from_optional_bool(
+            first_board.is_low if first_board is not None else None
+        )
+        low_level_first_limit_up_status = SignalStatus.from_optional_bool(
+            first_board.matched if first_board is not None else None
+        )
+        limit_up_status = SignalStatus.from_optional_bool(
+            candidate.limit_up.is_close_limit_up
+        )
+
         results.append(
             ReportStockView(
                 rank=rank,
@@ -255,6 +283,12 @@ def build_report_stocks(
                 institutional_data_cutoff=features.institutional_data_cutoff,
                 relative_sample_size=dict(scored.relative_sample_size),
                 relative_rank=dict(scored.relative_rank),
+                # --- K-line chart / Flex: one report model, three renderers ---
+                chart_data=features.chart_data,
+                limit_up_status=limit_up_status,
+                low_level_status=low_level_status,
+                low_level_first_limit_up_status=low_level_first_limit_up_status,
+                momentum_overheated_status=scored.momentum_overheated_status,
             )
         )
 
