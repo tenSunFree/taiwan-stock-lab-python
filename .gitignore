@@ -224,3 +224,6 @@ __marimo__/
 *.db-journal
 *.sqlite
 *.sqlite3
+
+# K-line chart preview output (python -m app.charts.preview)
+chart_preview/

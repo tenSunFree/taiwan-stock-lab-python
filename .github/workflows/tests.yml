@@ -18,6 +18,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # The chart renderer needs a CJK font. Without it the rendering tests
+      # would have nothing to draw with, so install it explicitly and fail
+      # this step (not silently skip tests) if it is not visible afterwards.
+      - name: Install CJK font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          fc-list | grep -qi "Noto Sans CJK"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

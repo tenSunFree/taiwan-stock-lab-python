@@ -7,3 +7,5 @@ pandas>=2.2
 pytest>=8.0
 pyyaml>=6.0
 truststore>=0.9
+matplotlib>=3.8
+Pillow>=10.0

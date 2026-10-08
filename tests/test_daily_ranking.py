@@ -3189,3 +3189,56 @@ def test_chart_assembly_failure_never_clears_price_factors(monkeypatch):
     assert features[0].chart_data is None
     assert features[0].volume_ratio_20d == pytest.approx(3.0)
     assert features[0].technical_low_first_limit_up_signal.matched is True
+
+
+# --- Step 2 -> Step 3 hand-off: real pipeline features render into a chart ----
+
+
+def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
+    from app.charts.stock_chart_renderer import (
+        ChartRenderError,
+        _resolve_fonts,
+        render_stock_chart_png,
+        select_chart_marker,
+    )
+    from app.domain.scoring import ScoredStock
+    from app.domain.signal_status import SignalStatus
+    from app.reports.report_builder import build_report_stocks
+
+    import os
+
+    try:
+        _resolve_fonts()
+    except ChartRenderError:
+        if os.environ.get("CI"):
+            raise  # CI must provide the font — never skip silently there
+        pytest.skip("no CJK font installed (apt install fonts-noto-cjk)")
+
+    candidate = _make_candidate(
+        "1101", close="44.65", turnover="100000000", volume=3_000_000
+    )
+    _, features = _run_build_stock_features(
+        _make_ohlc_history_rows(130, start=dt.date(2026, 2, 2)),
+        candidates=[candidate],
+    )
+    scored = ScoredStock(
+        stock_id="1101",
+        total_score=80.0,
+        data_completeness=0.9,
+        factor_scores={"momentum": 80.0},
+        risk_flags=(),
+    )
+    (view,) = build_report_stocks(
+        ranked_stocks=[scored],
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": features[0]},
+    )
+
+    # The report model carries everything the chart reads...
+    assert view.chart_data is not None and len(view.chart_data.bars) == 60
+    assert view.limit_up_status is SignalStatus.TRUE
+    assert view.low_level_first_limit_up_status is SignalStatus.TRUE
+    assert select_chart_marker(view) == "低檔首板"
+    # ...and it renders without the chart layer recomputing anything.
+    assert render_stock_chart_png(view).startswith(b"\x89PNG")
