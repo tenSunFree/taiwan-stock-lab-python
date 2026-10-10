@@ -217,3 +217,102 @@ def test_broadcast_text_5xx_retries_then_succeeds():
 
     assert call_count["n"] == 2
     assert result.success is True
+
+
+# --- Flex / generic message sends (one shared retry path) -------------------
+
+FLEX_CONTENTS = {"type": "carousel", "contents": [{"type": "bubble"}]}
+
+
+def test_push_flex_sends_a_flex_message_with_to():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"x-line-request-id": "req-1"})
+
+    client = make_client(handler)
+    result = client.push_flex(
+        target_id="U123",
+        alt_text="每日漲停股量化觀察 10/01｜1 檔",
+        contents=FLEX_CONTENTS,
+    )
+
+    assert result.success is True
+    assert captured["url"].endswith("/v2/bot/message/push")
+    assert captured["body"] == {
+        "to": "U123",
+        "messages": [
+            {
+                "type": "flex",
+                "altText": "每日漲停股量化觀察 10/01｜1 檔",
+                "contents": FLEX_CONTENTS,
+            }
+        ],
+    }
+
+
+def test_broadcast_flex_has_no_to_field():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    client = make_client(handler)
+    client.broadcast_flex(alt_text="alt", contents=FLEX_CONTENTS)
+
+    assert captured["url"].endswith("/v2/bot/message/broadcast")
+    assert "to" not in captured["body"]
+    assert captured["body"]["messages"][0]["type"] == "flex"
+
+
+def test_flex_send_reuses_one_retry_key_across_retries():
+    seen_keys = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_keys.append(request.headers["X-Line-Retry-Key"])
+        if len(seen_keys) < 3:
+            return httpx.Response(503)
+        return httpx.Response(200)
+
+    client = make_client(handler, initial_backoff_seconds=0)
+    result = client.broadcast_flex(alt_text="alt", contents=FLEX_CONTENTS)
+
+    assert result.attempts == 3
+    assert len(set(seen_keys)) == 1
+    assert seen_keys[0] == str(result.retry_key)
+
+
+def test_flex_4xx_is_not_retried_and_keeps_the_response_body():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(400, text='{"message":"invalid flex"}')
+
+    client = make_client(handler, initial_backoff_seconds=0)
+    with pytest.raises(LineNonRetryableError, match="invalid flex"):
+        client.broadcast_flex(alt_text="alt", contents=FLEX_CONTENTS)
+    assert calls["n"] == 1
+
+
+def test_push_messages_sends_the_given_objects_unchanged():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    messages = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    make_client(handler).push_messages(target_id="U1", messages=messages)
+    assert captured["body"] == {"to": "U1", "messages": messages}
+
+
+def test_text_and_flex_share_one_send_implementation():
+    from app.clients.line_client import LineMessagingClient
+
+    assert not hasattr(LineMessagingClient, "_send_text_request")
+    assert hasattr(LineMessagingClient, "_send_messages_request")

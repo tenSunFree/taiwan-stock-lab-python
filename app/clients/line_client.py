@@ -22,12 +22,15 @@ This uses a hand-rolled retry loop instead of a decorator-based retry
 library specifically so the retry key can be pinned once, outside the
 loop, and reused across every attempt inside it.
 
-push_text() and broadcast_text() share a single _send_text_request()
-implementation — the only difference between a Push and a Broadcast
-call is the endpoint URL and whether the payload has a `to` field.
-Keeping the retry/409/4xx/5xx handling in one place means a future
-change to that logic (e.g. adjusting backoff, handling a new status
-code) can't silently apply to one send mode and not the other.
+Every public send method (push_text / broadcast_text / push_flex /
+broadcast_flex / push_messages / broadcast_messages) goes through ONE
+_send_messages_request() implementation — the only differences between
+a Push and a Broadcast call are the endpoint URL and whether the
+payload has a `to` field, and the only difference between a text and a
+Flex send is the message object in `messages`. Keeping the
+retry/409/4xx/5xx handling in one place means a future change to that
+logic (e.g. adjusting backoff, handling a new status code) can't
+silently apply to one send mode or message type and not the others.
 """
 
 from __future__ import annotations
@@ -42,6 +45,12 @@ from app.clients.idempotency import create_line_retry_key
 
 LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push"
 LINE_BROADCAST_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
+
+
+def build_flex_message(*, alt_text: str, contents: dict) -> dict:
+    """A LINE Flex message object. `alt_text` is what notifications and
+    the chat list show (LINE limit: 400 characters)."""
+    return {"type": "flex", "altText": alt_text, "contents": contents}
 
 
 class LinePushError(RuntimeError):
@@ -88,9 +97,10 @@ class LineMessagingClient:
         """Send to ONE specific user/group/room. Does not reveal
         anything about who else may or may not receive this text —
         see broadcast_text() for "send to every friend of this OA"."""
-        payload = {"to": target_id, "messages": [{"type": "text", "text": text}]}
-        return self._send_text_request(
-            endpoint=LINE_PUSH_ENDPOINT, payload=payload, retry_key=retry_key
+        return self.push_messages(
+            target_id=target_id,
+            messages=[{"type": "text", "text": text}],
+            retry_key=retry_key,
         )
 
     def broadcast_text(
@@ -104,18 +114,73 @@ class LineMessagingClient:
         app.delivery.service.DeliveryService.deliver_broadcast()'s
         docstring for how idempotency is handled without one.
         """
-        payload = {"messages": [{"type": "text", "text": text}]}
-        return self._send_text_request(
-            endpoint=LINE_BROADCAST_ENDPOINT, payload=payload, retry_key=retry_key
+        return self.broadcast_messages(
+            messages=[{"type": "text", "text": text}], retry_key=retry_key
         )
 
-    def _send_text_request(
+    def push_flex(
+        self,
+        *,
+        target_id: str,
+        alt_text: str,
+        contents: dict,
+        retry_key: UUID | None = None,
+    ) -> LinePushResult:
+        """Push ONE Flex message (e.g. a carousel) to one target."""
+        return self.push_messages(
+            target_id=target_id,
+            messages=[build_flex_message(alt_text=alt_text, contents=contents)],
+            retry_key=retry_key,
+        )
+
+    def broadcast_flex(
+        self, *, alt_text: str, contents: dict, retry_key: UUID | None = None
+    ) -> LinePushResult:
+        """Broadcast ONE Flex message (e.g. a carousel) to every friend."""
+        return self.broadcast_messages(
+            messages=[build_flex_message(alt_text=alt_text, contents=contents)],
+            retry_key=retry_key,
+        )
+
+    def push_messages(
+        self,
+        *,
+        target_id: str,
+        messages: list[dict],
+        retry_key: UUID | None = None,
+    ) -> LinePushResult:
+        """Push already-built LINE message objects (text, flex, ...)."""
+        return self._send_messages_request(
+            endpoint=LINE_PUSH_ENDPOINT,
+            target_id=target_id,
+            messages=messages,
+            retry_key=retry_key,
+        )
+
+    def broadcast_messages(
+        self, *, messages: list[dict], retry_key: UUID | None = None
+    ) -> LinePushResult:
+        """Broadcast already-built LINE message objects."""
+        return self._send_messages_request(
+            endpoint=LINE_BROADCAST_ENDPOINT,
+            target_id=None,
+            messages=messages,
+            retry_key=retry_key,
+        )
+
+    def _send_messages_request(
         self,
         *,
         endpoint: str,
-        payload: dict,
+        target_id: str | None,
+        messages: list[dict],
         retry_key: UUID | None,
     ) -> LinePushResult:
+        """The single retry/409/4xx/5xx implementation for every send.
+        `target_id` is None for Broadcast (no `to` field)."""
+        payload: dict = {"messages": messages}
+        if target_id is not None:
+            payload = {"to": target_id, "messages": messages}
         actual_retry_key = retry_key or create_line_retry_key()
 
         headers = {

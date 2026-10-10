@@ -215,7 +215,7 @@ from app.clients.line_client import LineMessagingClient
 from app.db.delivery_repository import DeliveryRepository
 from app.db.eps_observation_repository import EpsObservationRepository
 from app.db.models import EpsCumulativeObservation, IngestionRun, MessageDelivery
-from app.delivery.service import DeliveryService
+from app.delivery.service import DeliveryService, OutboundMessage
 from app.domain.eps_growth_builder import build_eps_growth_sustained_signal
 from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_positive,
@@ -235,6 +235,8 @@ from app.domain.technical_signal_builder import (
     build_low_with_rising_signal,
 )
 from app.domain.valuation_filter import filter_candidates_by_pe
+from app.reports.chart_images import prepare_chart_heroes
+from app.reports.flex_builder import build_flex_carousels
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -282,6 +284,10 @@ from app.ingestion.twse_regulatory_mapper import (
     build_twse_disposition_statuses,
 )
 from app.ingestion.valuation_mapper import build_tpex_valuations, build_twse_valuations
+from app.storage.chart_image_uploader import (
+    ChartImageUploader,
+    build_uploader_from_env,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -497,7 +503,29 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # render_daily_report()/render_daily_report_messages() and
 # render_no_qualified_stock_report(). The "📌 功能進度" checklist is
 # unchanged. No scoring, ranking, or signal logic changed.
-MESSAGE_VERSION = "text-v15"
+#
+# text-v16: the "📌 功能進度" checklist line changes from "⬜ 日K線圖" to
+# "✅ 日K線圖" in every text report variant (the K-line chart feature
+# shipped). Visible content change -> new version. The text report is now
+# the FALLBACK / no-qualified-stock message; it is sent under
+# TEXT_MESSAGE_VERSION below.
+#
+# flex-v1: the daily report's default shape changes from plain text to a
+# LINE Flex CAROUSEL (one bubble per stock: K-line hero image, quantified
+# summary, three-state signals, risk line, disclaimer footer — see
+# app.reports.flex_builder). A different message shape -> new
+# MESSAGE_VERSION, so no old text-v15 delivery record can collide with
+# it. Each carousel is one delivery part; its DB content hash covers the
+# Flex builder's fingerprint, which excludes the hosted image URLs (see
+# app.delivery.service.OutboundMessage).
+#
+# Fallback ladder (each level only when the one above cannot be built):
+#   chart cannot be drawn/uploaded  -> that stock's bubble has no hero
+#   Flex cannot be built            -> plain-text report (TEXT_MESSAGE_VERSION)
+# A LINE send failure is NOT swallowed into a fallback: it fails the run
+# so the next scheduled attempt retries the same idempotent delivery.
+MESSAGE_VERSION = "flex-v1"
+TEXT_MESSAGE_VERSION = "text-v16"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -1373,6 +1401,53 @@ def _validate_shared_repository(
             )
 
 
+def build_outbound_messages(
+    *,
+    report_stocks: list,
+    report_messages: list[str],
+    target_date: dt.date,
+    chart_uploader: ChartImageUploader | None,
+) -> tuple[list[OutboundMessage], str]:
+    """The messages to deliver and the message_version they go out under.
+
+    Qualified stocks -> a Flex carousel (flex-v1). Anything that stops the
+    carousel from being built -> the plain-text report (text-v16). A
+    stock-level chart problem never gets here: prepare_chart_heroes only
+    drops that stock's hero image. No qualified stock -> the text
+    "nothing today" report, as before.
+    """
+    text_messages = [OutboundMessage.text(text) for text in report_messages]
+    if not report_stocks:
+        return text_messages, TEXT_MESSAGE_VERSION
+
+    try:
+        uploader = (
+            chart_uploader if chart_uploader is not None else build_uploader_from_env()
+        )
+        hero_urls = prepare_chart_heroes(
+            report_stocks, trading_date=target_date, uploader=uploader
+        )
+        carousels = build_flex_carousels(
+            report_stocks, trading_date=target_date, hero_urls=hero_urls
+        )
+        flex_messages = [
+            OutboundMessage.flex(
+                alt_text=carousel.alt_text,
+                contents=carousel.contents,
+                fingerprint=carousel.fingerprint,
+            )
+            for carousel in carousels
+        ]
+    except Exception:  # noqa: BLE001 - any failure -> text report, never no report
+        logger.exception(
+            "flex_build_failed report_date=%s stock_count=%d",
+            target_date,
+            len(report_stocks),
+        )
+        return text_messages, TEXT_MESSAGE_VERSION
+    return flex_messages, MESSAGE_VERSION
+
+
 def run(
     *,
     repository: InMemoryRawPayloadRepository | None = None,
@@ -1383,6 +1458,7 @@ def run(
     eps_observation_repository: EpsObservationRepository | None = None,
     delivery_repository: DeliveryRepository | None = None,
     line_client: LineMessagingClient | None = None,
+    chart_uploader: ChartImageUploader | None = None,
 ) -> int:
     if (
         twse_client is not None
@@ -1504,6 +1580,7 @@ def run(
             eps_observation_repository=eps_observation_repository,
             delivery_repository=delivery_repository,
             line_client=line_client,
+            chart_uploader=chart_uploader,
             target_date=target_date,
             ingestion_run_id=ingestion_run_id,
         )
@@ -1524,6 +1601,7 @@ def _run_pipeline(
     eps_observation_repository: EpsObservationRepository | None,
     delivery_repository: DeliveryRepository | None,
     line_client: LineMessagingClient | None,
+    chart_uploader: ChartImageUploader | None,
     target_date: dt.date,
     ingestion_run_id: str,
 ) -> int:
@@ -2179,20 +2257,27 @@ def _run_pipeline(
                 return 1
             line_client = LineMessagingClient(channel_access_token=channel_access_token)
 
+        outbound_messages, delivery_message_version = build_outbound_messages(
+            report_stocks=report_stocks,
+            report_messages=report_messages,
+            target_date=target_date,
+            chart_uploader=chart_uploader,
+        )
+
         def _run_delivery(service: DeliveryService) -> list[str]:
             if line_delivery_mode == "push":
-                return service.deliver_many(
+                return service.deliver_messages(
                     trading_date=target_date,
                     strategy_version=STRATEGY_VERSION,
                     target_id=target_id,
-                    message_version=MESSAGE_VERSION,
-                    messages=report_messages,
+                    message_version=delivery_message_version,
+                    messages=outbound_messages,
                 )
-            return service.deliver_broadcast_many(
+            return service.deliver_broadcast_messages(
                 trading_date=target_date,
                 strategy_version=STRATEGY_VERSION,
-                message_version=MESSAGE_VERSION,
-                messages=report_messages,
+                message_version=delivery_message_version,
+                messages=outbound_messages,
             )
 
         try:
@@ -2226,12 +2311,12 @@ def _run_pipeline(
                     engine.dispose()
         except Exception:
             logger.exception(
-                "LINE_DELIVERY_MODE=%s failed trading_date=%s strategy_version=%s "
-                "message_version=%s",
-                line_delivery_mode,
+                "line_send_failed report_date=%s delivery_mode=%s "
+                "strategy_version=%s message_version=%s",
                 target_date,
+                line_delivery_mode,
                 STRATEGY_VERSION,
-                MESSAGE_VERSION,
+                delivery_message_version,
             )
             return 1
 
@@ -2242,8 +2327,8 @@ def _run_pipeline(
             ", ".join(delivery_results),
             target_date,
             STRATEGY_VERSION,
-            MESSAGE_VERSION,
-            len(report_messages),
+            delivery_message_version,
+            len(outbound_messages),
         )
 
     logger.info(

@@ -135,7 +135,7 @@ def build_revenue_yoy(
     # availability metadata sort last as a fallback, not a first pick.
     previous = max(
         previous_year_points,
-        key=lambda point: (point.available_at or dt.date.min),
+        key=lambda point: point.available_at or dt.date.min,
     )
 
     if previous.revenue <= 0:
@@ -227,7 +227,7 @@ def _resolve_month_yoy(
 
     previous = max(
         previous_year_points,
-        key=lambda point: (point.available_at or dt.date.min),
+        key=lambda point: point.available_at or dt.date.min,
     )
 
     if previous.revenue <= 0:

@@ -3242,3 +3242,265 @@ def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
     assert select_chart_marker(view) == "低檔首板"
     # ...and it renders without the chart layer recomputing anything.
     assert render_stock_chart_png(view).startswith(b"\x89PNG")
+
+
+# --- Flex carousel delivery (flex-v1) + text fallback (text-v16) ------------
+
+
+def _flex_run(
+    monkeypatch, tmp_path, handler, *, stocks=None, session=None, run_kwargs=None
+):
+    """Run the pipeline in broadcast mode against a recording LINE transport.
+
+    `stocks`: report stocks to inject in place of build_report_stocks()'s
+    output (the shared fixture yields no qualified stock); None keeps the
+    real "no qualified stock" behaviour. Returns (exit_code, db_session).
+    """
+    import httpx
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from app.clients.line_client import LineMessagingClient
+    from app.db.delivery_repository import DeliveryRepository
+    from app.db.models import MessageDelivery
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("LINE_DELIVERY_MODE", "broadcast")
+    monkeypatch.delenv("CHART_GCS_BUCKET", raising=False)
+    if stocks is not None:
+        monkeypatch.setattr(
+            "app.jobs.daily_ranking.build_report_stocks",
+            lambda **_: list(stocks),
+        )
+
+    if session is None:
+        engine = create_engine(f"sqlite:///{tmp_path / 'flex.db'}")
+        MessageDelivery.__table__.create(engine)
+        session = Session(engine)
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
+    )
+    line_client = LineMessagingClient(
+        channel_access_token="fake-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        initial_backoff_seconds=0,
+    )
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
+        delivery_repository=DeliveryRepository(session),
+        line_client=line_client,
+        **(run_kwargs or {}),
+    )
+    return result, session
+
+
+def _recording_handler(bodies, status=200):
+    import json
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            status, headers={"x-line-request-id": "req-1"}, text="bad"
+        )
+
+    return handler
+
+
+def _report_stock():
+    from decimal import Decimal
+
+    from app.domain.signal_status import SignalStatus
+    from app.reports.text_renderer import ReportStockView
+
+    return ReportStockView(
+        rank=1,
+        stock_id="6150",
+        stock_name="撼訊",
+        total_score=73.61,
+        data_completeness=0.9,
+        top_factor_names=(),
+        risk_flags=(),
+        close_price=Decimal("69.90"),
+        change_percent=9.91,
+        volume_ratio_20d=14.13,
+        return_5d=0.137,
+        low_level_first_limit_up_status=SignalStatus.FALSE,
+        momentum_overheated_status=SignalStatus.FALSE,
+    )
+
+
+HERO_URL = "https://storage.googleapis.com/b/charts/2026/08/07/6150_20260807_abcd.png"
+
+
+def test_message_versions_are_flex_v1_and_text_v16():
+    from app.jobs.daily_ranking import MESSAGE_VERSION, TEXT_MESSAGE_VERSION
+
+    assert MESSAGE_VERSION == "flex-v1"
+    assert TEXT_MESSAGE_VERSION == "text-v16"
+
+
+def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_path):
+    from app.db.models import MessageDelivery
+
+    bodies = []
+    monkeypatch.setattr(
+        "app.jobs.daily_ranking.prepare_chart_heroes",
+        lambda stocks, **_: {"6150": HERO_URL},
+    )
+    result, session = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+
+    assert result == 0
+    assert len(bodies) == 1
+    message = bodies[0]["messages"][0]
+    assert message["type"] == "flex"
+    assert message["altText"] == "每日漲停股量化觀察 08/07｜1 檔"
+    assert message["contents"]["type"] == "carousel"
+    bubble = message["contents"]["contents"][0]
+    assert bubble["hero"]["url"] == HERO_URL
+    assert bubble["hero"]["action"] == {"type": "uri", "uri": HERO_URL}
+    assert [r.message_version for r in session.query(MessageDelivery).all()] == [
+        "flex-v1:p01-of-01"
+    ]
+
+
+def test_without_image_hosting_the_card_is_sent_without_a_hero(monkeypatch, tmp_path):
+    bodies = []
+    result, _ = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+    assert result == 0
+    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    assert bubble["type"] == "bubble"
+    assert "hero" not in bubble
+
+
+def test_rerun_is_skipped_even_when_the_chart_is_missing_on_the_rerun(
+    monkeypatch, tmp_path
+):
+    """Run 1 hosts a chart; run 2 (e.g. a transient GCS error) has none.
+    Same stocks, same data -> the delivery is the same and must be SKIPPED,
+    not fail with DeliveryContentConflict."""
+    bodies = []
+    heroes = {"6150": HERO_URL}
+    monkeypatch.setattr(
+        "app.jobs.daily_ranking.prepare_chart_heroes", lambda stocks, **_: dict(heroes)
+    )
+    first, session = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+    heroes.clear()
+    second, _ = _flex_run(
+        monkeypatch,
+        tmp_path,
+        _recording_handler(bodies),
+        stocks=[_report_stock()],
+        session=session,
+    )
+    assert (first, second) == (0, 0)
+    assert len(bodies) == 1
+
+
+def test_flex_build_failure_falls_back_to_the_text_report(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    from app.db.models import MessageDelivery
+    from app.reports.flex_builder import FlexBuildError
+
+    def boom(*args, **kwargs):
+        raise FlexBuildError("cannot build")
+
+    monkeypatch.setattr("app.jobs.daily_ranking.build_flex_carousels", boom)
+    bodies = []
+    with caplog.at_level(logging.ERROR):
+        result, session = _flex_run(
+            monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+        )
+
+    assert result == 0
+    assert "flex_build_failed report_date=2026-08-07 stock_count=1" in caplog.text
+    assert all(m["type"] == "text" for body in bodies for m in body["messages"])
+    versions = [r.message_version for r in session.query(MessageDelivery).all()]
+    assert versions and all(v.startswith("text-v16:") for v in versions)
+
+
+def test_no_qualified_stock_still_sends_the_text_report_with_the_new_checkmark(
+    monkeypatch, tmp_path
+):
+    bodies = []
+    result, session = _flex_run(monkeypatch, tmp_path, _recording_handler(bodies))
+    assert result == 0
+    message = bodies[0]["messages"][0]
+    assert message["type"] == "text"
+    assert "✅ 日K線圖" in message["text"]
+    assert "⬜ 日K線圖" not in message["text"]
+
+
+def test_a_line_failure_is_logged_as_line_send_failed_and_fails_the_run(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    bodies = []
+    with caplog.at_level(logging.ERROR):
+        result, _ = _flex_run(
+            monkeypatch,
+            tmp_path,
+            _recording_handler(bodies, status=400),
+            stocks=[_report_stock()],
+        )
+    assert result == 1
+    assert (
+        "line_send_failed report_date=2026-08-07 delivery_mode=broadcast" in caplog.text
+    )
+    # a LINE failure must NOT silently turn into a second, text-fallback send
+    assert len(bodies) == 1
+
+
+def test_a_chart_failure_for_every_stock_still_sends_the_flex_card(
+    monkeypatch, tmp_path
+):
+    """prepare_chart_heroes contains per-stock failures; the carousel goes
+    out with hero-less bubbles."""
+    from types import SimpleNamespace
+
+    from app.storage.chart_image_uploader import ChartImageUploadError
+
+    class BrokenUploader:
+        def upload_chart(self, **_):
+            raise ChartImageUploadError("403")
+
+    stock = _report_stock()
+    stock = type(stock)(**{**stock.__dict__, "chart_data": SimpleNamespace()})
+    monkeypatch.setattr(
+        "app.reports.chart_images.render_stock_chart_png", lambda s: b"\x89PNG"
+    )
+    bodies = []
+    result, _ = _flex_run(
+        monkeypatch,
+        tmp_path,
+        _recording_handler(bodies),
+        stocks=[stock],
+        run_kwargs={"chart_uploader": BrokenUploader()},
+    )
+    assert result == 0
+    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    assert "hero" not in bubble
