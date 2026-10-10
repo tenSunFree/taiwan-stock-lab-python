@@ -346,6 +346,12 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          # K-line chart hosting (public GCS bucket). A repository
+          # VARIABLE (not a secret: the bucket name is public in every
+          # image URL). Empty/unset -> hosting disabled, cards are sent
+          # without a hero image. Credentials come from the WIF auth step
+          # above (ADC); the SA only needs roles/storage.objectCreator.
+          CHART_GCS_BUCKET: ${{ vars.CHART_GCS_BUCKET }}
           # Scheduled: the date pinned by `gate` from created_at.
           # Manual: the trading_date input (empty -> today in Taipei).
           TARGET_TRADING_DATE: ${{ github.event_name == 'schedule' && needs.gate.outputs.trading_date || github.event.inputs.trading_date }}
