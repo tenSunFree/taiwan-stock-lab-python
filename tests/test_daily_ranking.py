@@ -3248,7 +3248,14 @@ def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
 
 
 def _flex_run(
-    monkeypatch, tmp_path, handler, *, stocks=None, session=None, run_kwargs=None
+    monkeypatch,
+    tmp_path,
+    handler,
+    *,
+    stocks=None,
+    session=None,
+    run_kwargs=None,
+    env=None,
 ):
     """Run the pipeline in broadcast mode against a recording LINE transport.
 
@@ -3267,6 +3274,8 @@ def _flex_run(
     monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
     monkeypatch.setenv("LINE_DELIVERY_MODE", "broadcast")
     monkeypatch.delenv("CHART_GCS_BUCKET", raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
     if stocks is not None:
         monkeypatch.setattr(
             "app.jobs.daily_ranking.build_report_stocks",
@@ -3490,8 +3499,15 @@ def test_a_chart_failure_for_every_stock_still_sends_the_flex_card(
 
     stock = _report_stock()
     stock = type(stock)(**{**stock.__dict__, "chart_data": SimpleNamespace()})
+    import functools
+
+    from app.reports.chart_images import prepare_chart_heroes
+
+    # prepare_chart_heroes binds its default renderer at definition time, so
+    # patching the module attribute would not reach it: pass the renderer in.
     monkeypatch.setattr(
-        "app.reports.chart_images.render_stock_chart_png", lambda s: b"\x89PNG"
+        "app.jobs.daily_ranking.prepare_chart_heroes",
+        functools.partial(prepare_chart_heroes, render=lambda s: b"\x89PNG"),
     )
     bodies = []
     result, _ = _flex_run(

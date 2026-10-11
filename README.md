@@ -568,6 +568,17 @@ available.
   during feature-building whenever it is configured (benign,
   append-only, revision-safe — see Enrichment (TWSE / TPEx Financial
   Statements) above)
+- As of `flex-v1` the default LINE message is a Flex carousel, so
+  `REPORT_DRY_RUN=true` also previews it **locally**: each stock's K-line
+  chart is drawn to `flex_preview/<code>_<YYYYMMDD>.png` and the
+  carousel is written to `flex_preview/carousel_NN.json` (paste into
+  LINE's Flex Message Simulator) and `flex_preview/message_NN.json`
+  (the full message object), with a size summary printed against LINE's
+  limits. Set `REPORT_PREVIEW_DIR` to change the directory. Nothing is
+  uploaded to GCS and nothing is sent: the hero URLs in the JSON are
+  placeholders on `preview.invalid`, so the simulator shows a broken
+  image there — open the PNG for the real chart. The plain-text report
+  printed above it is what production sends only as the fallback
 
 ### Delivery
 
@@ -812,6 +823,7 @@ Environment variables consumed by the job (see
 | `DATABASE_URL`              | PostgreSQL connection string (delivery idempotency + EPS observations); in CI, `127.0.0.1:5432` via Cloud SQL Auth Proxy |
 | `TARGET_TRADING_DATE`       | Manual override for `workflow_dispatch` backfills; defaults to today                         |
 | `REPORT_DRY_RUN`            | `true` → also print the report to stdout. Independent of `LINE_DELIVERY_MODE` — set that to `off` for a genuine preview-only run |
+| `REPORT_PREVIEW_DIR`        | Directory for the dry-run Flex preview files (default `flex_preview`) |
 | `LINE_DELIVERY_MODE`        | `off` (default) / `push` (single target) / `broadcast` (all OA friends)                      |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Required when `LINE_DELIVERY_MODE` is `push` or `broadcast`                                  |
 | `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` (local testing only; not configured in CI)      |

@@ -237,6 +237,7 @@ from app.domain.technical_signal_builder import (
 from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.chart_images import prepare_chart_heroes
 from app.reports.flex_builder import build_flex_carousels
+from app.reports.flex_preview import run_flex_preview
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -2226,6 +2227,12 @@ def _run_pipeline(
             )
             print("=" * 72)
             print()
+
+        # The text above is what production sends only as the FALLBACK
+        # (or when no stock qualified). The default message is the Flex
+        # carousel: preview it locally (PNG + JSON files; no upload, no
+        # LINE call). Never raises.
+        run_flex_preview(report_stocks, trading_date=target_date)
 
     # --- Step 8: LINE live delivery (real side effect — opt-in only) ---
     # off       -> no LINE call, no DB write (default)
