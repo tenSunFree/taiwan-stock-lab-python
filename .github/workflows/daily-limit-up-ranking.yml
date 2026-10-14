@@ -228,6 +228,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # K-line charts draw Traditional-Chinese text, which needs a CJK font
+      # the runner does not ship. Without one every chart fails to render
+      # (chart_render_failed) and the cards go out without a hero image —
+      # the push still succeeds, so a missing font would otherwise go
+      # unnoticed. This step only WARNS if no font is found; it never blocks
+      # the daily push.
+      - name: Install CJK font (K-line chart rendering, best effort)
+        id: cjk_font_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      - name: Check CJK font (never blocks the push)
+        shell: bash
+        run: |
+          if [[ "${{ steps.cjk_font_install.outcome }}" != "success" ]]; then
+            echo "::warning::CJK font install step failed"
+          fi
+          if fc-list :lang=zh-tw family | grep -q .; then
+            fc-list :lang=zh-tw family | sort -u | head -5
+          else
+            echo "::warning::no zh-tw font found; K-line charts will be skipped"
+          fi
+
       # NOTE: pytest is deliberately NOT run here — tests.yml already runs
       # the full suite on every push/PR to main, and this workflow only
       # ever runs code already on main.

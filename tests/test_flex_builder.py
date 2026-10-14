@@ -223,17 +223,46 @@ def test_high_five_day_return_flag_is_not_worded_as_overheated():
     assert "過熱" not in risk_line
 
 
-def test_unconfirmed_regulatory_status_is_shown():
+@pytest.mark.parametrize(
+    ("missing", "expected"),
+    [
+        (("is_managed",), "⚪ 全額交割狀態未確認"),
+        (("is_attention",), "⚪ 注意狀態未確認"),
+        (("is_disposition",), "⚪ 處置狀態未確認"),
+        (("is_attention", "is_managed"), "⚪ 注意／全額交割狀態未確認"),
+        (
+            ("is_managed", "is_disposition", "is_attention"),
+            "⚪ 注意／處置／全額交割狀態未確認",
+        ),
+    ],
+    ids=["managed", "attention", "disposition", "two", "all-in-display-order"],
+)
+def test_only_the_unconfirmed_regulatory_statuses_are_named(missing, expected):
     bubble = build_stock_bubble(
-        make_stock(risk_missing_inputs=("is_attention",)), total_shown=1, hero_url=URL
+        make_stock(risk_missing_inputs=missing), total_shown=1, hero_url=URL
     )
-    assert "⚪ 注意／處置／全額交割狀態未確認" in body_texts(bubble)
-    clean = build_stock_bubble(
+    rows = [t for t in body_texts(bubble) if t.endswith("狀態未確認")]
+    assert rows == [expected]
+
+
+def test_no_regulatory_line_when_those_statuses_are_confirmed():
+    bubble = build_stock_bubble(
         make_stock(risk_missing_inputs=("consecutive_limit_up_days",)),
         total_shown=1,
         hero_url=URL,
     )
-    assert "⚪ 注意／處置／全額交割狀態未確認" not in body_texts(clean)
+    assert not [t for t in body_texts(bubble) if t.endswith("狀態未確認")]
+
+
+def test_regulatory_wording_is_part_of_the_idempotency_fingerprint():
+    one = build_flex_carousels(
+        [make_stock(risk_missing_inputs=("is_managed",))], trading_date=DAY
+    )[0]
+    two = build_flex_carousels(
+        [make_stock(risk_missing_inputs=("is_attention", "is_managed"))],
+        trading_date=DAY,
+    )[0]
+    assert one.fingerprint != two.fingerprint
 
 
 # ---- carousel --------------------------------------------------------------

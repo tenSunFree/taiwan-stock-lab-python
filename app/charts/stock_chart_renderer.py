@@ -122,6 +122,9 @@ _CANDLE_BODY_WIDTH = 0.68
 _LIMIT_UP_BODY_WIDTH = 0.9  # today's limit-up bar is drawn a little wider
 _BADGE_PAD = 0.25  # boxstyle pad, in units of the badge font size
 
+_LEADER_COLOR = "#8A9099"  # badge -> bar leader line (muted, dashed)
+
+
 _TC_FONT_FAMILIES = (
     "Microsoft JhengHei",
     "PingFang TC",
@@ -549,14 +552,18 @@ def _render(report: ReportStockView, chart: StockChartData) -> Image.Image:
             + gap_px
         )
     # When today's high sits well below the badge row, a thin leader line ties
-    # the 漲停 badge to the bar it describes.
+    # the 漲停 badge to the bar it describes. It is a muted DASHED grey line,
+    # not the candle's red: a solid red line from the bar up to the badge row
+    # reads as an extremely long upper shadow (and crosses the y-axis
+    # gridlines up there), which is a price that never traded.
     if limit_up and (data_high - last.high) / price_per_px > 14:
         ax_price.vlines(
             count - 1,
             last.high,
             data_high + gap_px * price_per_px,
-            colors=_BADGE_LIMIT_UP,
-            linewidth=_pt(2.4),
+            colors=_LEADER_COLOR,
+            linestyles=(0, (3, 3)),
+            linewidth=_pt(1.6),
             zorder=4,
         )
 

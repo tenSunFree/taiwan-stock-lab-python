@@ -79,7 +79,15 @@ _RISK_FLAG_LABELS: dict[str, str] = {
     "HIGH_FIVE_DAY_RETURN": "近 5 日漲幅偏高",
 }
 _BASE_RISK_LABELS = ("追價風險", "開板風險")
-_REGULATORY_INPUTS = ("is_attention", "is_disposition", "is_managed")
+# risk input -> the short name shown when that status is unconfirmed. Order
+# is display order. Only the inputs that are actually missing are named: a
+# stock whose 注意/處置 status IS confirmed must not be shown as if it were not
+# just because 全額交割 has no data source.
+_REGULATORY_INPUT_LABELS: dict[str, str] = {
+    "is_attention": "注意",
+    "is_disposition": "處置",
+    "is_managed": "全額交割",
+}
 
 _COLOR_UP = "#D32F2F"  # Taiwan convention: red = up
 _COLOR_DOWN = "#2E7D32"
@@ -161,8 +169,13 @@ def _summary_rows(stock: ReportStockView, *, total_shown: int) -> list[_Row]:
         ),
         _Row("normal", f"資料完整度：{stock.data_completeness:.0%}"),
     ]
-    if any(name in stock.risk_missing_inputs for name in _REGULATORY_INPUTS):
-        rows.append(_Row("normal", "⚪ 注意／處置／全額交割狀態未確認"))
+    unconfirmed = [
+        label
+        for name, label in _REGULATORY_INPUT_LABELS.items()
+        if name in stock.risk_missing_inputs
+    ]
+    if unconfirmed:
+        rows.append(_Row("normal", f"⚪ {'／'.join(unconfirmed)}狀態未確認"))
     rows.append(_Row("risk", "⚠️ " + "／".join(_risk_labels(stock))))
     return rows
 

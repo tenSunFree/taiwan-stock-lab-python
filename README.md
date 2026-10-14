@@ -636,6 +636,52 @@ available.
 
 ---
 
+
+### Chart image hosting (GCS)
+
+The Flex carousel's K-line hero images are PNGs hosted in a **public,
+dedicated Google Cloud Storage bucket** (LINE fetches them over HTTPS).
+Hosting is off until `CHART_GCS_BUCKET` is set; without it every card is
+sent without a hero image (the push still succeeds).
+
+One-time setup (replace the bucket name with your own — names are global):
+
+```bash
+gcloud config set project travel-audio-guide-508205
+gcloud storage buckets create gs://taiwan-stock-lab-charts-508205 \
+  --location=asia-east1 --uniform-bucket-level-access
+# anyone may READ the (non-sensitive, hash-named) chart images
+gcloud storage buckets add-iam-policy-binding gs://taiwan-stock-lab-charts-508205 \
+  --member=allUsers --role=roles/storage.objectViewer
+# the pipeline's service account may only CREATE objects (never overwrite/delete)
+gcloud storage buckets add-iam-policy-binding gs://taiwan-stock-lab-charts-508205 \
+  --member=serviceAccount:github-taiwan-stock-lab@travel-audio-guide-508205.iam.gserviceaccount.com \
+  --role=roles/storage.objectCreator
+```
+
+Then set the repository **variable** (not a secret — the bucket name is
+visible in every image URL) `CHART_GCS_BUCKET` under Settings → Secrets and
+variables → Actions → Variables. If `allUsers` is rejected, an organization
+policy (public access prevention) is blocking public buckets.
+
+Verify with the real bucket, as the real identity: run the manual workflow
+**chart-hosting-smoke** (Actions tab → Run workflow, on `main`). It uploads
+a small PNG, re-uploads it (must report "already existed"), then fetches
+the public URL anonymously and checks HTTP 200, `image/png`, an `immutable`
+`Cache-Control`, and byte-for-byte equality. Locally the same check is
+`python -m app.storage.smoke` with `CHART_GCS_BUCKET` set and Application
+Default Credentials available (`gcloud auth application-default login`,
+plus `GOOGLE_CLOUD_PROJECT`). Each run leaves one small
+`charts/.../SMOKE_*` object; the pipeline account cannot delete it, so remove it
+manually as an admin. Do NOT add a short-TTL lifecycle rule to `charts/`:
+production images share that prefix, and old LINE cards would lose their
+images.
+
+The chart text needs a Traditional-Chinese capable font: both workflows
+install `fonts-noto-cjk` on the runner; locally Microsoft JhengHei (Windows)
+or PingFang TC (macOS) is picked up automatically, or point `CHART_FONT_PATH`
+(and optionally `CHART_FONT_BOLD_PATH`) at a `.ttf`/`.otf` file.
+
 ## Roadmap
 
 - **Phase 6** — Multi-recipient subscriber management: today's
@@ -824,6 +870,9 @@ Environment variables consumed by the job (see
 | `TARGET_TRADING_DATE`       | Manual override for `workflow_dispatch` backfills; defaults to today                         |
 | `REPORT_DRY_RUN`            | `true` → also print the report to stdout. Independent of `LINE_DELIVERY_MODE` — set that to `off` for a genuine preview-only run |
 | `REPORT_PREVIEW_DIR`        | Directory for the dry-run Flex preview files (default `flex_preview`) |
+| `CHART_GCS_BUCKET`          | GCS bucket for the Flex K-line images. Empty/unset → cards are sent without a hero image (repository **variable**, not a secret) |
+| `CHART_PUBLIC_BASE_URL`     | Optional public base URL for the images (CDN / custom domain); default `https://storage.googleapis.com/<bucket>` |
+| `CHART_FONT_PATH`           | Optional `.ttf`/`.otf` used for chart text instead of the auto-detected CJK font (`CHART_FONT_BOLD_PATH` for the bold face) |
 | `LINE_DELIVERY_MODE`        | `off` (default) / `push` (single target) / `broadcast` (all OA friends)                      |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Required when `LINE_DELIVERY_MODE` is `push` or `broadcast`                                  |
 | `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` (local testing only; not configured in CI)      |

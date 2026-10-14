@@ -3244,7 +3244,7 @@ def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
     assert render_stock_chart_png(view).startswith(b"\x89PNG")
 
 
-# --- Flex carousel delivery (flex-v1) + text fallback (text-v16) ------------
+# --- Flex carousel delivery (flex-v2) + text fallback (text-v16) ------------
 
 
 def _flex_run(
@@ -3356,10 +3356,10 @@ def _report_stock():
 HERO_URL = "https://storage.googleapis.com/b/charts/2026/08/07/6150_20260807_abcd.png"
 
 
-def test_message_versions_are_flex_v1_and_text_v16():
+def test_message_versions_are_flex_v2_and_text_v16():
     from app.jobs.daily_ranking import MESSAGE_VERSION, TEXT_MESSAGE_VERSION
 
-    assert MESSAGE_VERSION == "flex-v1"
+    assert MESSAGE_VERSION == "flex-v2"
     assert TEXT_MESSAGE_VERSION == "text-v16"
 
 
@@ -3385,7 +3385,7 @@ def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_pa
     assert bubble["hero"]["url"] == HERO_URL
     assert bubble["hero"]["action"] == {"type": "uri", "uri": HERO_URL}
     assert [r.message_version for r in session.query(MessageDelivery).all()] == [
-        "flex-v1:p01-of-01"
+        "flex-v2:p01-of-01"
     ]
 
 

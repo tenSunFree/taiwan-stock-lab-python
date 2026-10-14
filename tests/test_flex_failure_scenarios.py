@@ -113,7 +113,7 @@ def test_an_invalid_bucket_name_disables_images_but_not_the_card(monkeypatch, ca
             target_date=__import__("datetime").date(2026, 8, 7),
             chart_uploader=None,
         )
-    assert version == "flex-v1"
+    assert version == "flex-v2"
     bubble = messages[0].payload["contents"]["contents"][0]
     assert "hero" not in bubble
     assert "image_upload_failed" in caplog.text
@@ -201,8 +201,8 @@ def test_second_carousel_failing_is_resumed_without_resending_the_first(
 
     rows = {r.message_version: r.status for r in session.query(MessageDelivery).all()}
     assert rows == {
-        "flex-v1:p01-of-02": "SUCCESS",
-        "flex-v1:p02-of-02": "FAILED",
+        "flex-v2:p01-of-02": "SUCCESS",
+        "flex-v2:p02-of-02": "FAILED",
     }
 
     resent: list[int] = []
@@ -237,7 +237,7 @@ def test_line_5xx_fails_the_run_and_does_not_fall_back_to_text(
 
     assert result == 1
     assert "line_send_failed report_date=2026-08-07" in caplog.text
-    assert "message_version=flex-v1" in caplog.text
+    assert "message_version=flex-v2" in caplog.text
     # every attempt was the SAME Flex message; nothing was re-sent as text
     assert bodies and all(b["messages"][0]["type"] == "flex" for b in bodies)
     assert [r.status for r in session.query(MessageDelivery).all()] == ["FAILED"]

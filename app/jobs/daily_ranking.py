@@ -525,7 +525,13 @@ STRATEGY_VERSION = "rule-v1.2.0"
 #   Flex cannot be built            -> plain-text report (TEXT_MESSAGE_VERSION)
 # A LINE send failure is NOT swallowed into a fallback: it fails the run
 # so the next scheduled attempt retries the same idempotent delivery.
-MESSAGE_VERSION = "flex-v1"
+#
+# flex-v2: the Flex bubble's regulatory-status line names only the statuses
+# that are actually unconfirmed (e.g. "⚪ 全額交割狀態未確認") instead of
+# always printing "注意／處置／全額交割狀態未確認" — a stock whose 注意/處置
+# status was confirmed was shown as less certain than the text report says.
+# Visible wording change -> new version (flex-v1 rows can never collide).
+MESSAGE_VERSION = "flex-v2"
 TEXT_MESSAGE_VERSION = "text-v16"
 
 # CRITICAL for delivery idempotency: the same
@@ -1411,7 +1417,7 @@ def build_outbound_messages(
 ) -> tuple[list[OutboundMessage], str]:
     """The messages to deliver and the message_version they go out under.
 
-    Qualified stocks -> a Flex carousel (flex-v1). Anything that stops the
+    Qualified stocks -> a Flex carousel (flex-v2). Anything that stops the
     carousel from being built -> the plain-text report (text-v16). A
     stock-level chart problem never gets here: prepare_chart_heroes only
     drops that stock's hero image. No qualified stock -> the text
