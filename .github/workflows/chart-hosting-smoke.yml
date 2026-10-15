@@ -1,0 +1,53 @@
+name: chart-hosting-smoke
+
+# Manual, read-the-result check of the REAL chart image bucket, run as the
+# SAME identity the daily job uses (Workload Identity Federation -> the
+# pipeline's service account). It answers what a local run cannot:
+# does THAT service account have storage.objectCreator on the bucket, and is
+# the bucket publicly readable? Nothing is sent to LINE and no database is
+# touched. Run it after creating the bucket / granting IAM / setting the
+# CHART_GCS_BUCKET repository variable (see README, "Chart image hosting").
+#
+# Side effect: one small object under charts/YYYY/MM/DD/SMOKE_* per run.
+
+on:
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: travel-audio-guide-508205
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/1088235476550/locations/global/workloadIdentityPools/github/providers/taiwan-stock-lab
+  GCP_SERVICE_ACCOUNT: github-taiwan-stock-lab@travel-audio-guide-508205.iam.gserviceaccount.com
+
+jobs:
+  smoke:
+    name: Smoke-test chart image hosting
+    # Like the daily job: the production identity only ever runs from main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Smoke test (upload, idempotent re-upload, anonymous GET)
+        env:
+          CHART_GCS_BUCKET: ${{ vars.CHART_GCS_BUCKET }}
+        run: python -m app.storage.smoke

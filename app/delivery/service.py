@@ -36,6 +36,7 @@ rerun, correctly SKIPs parts 1-2 and only (re)sends part 3.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 from typing import Callable
 from uuid import UUID
 
@@ -44,6 +45,7 @@ from app.clients.line_client import (
     LineNonRetryableError,
     LinePushError,
     LinePushResult,
+    build_flex_message,
 )
 from app.db.delivery_repository import DeliveryRepository
 
@@ -59,6 +61,38 @@ from app.db.delivery_repository import DeliveryRepository
 # a deliberate scope decision, not a bug — see the module docstring
 # above.
 BROADCAST_DELIVERY_SCOPE = "line:broadcast:all-friends:v1"
+
+
+@dataclass(frozen=True)
+class OutboundMessage:
+    """One LINE message plus the string its idempotency hash covers.
+
+    `payload` is the LINE message object that is actually sent.
+    `fingerprint` is what DeliveryRepository hashes (message_hash) to
+    detect "same idempotency key, different content". For a text
+    message the two are the same text. For a Flex message the
+    fingerprint deliberately EXCLUDES volatile presentation that can
+    legitimately differ between two runs of the same day's data — e.g.
+    the hosted image URLs (a chart that could be drawn in the first run
+    but not in the rerun must not turn a harmless rerun into a
+    DeliveryContentConflict). It still covers everything that carries
+    meaning (stocks, scores, signals, wording); see
+    app.reports.flex_builder for exactly what goes into it.
+    """
+
+    payload: dict
+    fingerprint: str
+
+    @staticmethod
+    def text(text: str) -> "OutboundMessage":
+        return OutboundMessage(payload={"type": "text", "text": text}, fingerprint=text)
+
+    @staticmethod
+    def flex(*, alt_text: str, contents: dict, fingerprint: str) -> "OutboundMessage":
+        return OutboundMessage(
+            payload=build_flex_message(alt_text=alt_text, contents=contents),
+            fingerprint=fingerprint,
+        )
 
 
 def build_message_part_version(
@@ -204,6 +238,76 @@ class DeliveryService:
                     strategy_version=strategy_version,
                     message_version=part_version,
                     message=message,
+                )
+            )
+        return results
+
+    def deliver_messages(
+        self,
+        *,
+        trading_date: dt.date,
+        strategy_version: str,
+        target_id: str,
+        message_version: str,
+        messages: list[OutboundMessage],
+    ) -> list[str]:
+        """deliver_many() for arbitrary LINE message objects (Flex, text).
+
+        Same per-part idempotency identity and fail-fast behaviour as
+        deliver_many(); the only difference is that each part is sent as
+        its `payload` and its DB content hash covers `fingerprint`.
+        """
+        part_count = len(messages)
+        results = []
+        for index, message in enumerate(messages, start=1):
+            results.append(
+                self._deliver(
+                    trading_date=trading_date,
+                    strategy_version=strategy_version,
+                    delivery_scope=target_id,
+                    message_version=build_message_part_version(
+                        base_version=message_version,
+                        part_index=index,
+                        part_count=part_count,
+                    ),
+                    message=message.fingerprint,
+                    send=lambda retry_key, m=message: self.line_client.push_messages(
+                        target_id=target_id,
+                        messages=[m.payload],
+                        retry_key=retry_key,
+                    ),
+                )
+            )
+        return results
+
+    def deliver_broadcast_messages(
+        self,
+        *,
+        trading_date: dt.date,
+        strategy_version: str,
+        message_version: str,
+        messages: list[OutboundMessage],
+    ) -> list[str]:
+        """Broadcast sibling of deliver_messages()."""
+        part_count = len(messages)
+        results = []
+        for index, message in enumerate(messages, start=1):
+            results.append(
+                self._deliver(
+                    trading_date=trading_date,
+                    strategy_version=strategy_version,
+                    delivery_scope=BROADCAST_DELIVERY_SCOPE,
+                    message_version=build_message_part_version(
+                        base_version=message_version,
+                        part_index=index,
+                        part_count=part_count,
+                    ),
+                    message=message.fingerprint,
+                    send=lambda retry_key, m=message: (
+                        self.line_client.broadcast_messages(
+                            messages=[m.payload], retry_key=retry_key
+                        )
+                    ),
                 )
             )
         return results

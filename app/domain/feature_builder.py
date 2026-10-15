@@ -35,10 +35,32 @@ TRAILING_WINDOW = 20
 
 @dataclass(frozen=True)
 class HistoricalPricePoint:
+    """One historical trading session.
+
+    open/high/low are OPTIONAL (default None) on purpose:
+
+    * The volume/turnover/return features in this module only need
+      close/volume/turnover. A row whose provider omitted open/max/min is
+      still perfectly usable for them, so the mapper keeps such rows
+      instead of dropping them (dropping would silently change existing
+      feature values).
+    * Consumers that DO need the full candle (app.domain.price_structure's
+      20-day High/Low range, the K-line chart) treat a missing
+      open/high/low as "cannot be computed" and fail closed — they never
+      substitute close for a missing high/low.
+
+    All prices on one point share one basis (FinMind TaiwanStockPrice,
+    i.e. NOT ex-rights/dividend adjusted); candles, MAs and the 20-day
+    range must therefore all be derived from the same list of points.
+    """
+
     trading_date: dt.date
     close: float
     volume: float
     turnover: float
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
 
 
 @dataclass(frozen=True)

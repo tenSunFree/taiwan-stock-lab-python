@@ -36,16 +36,20 @@ on:
         default: true
         type: boolean
       delivery_mode:
-        description: "LINE delivery mode when dry_run=false (broadcast = send to every OA friend)"
+        description: "LINE delivery mode when dry_run=false (push = ONLY the LINE_TARGET_ID user, for testing; broadcast = send to every OA friend)"
         required: true
         default: "off"
         type: choice
-        # "push" is deliberately NOT offered: this repo has no
-        # LINE_TARGET_ID secret (broadcast-only delivery), and
-        # daily_ranking.py exits 1 if LINE_DELIVERY_MODE=push is
-        # selected without one.
+        # "push" sends to ONE target only (the LINE_TARGET_ID secret):
+        # a real end-to-end test (real chart upload, real Flex, real LINE)
+        # that does not notify every friend. daily_ranking.py exits 1 if
+        # push is selected while LINE_TARGET_ID is missing. A manual push
+        # run never counts as "already delivered" for the scheduled
+        # broadcast: the `gate` job only looks at scheduled runs, and the
+        # delivery idempotency key includes the target.
         options:
           - "off"
+          - push
           - broadcast
 
 # Nothing granted at the workflow level; each job below requests only
@@ -228,6 +232,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # K-line charts draw Traditional-Chinese text, which needs a CJK font
+      # the runner does not ship. Without one every chart fails to render
+      # (chart_render_failed) and the cards go out without a hero image —
+      # the push still succeeds, so a missing font would otherwise go
+      # unnoticed. This step only WARNS if no font is found; it never blocks
+      # the daily push.
+      - name: Install CJK font (K-line chart rendering, best effort)
+        id: cjk_font_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      - name: Check CJK font (never blocks the push)
+        shell: bash
+        run: |
+          if [[ "${{ steps.cjk_font_install.outcome }}" != "success" ]]; then
+            echo "::warning::CJK font install step failed"
+          fi
+          if fc-list :lang=zh-tw family | grep -q .; then
+            fc-list :lang=zh-tw family | sort -u | head -5
+          else
+            echo "::warning::no zh-tw font found; K-line charts will be skipped"
+          fi
+
       # NOTE: pytest is deliberately NOT run here — tests.yml already runs
       # the full suite on every push/PR to main, and this workflow only
       # ever runs code already on main.
@@ -346,6 +376,14 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          # Only read when delivery_mode=push (manual test to ONE user).
+          LINE_TARGET_ID: ${{ secrets.LINE_TARGET_ID }}
+          # K-line chart hosting (public GCS bucket). A repository
+          # VARIABLE (not a secret: the bucket name is public in every
+          # image URL). Empty/unset -> hosting disabled, cards are sent
+          # without a hero image. Credentials come from the WIF auth step
+          # above (ADC); the SA only needs roles/storage.objectCreator.
+          CHART_GCS_BUCKET: ${{ vars.CHART_GCS_BUCKET }}
           # Scheduled: the date pinned by `gate` from created_at.
           # Manual: the trading_date input (empty -> today in Taipei).
           TARGET_TRADING_DATE: ${{ github.event_name == 'schedule' && needs.gate.outputs.trading_date || github.event.inputs.trading_date }}

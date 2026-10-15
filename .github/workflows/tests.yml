@@ -21,5 +21,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # The K-line chart tests draw real Traditional-Chinese text; the
+      # runner has no CJK font by default. test_ci_has_cjk_font fails loudly
+      # if this step is ever removed (instead of ~25 rendering tests
+      # silently skipping).
+      - name: Install CJK font (chart rendering tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+          fc-list :lang=zh-tw family | sort -u | head -5
+
       - name: Run tests
         run: pytest -v

@@ -288,3 +288,50 @@ def test_total_score_formula_is_unchanged_by_relative_score_metadata():
             available_weight += weight
         expected_total_score = round(weighted_sum / available_weight, 2)
         assert stock.total_score == pytest.approx(expected_total_score)
+
+
+# --- ScoredStock.momentum_overheated_status (Domain-owned decision) -----------
+
+
+def _scored(**kw):
+    from app.domain.scoring import ScoredStock
+
+    fields = dict(
+        stock_id="1101",
+        total_score=50.0,
+        data_completeness=1.0,
+        factor_scores={"momentum": 10.0},
+        risk_flags=("HIGH_FIVE_DAY_RETURN",),
+    )
+    fields.update(kw)
+    return ScoredStock(**fields)
+
+
+def test_scored_stock_momentum_overheated_true():
+    from app.domain.signal_status import SignalStatus
+
+    assert _scored().momentum_overheated_status is SignalStatus.TRUE
+
+
+def test_scored_stock_momentum_overheated_false_when_score_is_decent():
+    from app.domain.signal_status import SignalStatus
+
+    stock = _scored(factor_scores={"momentum": 85.0})
+    assert stock.momentum_overheated_status is SignalStatus.FALSE
+
+
+def test_scored_stock_momentum_overheated_false_without_the_risk_flag():
+    from app.domain.signal_status import SignalStatus
+
+    assert _scored(risk_flags=()).momentum_overheated_status is SignalStatus.FALSE
+
+
+def test_scored_stock_momentum_overheated_insufficient_without_a_momentum_score():
+    from app.domain.signal_status import SignalStatus
+
+    stock = _scored(factor_scores={"momentum": None})
+    assert stock.momentum_overheated_status is SignalStatus.INSUFFICIENT_DATA
+    assert (
+        _scored(factor_scores={}).momentum_overheated_status
+        is SignalStatus.INSUFFICIENT_DATA
+    )

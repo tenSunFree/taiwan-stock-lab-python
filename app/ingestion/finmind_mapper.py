@@ -290,12 +290,24 @@ def build_historical_price_points(
         if close is None or volume is None or turnover is None:
             continue
 
+        # open/max/min are carried through when FinMind supplied them,
+        # but a row missing them is NOT dropped: close/volume/turnover
+        # alone are enough for every existing feature. Consumers that
+        # need a full candle (price_structure, chart) fail closed on
+        # None — see HistoricalPricePoint's docstring.
+        open_price = _to_decimal(row.get("open"), zero_is_missing=True)
+        high_price = _to_decimal(row.get("max"), zero_is_missing=True)
+        low_price = _to_decimal(row.get("min"), zero_is_missing=True)
+
         result.append(
             HistoricalPricePoint(
                 trading_date=trading_date,
                 close=float(close),
                 volume=float(volume),
                 turnover=float(turnover),
+                open=float(open_price) if open_price is not None else None,
+                high=float(high_price) if high_price is not None else None,
+                low=float(low_price) if low_price is not None else None,
             )
         )
 

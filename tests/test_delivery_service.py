@@ -406,3 +406,148 @@ def test_deliver_many_and_deliver_broadcast_many_parts_are_independent(session):
     assert push_results == ["SUCCESS", "SUCCESS"]
     assert broadcast_results == ["SUCCESS", "SUCCESS"]
     assert len(call_log) == 4  # all four actually called LINE, none skipped
+
+
+# --- deliver_messages / deliver_broadcast_messages (Flex + fingerprint) -----
+
+import json  # noqa: E402
+
+from app.clients.idempotency import create_message_hash  # noqa: E402
+from app.db.delivery_repository import DeliveryContentConflict  # noqa: E402
+from app.delivery.service import OutboundMessage  # noqa: E402
+
+
+def flex_message(*, hero: str | None, fingerprint: str = "fp-1") -> OutboundMessage:
+    bubble = {"type": "bubble"}
+    if hero:
+        bubble["hero"] = {"type": "image", "url": hero}
+    return OutboundMessage.flex(
+        alt_text="alt",
+        contents={"type": "carousel", "contents": [bubble]},
+        fingerprint=fingerprint,
+    )
+
+
+def recording_service(session):
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, headers={"x-line-request-id": f"req-{len(bodies)}"})
+
+    return make_service(session, handler), bodies
+
+
+def test_outbound_text_message_is_its_own_fingerprint():
+    message = OutboundMessage.text("hello")
+    assert message.payload == {"type": "text", "text": "hello"}
+    assert message.fingerprint == "hello"
+
+
+def test_deliver_broadcast_messages_sends_flex_payload_with_part_version(session):
+    service, bodies = recording_service(session)
+    results = service.deliver_broadcast_messages(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        message_version="flex-v1",
+        messages=[flex_message(hero="https://img/a.png")],
+    )
+
+    assert results == ["SUCCESS"]
+    assert bodies[0]["messages"][0]["type"] == "flex"
+    assert "to" not in bodies[0]
+    row = session.query(MessageDelivery).one()
+    assert row.message_version == "flex-v1:p01-of-01"
+    assert row.message_hash == create_message_hash("fp-1")
+
+
+def test_deliver_messages_pushes_to_the_target(session):
+    service, bodies = recording_service(session)
+    service.deliver_messages(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        target_id="U123",
+        message_version="flex-v1",
+        messages=[flex_message(hero=None)],
+    )
+    assert bodies[0]["to"] == "U123"
+
+
+def test_rerun_with_different_hero_urls_is_skipped_not_a_content_conflict(session):
+    """The whole point of the fingerprint: a chart that is hosted under a
+    different URL (or missing) on the rerun is the same delivery."""
+    service, bodies = recording_service(session)
+    kwargs = dict(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        message_version="flex-v1",
+    )
+    service.deliver_broadcast_messages(
+        messages=[flex_message(hero="https://img/a.png")], **kwargs
+    )
+    second = service.deliver_broadcast_messages(
+        messages=[flex_message(hero=None)], **kwargs
+    )
+    assert second == ["SKIPPED_ALREADY_SENT"]
+    assert len(bodies) == 1
+
+
+def test_changed_content_under_the_same_version_is_still_a_conflict(session):
+    service, _ = recording_service(session)
+    kwargs = dict(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        message_version="flex-v1",
+    )
+    service.deliver_broadcast_messages(
+        messages=[flex_message(hero=None, fingerprint="fp-1")], **kwargs
+    )
+    with pytest.raises(DeliveryContentConflict):
+        service.deliver_broadcast_messages(
+            messages=[flex_message(hero=None, fingerprint="fp-2")], **kwargs
+        )
+
+
+def test_failed_flex_send_is_retried_on_rerun_with_the_same_retry_key(session):
+    keys = []
+    state = {"fail": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers["X-Line-Retry-Key"])
+        if state["fail"]:
+            return httpx.Response(400, text="bad")
+        return httpx.Response(200)
+
+    service = make_service(session, handler)
+    kwargs = dict(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        message_version="flex-v1",
+        messages=[flex_message(hero=None)],
+    )
+    with pytest.raises(LineNonRetryableError):
+        service.deliver_broadcast_messages(**kwargs)
+    state["fail"] = False
+    assert service.deliver_broadcast_messages(**kwargs) == ["SUCCESS"]
+    assert keys[0] == keys[1]  # same persisted retry key
+
+
+def test_text_messages_via_deliver_messages_match_deliver_many_hashes(session):
+    service, _ = recording_service(session)
+    service.deliver_broadcast_messages(
+        trading_date=TRADING_DATE,
+        strategy_version="rule-v1.2.0",
+        message_version="text-v16",
+        messages=[OutboundMessage.text("one"), OutboundMessage.text("two")],
+    )
+    rows = (
+        session.query(MessageDelivery).order_by(MessageDelivery.message_version).all()
+    )
+    assert [r.message_version for r in rows] == [
+        "text-v16:p01-of-02",
+        "text-v16:p02-of-02",
+    ]
+    assert [r.message_hash for r in rows] == [
+        create_message_hash("one"),
+        create_message_hash("two"),
+    ]

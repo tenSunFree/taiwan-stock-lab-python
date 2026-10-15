@@ -386,3 +386,49 @@ def test_build_monthly_revenue_points_ignores_other_stock_rows():
         },
     ]
     assert build_monthly_revenue_points(rows, expected_stock_id="1101") == []
+
+
+# --- OHLC carried into HistoricalPricePoint (K-line chart) -------------------
+
+
+def test_historical_points_carry_open_high_low_when_finmind_supplies_them():
+    from app.ingestion.finmind_mapper import build_historical_price_points
+
+    rows = [
+        {
+            "date": "2026-08-26",
+            "open": 10.0,
+            "max": 11.5,
+            "min": 9.8,
+            "close": 11.0,
+            "Trading_Volume": 1000,
+            "Trading_money": 11000,
+        }
+    ]
+    (point,) = build_historical_price_points(rows)
+    assert (point.open, point.high, point.low, point.close) == (10.0, 11.5, 9.8, 11.0)
+
+
+def test_historical_points_without_ohlc_are_kept_with_none_not_dropped():
+    from app.ingestion.finmind_mapper import build_historical_price_points
+
+    rows = [
+        {
+            "date": "2026-08-26",
+            "close": 11.0,
+            "Trading_Volume": 1000,
+            "Trading_money": 11000,
+        },
+        {  # FinMind's "no announced price" zero must not become a 0 high/low
+            "date": "2026-08-27",
+            "open": 0,
+            "max": 0,
+            "min": 0,
+            "close": 11.0,
+            "Trading_Volume": 1000,
+            "Trading_money": 11000,
+        },
+    ]
+    points = build_historical_price_points(rows)
+    assert len(points) == 2  # still usable for volume/return features
+    assert all(p.open is None and p.high is None and p.low is None for p in points)

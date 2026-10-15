@@ -208,13 +208,14 @@ import sys
 from decimal import Decimal
 
 from app.domain.candidate_builder import Candidate, CandidateBuilder
+from app.domain.chart_data import build_stock_chart_data, today_point_from_daily_price
 from app.domain.feature_builder import build_price_features
 from app.domain.features import StockFeatures
 from app.clients.line_client import LineMessagingClient
 from app.db.delivery_repository import DeliveryRepository
 from app.db.eps_observation_repository import EpsObservationRepository
 from app.db.models import EpsCumulativeObservation, IngestionRun, MessageDelivery
-from app.delivery.service import DeliveryService
+from app.delivery.service import DeliveryService, OutboundMessage
 from app.domain.eps_growth_builder import build_eps_growth_sustained_signal
 from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_positive,
@@ -234,6 +235,9 @@ from app.domain.technical_signal_builder import (
     build_low_with_rising_signal,
 )
 from app.domain.valuation_filter import filter_candidates_by_pe
+from app.reports.chart_images import prepare_chart_heroes
+from app.reports.flex_builder import build_flex_carousels
+from app.reports.flex_preview import run_flex_preview
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
     MAX_LINE_TEXT_UTF16_UNITS,
@@ -281,6 +285,10 @@ from app.ingestion.twse_regulatory_mapper import (
     build_twse_disposition_statuses,
 )
 from app.ingestion.valuation_mapper import build_tpex_valuations, build_twse_valuations
+from app.storage.chart_image_uploader import (
+    ChartImageUploader,
+    build_uploader_from_env,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -496,7 +504,35 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # render_daily_report()/render_daily_report_messages() and
 # render_no_qualified_stock_report(). The "📌 功能進度" checklist is
 # unchanged. No scoring, ranking, or signal logic changed.
-MESSAGE_VERSION = "text-v15"
+#
+# text-v16: the "📌 功能進度" checklist line changes from "⬜ 日K線圖" to
+# "✅ 日K線圖" in every text report variant (the K-line chart feature
+# shipped). Visible content change -> new version. The text report is now
+# the FALLBACK / no-qualified-stock message; it is sent under
+# TEXT_MESSAGE_VERSION below.
+#
+# flex-v1: the daily report's default shape changes from plain text to a
+# LINE Flex CAROUSEL (one bubble per stock: K-line hero image, quantified
+# summary, three-state signals, risk line, disclaimer footer — see
+# app.reports.flex_builder). A different message shape -> new
+# MESSAGE_VERSION, so no old text-v15 delivery record can collide with
+# it. Each carousel is one delivery part; its DB content hash covers the
+# Flex builder's fingerprint, which excludes the hosted image URLs (see
+# app.delivery.service.OutboundMessage).
+#
+# Fallback ladder (each level only when the one above cannot be built):
+#   chart cannot be drawn/uploaded  -> that stock's bubble has no hero
+#   Flex cannot be built            -> plain-text report (TEXT_MESSAGE_VERSION)
+# A LINE send failure is NOT swallowed into a fallback: it fails the run
+# so the next scheduled attempt retries the same idempotent delivery.
+#
+# flex-v2: the Flex bubble's regulatory-status line names only the statuses
+# that are actually unconfirmed (e.g. "⚪ 全額交割狀態未確認") instead of
+# always printing "注意／處置／全額交割狀態未確認" — a stock whose 注意/處置
+# status was confirmed was shown as less certain than the text report says.
+# Visible wording change -> new version (flex-v1 rows can never collide).
+MESSAGE_VERSION = "flex-v2"
+TEXT_MESSAGE_VERSION = "text-v16"
 
 # CRITICAL for delivery idempotency: the same
 # trading_date + strategy_version + target + message_version MUST
@@ -508,10 +544,21 @@ MESSAGE_VERSION = "text-v15"
 # instead.
 DATA_UPDATED_LABEL = "收盤後"
 
-# Retrieval buffer only — historical factors still use the trailing
-# 5/20 actual trading-day observations; 60 calendar days simply gives
-# FinMind enough room to cover weekends and market holidays.
-HISTORY_LOOKBACK_CALENDAR_DAYS = 60
+# Retrieval buffers only — the real windows are counted in trading
+# sessions, these calendar spans just give FinMind enough room to cover
+# weekends and market holidays.
+#
+# PRICE history feeds the 5/20-session factors AND the K-line chart,
+# which needs up to 120 sessions (60 displayed + MA60 warm-up): 200
+# calendar days ~= 135-140 sessions after weekends/holidays. It is the
+# SAME request as before (one FinMind call per candidate) — only the
+# date range is wider; FinMind already returns open/max/min in it.
+PRICE_HISTORY_LOOKBACK_CALENDAR_DAYS = 200
+
+# INSTITUTIONAL flow keeps its original 60-day window: it only needs the
+# trailing 5 sessions, so widening it together with the price window
+# would just download ~3x more rows per candidate for nothing.
+INSTITUTIONAL_LOOKBACK_CALENDAR_DAYS = 60
 
 # Retrieval buffer only. ~18 months ensures the response normally
 # contains both the latest disclosed revenue month and the same
@@ -816,7 +863,12 @@ def build_stock_features(
         logger.info("No candidates require enrichment")
         return []
 
-    history_start_date = target_date - dt.timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
+    price_history_start_date = target_date - dt.timedelta(
+        days=PRICE_HISTORY_LOOKBACK_CALENDAR_DAYS
+    )
+    institutional_start_date = target_date - dt.timedelta(
+        days=INSTITUTIONAL_LOOKBACK_CALENDAR_DAYS
+    )
     history_end_date = target_date - dt.timedelta(days=1)
 
     revenue_start_date = target_date - dt.timedelta(days=REVENUE_LOOKBACK_CALENDAR_DAYS)
@@ -876,12 +928,17 @@ def build_stock_features(
         # computed by CandidateBuilder, never recomputed) — still no
         # second FinMind call, still shares this block's try/except.
         technical_low_first_limit_up_signal = None
+        # K-line series for the LINE chart (display-only, never scored).
+        # Built from the SAME history_points as the signals above, plus
+        # today's official TWSE/TPEx candle, so the chart's High/Low
+        # range and the 低檔首板 signal share one price basis.
+        chart_data = None
 
         try:
             history_payload = finmind_client.fetch_stock_price_history(
                 ingestion_run_id=ingestion_run_id,
                 stock_id=stock_id,
-                start_date=history_start_date,
+                start_date=price_history_start_date,
                 end_date=history_end_date,
                 target_date=target_date,
             )
@@ -923,6 +980,31 @@ def build_stock_features(
                 )
                 price_success_count += 1
 
+                # Own try/except (same independence policy as the
+                # blocks below): a chart-assembly failure must never
+                # clear the price factors/signals computed above.
+                try:
+                    today_point = today_point_from_daily_price(candidate.price)
+                    if today_point is not None:
+                        chart_data = build_stock_chart_data(
+                            history=history_points, today=today_point
+                        )
+                    if chart_data is None:
+                        logger.warning(
+                            "chart_data_unavailable stock_id=%s report_date=%s "
+                            "today_candle_complete=%s",
+                            stock_id,
+                            target_date,
+                            today_point is not None,
+                        )
+                except Exception:
+                    chart_data = None
+                    logger.exception(
+                        "chart_data_failed stock_id=%s report_date=%s",
+                        stock_id,
+                        target_date,
+                    )
+
         except Exception:
             price_failure_count += 1
             logger.exception(
@@ -955,7 +1037,7 @@ def build_stock_features(
             institutional_payload = finmind_client.fetch_stock_institutional_investors(
                 ingestion_run_id=ingestion_run_id,
                 stock_id=stock_id,
-                start_date=history_start_date,
+                start_date=institutional_start_date,
                 end_date=history_end_date,
                 target_date=target_date,
             )
@@ -1210,6 +1292,7 @@ def build_stock_features(
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             institutional_data_cutoff=institutional_data_cutoff,
+            chart_data=chart_data,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             technical_low_first_limit_up_signal=technical_low_first_limit_up_signal,
             revenue_yoy=revenue_yoy,
@@ -1325,6 +1408,53 @@ def _validate_shared_repository(
             )
 
 
+def build_outbound_messages(
+    *,
+    report_stocks: list,
+    report_messages: list[str],
+    target_date: dt.date,
+    chart_uploader: ChartImageUploader | None,
+) -> tuple[list[OutboundMessage], str]:
+    """The messages to deliver and the message_version they go out under.
+
+    Qualified stocks -> a Flex carousel (flex-v2). Anything that stops the
+    carousel from being built -> the plain-text report (text-v16). A
+    stock-level chart problem never gets here: prepare_chart_heroes only
+    drops that stock's hero image. No qualified stock -> the text
+    "nothing today" report, as before.
+    """
+    text_messages = [OutboundMessage.text(text) for text in report_messages]
+    if not report_stocks:
+        return text_messages, TEXT_MESSAGE_VERSION
+
+    try:
+        uploader = (
+            chart_uploader if chart_uploader is not None else build_uploader_from_env()
+        )
+        hero_urls = prepare_chart_heroes(
+            report_stocks, trading_date=target_date, uploader=uploader
+        )
+        carousels = build_flex_carousels(
+            report_stocks, trading_date=target_date, hero_urls=hero_urls
+        )
+        flex_messages = [
+            OutboundMessage.flex(
+                alt_text=carousel.alt_text,
+                contents=carousel.contents,
+                fingerprint=carousel.fingerprint,
+            )
+            for carousel in carousels
+        ]
+    except Exception:  # noqa: BLE001 - any failure -> text report, never no report
+        logger.exception(
+            "flex_build_failed report_date=%s stock_count=%d",
+            target_date,
+            len(report_stocks),
+        )
+        return text_messages, TEXT_MESSAGE_VERSION
+    return flex_messages, MESSAGE_VERSION
+
+
 def run(
     *,
     repository: InMemoryRawPayloadRepository | None = None,
@@ -1335,6 +1465,7 @@ def run(
     eps_observation_repository: EpsObservationRepository | None = None,
     delivery_repository: DeliveryRepository | None = None,
     line_client: LineMessagingClient | None = None,
+    chart_uploader: ChartImageUploader | None = None,
 ) -> int:
     if (
         twse_client is not None
@@ -1456,6 +1587,7 @@ def run(
             eps_observation_repository=eps_observation_repository,
             delivery_repository=delivery_repository,
             line_client=line_client,
+            chart_uploader=chart_uploader,
             target_date=target_date,
             ingestion_run_id=ingestion_run_id,
         )
@@ -1476,6 +1608,7 @@ def _run_pipeline(
     eps_observation_repository: EpsObservationRepository | None,
     delivery_repository: DeliveryRepository | None,
     line_client: LineMessagingClient | None,
+    chart_uploader: ChartImageUploader | None,
     target_date: dt.date,
     ingestion_run_id: str,
 ) -> int:
@@ -2101,6 +2234,12 @@ def _run_pipeline(
             print("=" * 72)
             print()
 
+        # The text above is what production sends only as the FALLBACK
+        # (or when no stock qualified). The default message is the Flex
+        # carousel: preview it locally (PNG + JSON files; no upload, no
+        # LINE call). Never raises.
+        run_flex_preview(report_stocks, trading_date=target_date)
+
     # --- Step 8: LINE live delivery (real side effect — opt-in only) ---
     # off       -> no LINE call, no DB write (default)
     # push      -> send to ONE target (LINE_TARGET_ID) — for testing a
@@ -2131,20 +2270,27 @@ def _run_pipeline(
                 return 1
             line_client = LineMessagingClient(channel_access_token=channel_access_token)
 
+        outbound_messages, delivery_message_version = build_outbound_messages(
+            report_stocks=report_stocks,
+            report_messages=report_messages,
+            target_date=target_date,
+            chart_uploader=chart_uploader,
+        )
+
         def _run_delivery(service: DeliveryService) -> list[str]:
             if line_delivery_mode == "push":
-                return service.deliver_many(
+                return service.deliver_messages(
                     trading_date=target_date,
                     strategy_version=STRATEGY_VERSION,
                     target_id=target_id,
-                    message_version=MESSAGE_VERSION,
-                    messages=report_messages,
+                    message_version=delivery_message_version,
+                    messages=outbound_messages,
                 )
-            return service.deliver_broadcast_many(
+            return service.deliver_broadcast_messages(
                 trading_date=target_date,
                 strategy_version=STRATEGY_VERSION,
-                message_version=MESSAGE_VERSION,
-                messages=report_messages,
+                message_version=delivery_message_version,
+                messages=outbound_messages,
             )
 
         try:
@@ -2178,12 +2324,12 @@ def _run_pipeline(
                     engine.dispose()
         except Exception:
             logger.exception(
-                "LINE_DELIVERY_MODE=%s failed trading_date=%s strategy_version=%s "
-                "message_version=%s",
-                line_delivery_mode,
+                "line_send_failed report_date=%s delivery_mode=%s "
+                "strategy_version=%s message_version=%s",
                 target_date,
+                line_delivery_mode,
                 STRATEGY_VERSION,
-                MESSAGE_VERSION,
+                delivery_message_version,
             )
             return 1
 
@@ -2194,8 +2340,8 @@ def _run_pipeline(
             ", ".join(delivery_results),
             target_date,
             STRATEGY_VERSION,
-            MESSAGE_VERSION,
-            len(report_messages),
+            delivery_message_version,
+            len(outbound_messages),
         )
 
     logger.info(

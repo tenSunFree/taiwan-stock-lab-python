@@ -224,3 +224,8 @@ __marimo__/
 *.db-journal
 *.sqlite
 *.sqlite3
+
+# K-line chart preview output (python -m app.charts.preview)
+chart_preview/
+# REPORT_DRY_RUN Flex preview output (PNG + JSON), see README
+flex_preview/

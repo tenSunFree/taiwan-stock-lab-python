@@ -77,6 +77,10 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from app.domain.feature_builder import HistoricalPricePoint
+from app.domain.price_structure import (
+    build_low_level_position,
+    build_valid_history,
+)
 from app.domain.price_ticks import calculate_limit_up_price
 
 RANGE_WINDOW = 20
@@ -302,10 +306,16 @@ def build_low_first_limit_up_signal(
             previous_session_limit_up_estimated=None,
         )
 
-    range_position: float | None = None
+    # "低檔" for 低檔首板 is the state of the stock BEFORE today's
+    # limit-up: Close[T-1] inside the High/Low range of T-20 .. T-1
+    # (today excluded) — see app.domain.price_structure. This is the
+    # single shared implementation; chart/Flex layers read its output,
+    # they never recompute it. Unresolvable (too little history, missing
+    # high/low, flat range) -> None, never False.
+    low_level = build_low_level_position(valid_history)
+    range_position: float | None = low_level.position
     is_low: bool | None = None
-    if len(valid_history) >= RANGE_WINDOW:
-        range_position = _range_position(valid_history, today_close=today_close)
+    if range_position is not None:
         is_low = range_position <= RANGE_POSITION_LOW_THRESHOLD
 
     previous_session_limit_up = estimate_previous_session_limit_up(valid_history)
@@ -376,25 +386,10 @@ def estimate_previous_session_limit_up(
 def _build_valid_history(
     history: list[HistoricalPricePoint], *, target_date: dt.date
 ) -> list[HistoricalPricePoint] | None:
-    """
-    Shared no-look-ahead / duplicate-date defense for every signal in
-    this module (see build_low_with_rising_signal's own docstring for
-    the full rationale): rows on or after target_date and non-positive
-    closes are dropped, and a duplicate trading_date is treated as
-    invalid input — returns None (not partial data) rather than
-    silently letting a diluted/incorrect window pass any "enough data"
-    gate, mirroring app.domain.institutional_flow_builder's own
-    duplicate-date defense.
-    """
-    valid_history_by_date: dict[dt.date, HistoricalPricePoint] = {}
-    for point in history:
-        if point.trading_date >= target_date or point.close <= 0:
-            continue
-        if point.trading_date in valid_history_by_date:
-            return None
-        valid_history_by_date[point.trading_date] = point
-
-    return sorted(valid_history_by_date.values(), key=lambda point: point.trading_date)
+    """Thin alias of app.domain.price_structure.build_valid_history —
+    the no-look-ahead / duplicate-date defense now lives in ONE place so
+    signals and the chart cannot drift apart."""
+    return build_valid_history(history, target_date=target_date)
 
 
 def _range_position(

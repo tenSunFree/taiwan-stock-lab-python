@@ -1325,11 +1325,16 @@ class FakeHistoryFinMindClient:
         self.calls: list[str] = []
         self.institutional_calls: list[str] = []
         self.revenue_calls: list[str] = []
+        # (start_date, end_date) of every request, to pin the separate
+        # price (200d) vs institutional (60d) lookback windows.
+        self.price_ranges: list[tuple[dt.date, dt.date]] = []
+        self.institutional_ranges: list[tuple[dt.date, dt.date]] = []
 
     def fetch_stock_price_history(
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
         self.calls.append(stock_id)
+        self.price_ranges.append((start_date, end_date))
         if stock_id in self.failing_stock_ids:
             raise RuntimeError(f"simulated history failure: {stock_id}")
 
@@ -1355,6 +1360,7 @@ class FakeHistoryFinMindClient:
         self, *, ingestion_run_id, stock_id, start_date, end_date, target_date
     ):
         self.institutional_calls.append(stock_id)
+        self.institutional_ranges.append((start_date, end_date))
         if stock_id in self.institutional_failing_stock_ids:
             raise RuntimeError(f"simulated institutional failure: {stock_id}")
 
@@ -1571,7 +1577,21 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     candidates = [
         _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
     ]
-    history_rows = _make_history_rows(20, close="100", volume="1000000")
+    # 低檔首板 needs real High/Low (app.domain.price_structure): a steadily
+    # falling OHLC series ending at 102, so Close[T-1]=102 sits at the
+    # bottom of the T-20..T-1 High/Low range [101, 141]. (The old flat,
+    # close-only fixture relied on "flat range counts as low", which the
+    # spec replaced with "flat/missing High-Low -> insufficient data".)
+    history_rows = [
+        {
+            **row,
+            "open": str(140 - 2 * i),
+            "max": str(141 - 2 * i),
+            "min": str(139 - 2 * i),
+            "close": str(140 - 2 * i),
+        }
+        for i, row in enumerate(_make_history_rows(20, volume="1000000"))
+    ]
     client = FakeHistoryFinMindClient(
         rows_by_stock={"1101": history_rows},
         institutional_rows_by_stock={
@@ -1607,14 +1627,14 @@ def test_build_stock_features_computes_real_technical_factors_on_success():
     # so the combined signal must be False, not True.
     assert feature.technical_low_with_rising_signal is False
     # Same fixture, different combination: today IS limit-up (fixture
-    # candidate always has is_close_limit_up=True), today's close sits
-    # at the bottom of the (degenerate) 20-day range same as above, AND
-    # the flat close=100 history means the immediately preceding
-    # session's own approximate limit-up check comes back False (100
-    # is not calculate_limit_up_price(100)=110) — i.e. genuinely a
-    # first board, not a continuation. All three conditions hold, so
-    # this must be True even though technical_low_with_rising_signal
-    # above is False for the same fixture — the two are independent.
+    # candidate always has is_close_limit_up=True), Close[T-1]=102 sits
+    # at the bottom of the T-20..T-1 High/Low range, AND the falling
+    # history means the immediately preceding session's own approximate
+    # limit-up check comes back False (102 is not
+    # calculate_limit_up_price(104)) — i.e. genuinely a first board, not
+    # a continuation. All three conditions hold, so this must be True
+    # even though technical_low_with_rising_signal above is False for
+    # the same fixture — the two are independent.
     assert feature.technical_low_first_limit_up_signal is not None
     assert feature.technical_low_first_limit_up_signal.matched is True
     assert feature.revenue_yoy is not None
@@ -3018,3 +3038,485 @@ def test_run_line_delivery_mode_broadcast_does_not_require_target_id(
     assert result == 0
     assert len(call_log) == 1
     assert call_log[0].endswith("/v2/bot/message/broadcast")
+
+
+# --- K-line chart wiring: lookback split + chart_data in StockFeatures --------
+
+
+def _trading_dates(count: int, *, start: dt.date) -> list[dt.date]:
+    """`count` weekday dates from `start` — real sessions, no Sat/Sun rows
+    (the K-line chart counts 60 bars = 60 trading sessions)."""
+    dates: list[dt.date] = []
+    current = start
+    while len(dates) < count:
+        if current.weekday() < 5:
+            dates.append(current)
+        current += dt.timedelta(days=1)
+    return dates
+
+
+def _make_ohlc_history_rows(count: int, *, start=dt.date(2026, 6, 1)):
+    """Falling OHLC series (140, 138, ...), one row per TRADING session."""
+    return [
+        {
+            "date": trading_date.isoformat(),
+            "open": str(140 - i),
+            "max": str(141 - i),
+            "min": str(139 - i),
+            "close": str(140 - i),
+            "Trading_Volume": "1000000",
+            "Trading_money": "100000000",
+        }
+        for i, trading_date in enumerate(_trading_dates(count, start=start))
+    ]
+
+
+def test_trading_dates_helper_skips_weekends():
+    dates = _trading_dates(10, start=dt.date(2026, 6, 1))  # a Monday
+    assert all(d.weekday() < 5 for d in dates)
+    assert dates[5] == dt.date(2026, 6, 8)  # Fri 6/5 -> next Mon 6/8
+
+
+def _run_build_stock_features(history_rows, *, candidates=None):
+    from app.jobs.daily_ranking import build_stock_features
+
+    candidates = candidates or [
+        _make_candidate("1101", close="44.65", turnover="100000000", volume=3_000_000)
+    ]
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": history_rows},
+        institutional_rows_by_stock={
+            "1101": _make_institutional_rows(
+                5, start=dt.date(2026, 6, 16), buy=1000, sell=200
+            )
+        },
+        revenue_rows_by_stock={"1101": _make_monthly_revenue_rows(stock_id="1101")},
+    )
+    features = build_stock_features(
+        candidates=candidates,
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+    return client, features
+
+
+def test_price_history_uses_200_day_window_but_institutional_keeps_60():
+    client, _ = _run_build_stock_features(_make_ohlc_history_rows(30))
+
+    expected_end = TARGET_DATE - dt.timedelta(days=1)
+    assert client.price_ranges == [(TARGET_DATE - dt.timedelta(days=200), expected_end)]
+    assert client.institutional_ranges == [
+        (TARGET_DATE - dt.timedelta(days=60), expected_end)
+    ]
+
+
+def test_build_stock_features_attaches_chart_data_with_todays_official_candle():
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+    chart = features[0].chart_data
+
+    assert chart is not None
+    assert len(chart.bars) == 31  # 30 FinMind sessions + today
+    today = chart.bars[-1]
+    # Today's candle is the official TWSE/TPEx one from the candidate
+    # (open=reference 40.60, high=close 44.65), never from FinMind.
+    assert today.trading_date == TARGET_DATE
+    assert (today.open, today.high, today.low, today.close) == (
+        40.6,
+        44.65,
+        40.6,
+        44.65,
+    )
+    assert today.volume == 3_000_000.0
+    # range = T-20..T-1 of the FinMind history only (today excluded).
+    assert chart.range_20d is not None
+    last_20 = _make_ohlc_history_rows(30)[-20:]
+    assert chart.range_20d.high == max(float(r["max"]) for r in last_20)
+    assert chart.range_20d.low == min(float(r["min"]) for r in last_20)
+    assert chart.ma5[-1] is not None
+
+
+def test_chart_range_and_first_board_signal_share_one_price_basis():
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+    chart = features[0].chart_data
+    signal = features[0].technical_low_first_limit_up_signal
+
+    low_level_position = (chart.bars[-2].close - chart.range_20d.low) / (
+        chart.range_20d.high - chart.range_20d.low
+    )
+    assert signal.range_position == pytest.approx(low_level_position)
+
+
+def test_chart_data_is_none_when_history_has_no_ohlc_but_factors_still_compute():
+    rows = [
+        {k: v for k, v in row.items() if k not in {"open", "max", "min"}}
+        for row in _make_ohlc_history_rows(30)
+    ]
+    _, features = _run_build_stock_features(rows)
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d is not None  # price factors unaffected
+    assert features[0].technical_low_first_limit_up_signal.matched is None
+
+
+def test_chart_data_is_none_when_todays_official_candle_is_incomplete():
+    from dataclasses import replace
+
+    candidate = _make_candidate(
+        "1101", close="44.65", turnover="100000000", volume=3_000_000
+    )
+    broken = replace(
+        candidate, price=replace(candidate.price, open_price=None, low_price=None)
+    )
+    _, features = _run_build_stock_features(
+        _make_ohlc_history_rows(30), candidates=[broken]
+    )
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d is not None
+
+
+def test_chart_assembly_failure_never_clears_price_factors(monkeypatch):
+    import app.jobs.daily_ranking as daily_ranking
+
+    def boom(**_kwargs):
+        raise RuntimeError("simulated chart failure")
+
+    monkeypatch.setattr(daily_ranking, "build_stock_chart_data", boom)
+    _, features = _run_build_stock_features(_make_ohlc_history_rows(30))
+
+    assert features[0].chart_data is None
+    assert features[0].volume_ratio_20d == pytest.approx(3.0)
+    assert features[0].technical_low_first_limit_up_signal.matched is True
+
+
+# --- Step 2 -> Step 3 hand-off: real pipeline features render into a chart ----
+
+
+def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
+    from app.charts.stock_chart_renderer import (
+        ChartRenderError,
+        _resolve_fonts,
+        render_stock_chart_png,
+        select_chart_marker,
+    )
+    from app.domain.scoring import ScoredStock
+    from app.domain.signal_status import SignalStatus
+    from app.reports.report_builder import build_report_stocks
+
+    import os
+
+    try:
+        _resolve_fonts()
+    except ChartRenderError:
+        if os.environ.get("CI"):
+            raise  # CI must provide the font — never skip silently there
+        pytest.skip("no CJK font installed (apt install fonts-noto-cjk)")
+
+    candidate = _make_candidate(
+        "1101", close="44.65", turnover="100000000", volume=3_000_000
+    )
+    _, features = _run_build_stock_features(
+        _make_ohlc_history_rows(130, start=dt.date(2026, 2, 2)),
+        candidates=[candidate],
+    )
+    scored = ScoredStock(
+        stock_id="1101",
+        total_score=80.0,
+        data_completeness=0.9,
+        factor_scores={"momentum": 80.0},
+        risk_flags=(),
+    )
+    (view,) = build_report_stocks(
+        ranked_stocks=[scored],
+        stock_master={"1101": candidate.stock},
+        candidates={"1101": candidate},
+        features_by_stock={"1101": features[0]},
+    )
+
+    # The report model carries everything the chart reads...
+    assert view.chart_data is not None and len(view.chart_data.bars) == 60
+    assert view.limit_up_status is SignalStatus.TRUE
+    assert view.low_level_first_limit_up_status is SignalStatus.TRUE
+    assert select_chart_marker(view) == "低檔首板"
+    # ...and it renders without the chart layer recomputing anything.
+    assert render_stock_chart_png(view).startswith(b"\x89PNG")
+
+
+# --- Flex carousel delivery (flex-v2) + text fallback (text-v16) ------------
+
+
+def _flex_run(
+    monkeypatch,
+    tmp_path,
+    handler,
+    *,
+    stocks=None,
+    session=None,
+    run_kwargs=None,
+    env=None,
+):
+    """Run the pipeline in broadcast mode against a recording LINE transport.
+
+    `stocks`: report stocks to inject in place of build_report_stocks()'s
+    output (the shared fixture yields no qualified stock); None keeps the
+    real "no qualified stock" behaviour. Returns (exit_code, db_session).
+    """
+    import httpx
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from app.clients.line_client import LineMessagingClient
+    from app.db.delivery_repository import DeliveryRepository
+    from app.db.models import MessageDelivery
+
+    monkeypatch.setenv("TARGET_TRADING_DATE", "2026-08-07")
+    monkeypatch.setenv("LINE_DELIVERY_MODE", "broadcast")
+    monkeypatch.delenv("CHART_GCS_BUCKET", raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
+    if stocks is not None:
+        monkeypatch.setattr(
+            "app.jobs.daily_ranking.build_report_stocks",
+            lambda **_: list(stocks),
+        )
+
+    if session is None:
+        engine = create_engine(f"sqlite:///{tmp_path / 'flex.db'}")
+        MessageDelivery.__table__.create(engine)
+        session = Session(engine)
+
+    repository = InMemoryRawPayloadRepository()
+    twse_client, tpex_client, finmind_client, financial_statement_client = (
+        make_all_clients(
+            repository=repository,
+            twse_csv=TWSE_CSV_LIMIT_UP,
+            tpex_rows=TPEX_JSON_NON_LIMIT_UP,
+            stock_info_data=_merged_stock_info(
+                FINMIND_STOCK_INFO_LIMIT_UP, FINMIND_STOCK_INFO_TPEX_STOCK
+            ),
+        )
+    )
+    line_client = LineMessagingClient(
+        channel_access_token="fake-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        initial_backoff_seconds=0,
+    )
+    result = run(
+        repository=repository,
+        twse_client=twse_client,
+        tpex_client=tpex_client,
+        finmind_client=finmind_client,
+        financial_statement_client=financial_statement_client,
+        delivery_repository=DeliveryRepository(session),
+        line_client=line_client,
+        **(run_kwargs or {}),
+    )
+    return result, session
+
+
+def _recording_handler(bodies, status=200):
+    import json
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            status, headers={"x-line-request-id": "req-1"}, text="bad"
+        )
+
+    return handler
+
+
+def _report_stock():
+    from decimal import Decimal
+
+    from app.domain.signal_status import SignalStatus
+    from app.reports.text_renderer import ReportStockView
+
+    return ReportStockView(
+        rank=1,
+        stock_id="6150",
+        stock_name="撼訊",
+        total_score=73.61,
+        data_completeness=0.9,
+        top_factor_names=(),
+        risk_flags=(),
+        close_price=Decimal("69.90"),
+        change_percent=9.91,
+        volume_ratio_20d=14.13,
+        return_5d=0.137,
+        low_level_first_limit_up_status=SignalStatus.FALSE,
+        momentum_overheated_status=SignalStatus.FALSE,
+    )
+
+
+HERO_URL = "https://storage.googleapis.com/b/charts/2026/08/07/6150_20260807_abcd.png"
+
+
+def test_message_versions_are_flex_v2_and_text_v16():
+    from app.jobs.daily_ranking import MESSAGE_VERSION, TEXT_MESSAGE_VERSION
+
+    assert MESSAGE_VERSION == "flex-v2"
+    assert TEXT_MESSAGE_VERSION == "text-v16"
+
+
+def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_path):
+    from app.db.models import MessageDelivery
+
+    bodies = []
+    monkeypatch.setattr(
+        "app.jobs.daily_ranking.prepare_chart_heroes",
+        lambda stocks, **_: {"6150": HERO_URL},
+    )
+    result, session = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+
+    assert result == 0
+    assert len(bodies) == 1
+    message = bodies[0]["messages"][0]
+    assert message["type"] == "flex"
+    assert message["altText"] == "每日漲停股量化觀察 08/07｜1 檔"
+    assert message["contents"]["type"] == "carousel"
+    bubble = message["contents"]["contents"][0]
+    assert bubble["hero"]["url"] == HERO_URL
+    assert bubble["hero"]["action"] == {"type": "uri", "uri": HERO_URL}
+    assert [r.message_version for r in session.query(MessageDelivery).all()] == [
+        "flex-v2:p01-of-01"
+    ]
+
+
+def test_without_image_hosting_the_card_is_sent_without_a_hero(monkeypatch, tmp_path):
+    bodies = []
+    result, _ = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+    assert result == 0
+    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    assert bubble["type"] == "bubble"
+    assert "hero" not in bubble
+
+
+def test_rerun_is_skipped_even_when_the_chart_is_missing_on_the_rerun(
+    monkeypatch, tmp_path
+):
+    """Run 1 hosts a chart; run 2 (e.g. a transient GCS error) has none.
+    Same stocks, same data -> the delivery is the same and must be SKIPPED,
+    not fail with DeliveryContentConflict."""
+    bodies = []
+    heroes = {"6150": HERO_URL}
+    monkeypatch.setattr(
+        "app.jobs.daily_ranking.prepare_chart_heroes", lambda stocks, **_: dict(heroes)
+    )
+    first, session = _flex_run(
+        monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+    )
+    heroes.clear()
+    second, _ = _flex_run(
+        monkeypatch,
+        tmp_path,
+        _recording_handler(bodies),
+        stocks=[_report_stock()],
+        session=session,
+    )
+    assert (first, second) == (0, 0)
+    assert len(bodies) == 1
+
+
+def test_flex_build_failure_falls_back_to_the_text_report(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    from app.db.models import MessageDelivery
+    from app.reports.flex_builder import FlexBuildError
+
+    def boom(*args, **kwargs):
+        raise FlexBuildError("cannot build")
+
+    monkeypatch.setattr("app.jobs.daily_ranking.build_flex_carousels", boom)
+    bodies = []
+    with caplog.at_level(logging.ERROR):
+        result, session = _flex_run(
+            monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
+        )
+
+    assert result == 0
+    assert "flex_build_failed report_date=2026-08-07 stock_count=1" in caplog.text
+    assert all(m["type"] == "text" for body in bodies for m in body["messages"])
+    versions = [r.message_version for r in session.query(MessageDelivery).all()]
+    assert versions and all(v.startswith("text-v16:") for v in versions)
+
+
+def test_no_qualified_stock_still_sends_the_text_report_with_the_new_checkmark(
+    monkeypatch, tmp_path
+):
+    bodies = []
+    result, session = _flex_run(monkeypatch, tmp_path, _recording_handler(bodies))
+    assert result == 0
+    message = bodies[0]["messages"][0]
+    assert message["type"] == "text"
+    assert "✅ 日K線圖" in message["text"]
+    assert "⬜ 日K線圖" not in message["text"]
+
+
+def test_a_line_failure_is_logged_as_line_send_failed_and_fails_the_run(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    bodies = []
+    with caplog.at_level(logging.ERROR):
+        result, _ = _flex_run(
+            monkeypatch,
+            tmp_path,
+            _recording_handler(bodies, status=400),
+            stocks=[_report_stock()],
+        )
+    assert result == 1
+    assert (
+        "line_send_failed report_date=2026-08-07 delivery_mode=broadcast" in caplog.text
+    )
+    # a LINE failure must NOT silently turn into a second, text-fallback send
+    assert len(bodies) == 1
+
+
+def test_a_chart_failure_for_every_stock_still_sends_the_flex_card(
+    monkeypatch, tmp_path
+):
+    """prepare_chart_heroes contains per-stock failures; the carousel goes
+    out with hero-less bubbles."""
+    from types import SimpleNamespace
+
+    from app.storage.chart_image_uploader import ChartImageUploadError
+
+    class BrokenUploader:
+        def upload_chart(self, **_):
+            raise ChartImageUploadError("403")
+
+    stock = _report_stock()
+    stock = type(stock)(**{**stock.__dict__, "chart_data": SimpleNamespace()})
+    import functools
+
+    from app.reports.chart_images import prepare_chart_heroes
+
+    # prepare_chart_heroes binds its default renderer at definition time, so
+    # patching the module attribute would not reach it: pass the renderer in.
+    monkeypatch.setattr(
+        "app.jobs.daily_ranking.prepare_chart_heroes",
+        functools.partial(prepare_chart_heroes, render=lambda s: b"\x89PNG"),
+    )
+    bodies = []
+    result, _ = _flex_run(
+        monkeypatch,
+        tmp_path,
+        _recording_handler(bodies),
+        stocks=[stock],
+        run_kwargs={"chart_uploader": BrokenUploader()},
+    )
+    assert result == 0
+    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    assert "hero" not in bubble
