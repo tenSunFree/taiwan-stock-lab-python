@@ -875,7 +875,7 @@ Environment variables consumed by the job (see
 | `CHART_FONT_PATH`           | Optional `.ttf`/`.otf` used for chart text instead of the auto-detected CJK font (`CHART_FONT_BOLD_PATH` for the bold face) |
 | `LINE_DELIVERY_MODE`        | `off` (default) / `push` (single target) / `broadcast` (all OA friends)                      |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Required when `LINE_DELIVERY_MODE` is `push` or `broadcast`                                  |
-| `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` (local testing only; not configured in CI)      |
+| `LINE_TARGET_ID`            | Required only when `LINE_DELIVERY_MODE=push` (CI: repository secret `LINE_TARGET_ID`, manual test runs only)      |
 
 > **Note:** TWSE's `announcement/notice` (attention) endpoint only
 > ever reports the current calendar day's data — it has no verified

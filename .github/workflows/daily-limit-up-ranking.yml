@@ -36,16 +36,20 @@ on:
         default: true
         type: boolean
       delivery_mode:
-        description: "LINE delivery mode when dry_run=false (broadcast = send to every OA friend)"
+        description: "LINE delivery mode when dry_run=false (push = ONLY the LINE_TARGET_ID user, for testing; broadcast = send to every OA friend)"
         required: true
         default: "off"
         type: choice
-        # "push" is deliberately NOT offered: this repo has no
-        # LINE_TARGET_ID secret (broadcast-only delivery), and
-        # daily_ranking.py exits 1 if LINE_DELIVERY_MODE=push is
-        # selected without one.
+        # "push" sends to ONE target only (the LINE_TARGET_ID secret):
+        # a real end-to-end test (real chart upload, real Flex, real LINE)
+        # that does not notify every friend. daily_ranking.py exits 1 if
+        # push is selected while LINE_TARGET_ID is missing. A manual push
+        # run never counts as "already delivered" for the scheduled
+        # broadcast: the `gate` job only looks at scheduled runs, and the
+        # delivery idempotency key includes the target.
         options:
           - "off"
+          - push
           - broadcast
 
 # Nothing granted at the workflow level; each job below requests only
@@ -372,6 +376,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          # Only read when delivery_mode=push (manual test to ONE user).
+          LINE_TARGET_ID: ${{ secrets.LINE_TARGET_ID }}
           # K-line chart hosting (public GCS bucket). A repository
           # VARIABLE (not a secret: the bucket name is public in every
           # image URL). Empty/unset -> hosting disabled, cards are sent
