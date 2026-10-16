@@ -586,11 +586,12 @@ available.
   side effect), `push` (send to a single `LINE_TARGET_ID` — for
   testing a report-format change without notifying every subscriber),
   or `broadcast` (send to every friend of the Official Account — the
-  real daily delivery to subscribers). The scheduled GitHub Actions
-  workflow is broadcast-only: it deliberately does not offer `push` as
-  a manual option and does not configure `LINE_TARGET_ID`, since
-  `daily_ranking.py` exits 1 if `push` is selected without one. `push`
-  remains available for local testing
+  real daily delivery to subscribers). Scheduled GitHub Actions runs
+  are always `broadcast`. A manual `workflow_dispatch` run can choose
+  `push`, which sends to the `LINE_TARGET_ID` repository secret; a
+  manual run never counts toward the scheduled gate, so a test push
+  cannot suppress the real broadcast. `daily_ranking.py` exits 1 if
+  `push` is selected without a `LINE_TARGET_ID`
 - Report content is deterministic for a given trading date/strategy
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
@@ -681,6 +682,30 @@ The chart text needs a Traditional-Chinese capable font: both workflows
 install `fonts-noto-cjk` on the runner; locally Microsoft JhengHei (Windows)
 or PingFang TC (macOS) is picked up automatically, or point `CHART_FONT_PATH`
 (and optionally `CHART_FONT_BOLD_PATH`) at a `.ttf`/`.otf` file.
+
+#### Real-device check of the Flex carousel (one account)
+
+The daily pipeline only produces a Flex card on a day when at least one
+stock qualifies, so a real-device check cannot be scheduled. This manual
+tool feeds three deterministic **synthetic** stocks (`E2E001`–`E2E003`,
+names prefixed `【測試】`) through the production path — chart renderer,
+real GCS upload, public-URL fetch, Flex builder, LINE push — and sends the
+result to **one** account only (`LINE_TARGET_ID`):
+
+```bash
+python -m app.jobs.test_line_flex_push --no-send   # everything except the LINE push
+python -m app.jobs.test_line_flex_push             # also push to LINE_TARGET_ID
+```
+
+It needs `CHART_GCS_BUCKET`, Application Default Credentials that may
+create objects in the bucket, and (unless `--no-send`)
+`LINE_CHANNEL_ACCESS_TOKEN` and `LINE_TARGET_ID` in the environment or
+`.env`. It is deliberately fail-fast (any missing chart, unreachable hero
+URL or Flex problem exits non-zero, unlike production's graceful
+fallback), never touches the delivery database, and can never broadcast.
+It validates rendering and hosting, not stock selection, P/E filtering,
+risk policy or scoring. Each run leaves a few small `E2E00N_*.png`
+objects under `charts/`; remove them manually as an admin.
 
 ## Roadmap
 
@@ -1372,7 +1397,7 @@ app/jobs/              Scheduled job entry points
     - Manual `workflow_dispatch` accepts `trading_date`, `dry_run`
       (default on — forces `LINE_DELIVERY_MODE=off`, since the two
       flags are independent in code) and `delivery_mode` (`off` /
-      `broadcast`)
+      `push` / `broadcast`)
   - Three independent layers prevent duplicate sends: the `gate` job
     (avoids re-running the pipeline after a success), the
     `message_deliveries` database idempotency key (avoids a duplicate
