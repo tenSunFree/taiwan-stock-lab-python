@@ -283,7 +283,11 @@ def run_e2e(
     except FlexBuildError as exc:
         return fail("build Flex carousel", str(exc))
     bubbles = [b for c in carousels for b in c.contents.get("contents", [])]
-    hero_ok = all(b.get("hero", {}).get("url") in heroes.values() for b in bubbles)
+    # each bubble must carry ITS OWN stock's hosted chart, in stock order
+    # (the builder keeps input order); "some hosted URL" would accept charts
+    # attached to the wrong stock names
+    expected_heroes = [heroes[s.stock_id] for s in stocks]
+    hero_ok = [b.get("hero", {}).get("url") for b in bubbles] == expected_heroes
     if (
         not carousels
         or any(c.contents.get("type") != "carousel" for c in carousels)

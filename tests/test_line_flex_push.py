@@ -102,6 +102,26 @@ def test_happy_path_pushes_one_flex_carousel_to_the_target_only():
     assert all(b["hero"]["url"] in heroes.values() for b in contents["contents"])
 
 
+def test_a_chart_attached_to_the_wrong_stock_fails(monkeypatch):
+    real = e2e.build_flex_carousels
+
+    def swapped(*args, **kwargs):
+        carousels = real(*args, **kwargs)
+        first, second = carousels[0].contents["contents"][:2]
+        first["hero"]["url"], second["hero"]["url"] = (
+            second["hero"]["url"],
+            first["hero"]["url"],
+        )
+        return carousels
+
+    monkeypatch.setattr(e2e, "build_flex_carousels", swapped)
+    client = FakeClient()
+    checks, _ = run(client=client)
+    assert not checks[-1].passed
+    assert "hero_ok=False" in checks[-1].detail
+    assert client.calls == []
+
+
 def test_no_send_builds_everything_but_does_not_call_line():
     checks, heroes = run(client=None)
     assert all(c.passed for c in checks)
