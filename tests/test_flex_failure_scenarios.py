@@ -113,8 +113,12 @@ def test_an_invalid_bucket_name_disables_images_but_not_the_card(monkeypatch, ca
             target_date=__import__("datetime").date(2026, 8, 7),
             chart_uploader=None,
         )
-    assert version == "flex-v2"
-    bubble = messages[0].payload["contents"]["contents"][0]
+    assert version == "flex-v3"
+    assert messages[0].payload == {
+        "type": "text",
+        "text": "每日漲停股量化觀察 08/07｜1 檔",
+    }
+    bubble = messages[1].payload["contents"]["contents"][0]
     assert "hero" not in bubble
     assert "image_upload_failed" in caplog.text
 
@@ -143,7 +147,7 @@ def test_one_render_failure_leaves_the_other_bubble_with_its_hero(
         )
 
     assert result == 0
-    first, second = bodies[0]["messages"][0]["contents"]["contents"]
+    first, second = bodies[1]["messages"][0]["contents"]["contents"]
     assert "hero" not in first
     assert NOTE_CHART_UNAVAILABLE in texts(first)
     assert second["hero"]["url"] == "https://img.example.com/2002.png"
@@ -166,7 +170,7 @@ def test_one_upload_failure_leaves_the_other_bubble_with_its_hero(
     )
 
     assert result == 0
-    first, second = bodies[0]["messages"][0]["contents"]["contents"]
+    first, second = bodies[1]["messages"][0]["contents"]["contents"]
     assert first["hero"]["url"] == "https://img.example.com/2001.png"
     assert "hero" not in second
     assert NOTE_CHART_UNAVAILABLE in texts(second)
@@ -178,15 +182,18 @@ def test_one_upload_failure_leaves_the_other_bubble_with_its_hero(
 def test_second_carousel_failing_is_resumed_without_resending_the_first(
     monkeypatch, tmp_path
 ):
-    """13 stocks -> carousel 1 (12 bubbles) + carousel 2 (1 bubble). LINE
-    accepts the first and rejects the second; the run fails. The rerun must
-    send ONLY the second carousel, and finish."""
+    """13 stocks -> headline + carousel 1 (12 bubbles) + carousel 2 (1
+    bubble). LINE accepts the first two and rejects the last; the run fails.
+    The rerun must send ONLY the last carousel, and finish."""
     stocks = many_stocks(13)
     seen: list[int] = []
 
     def rejecting_second(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        bubbles = len(body["messages"][0]["contents"]["contents"])
+        message = body["messages"][0]
+        if message["type"] == "text":  # the headline
+            return httpx.Response(200, headers={"x-line-request-id": "req"}, text="ok")
+        bubbles = len(message["contents"]["contents"])
         seen.append(bubbles)
         status = 400 if bubbles == 1 else 200
         return httpx.Response(
@@ -201,15 +208,19 @@ def test_second_carousel_failing_is_resumed_without_resending_the_first(
 
     rows = {r.message_version: r.status for r in session.query(MessageDelivery).all()}
     assert rows == {
-        "flex-v2:p01-of-02": "SUCCESS",
-        "flex-v2:p02-of-02": "FAILED",
+        "flex-v3:p01-of-03": "SUCCESS",
+        "flex-v3:p02-of-03": "SUCCESS",
+        "flex-v3:p03-of-03": "FAILED",
     }
 
     resent: list[int] = []
 
     def accepting(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        resent.append(len(body["messages"][0]["contents"]["contents"]))
+        message = body["messages"][0]
+        resent.append(
+            len(message["contents"]["contents"]) if message["type"] == "flex" else 0
+        )
         return httpx.Response(200, headers={"x-line-request-id": "req"}, text="ok")
 
     second_run, _ = _flex_run(
@@ -237,9 +248,14 @@ def test_line_5xx_fails_the_run_and_does_not_fall_back_to_text(
 
     assert result == 1
     assert "line_send_failed report_date=2026-08-07" in caplog.text
-    assert "message_version=flex-v2" in caplog.text
-    # every attempt was the SAME Flex message; nothing was re-sent as text
-    assert bodies and all(b["messages"][0]["type"] == "flex" for b in bodies)
+    assert "message_version=flex-v3" in caplog.text
+    # the headline is the first part and LINE refuses it: every attempt is that
+    # same headline, the cards are never sent, and nothing falls back to the
+    # text report
+    assert bodies and all(
+        b["messages"] == [{"type": "text", "text": "每日漲停股量化觀察 08/07｜1 檔"}]
+        for b in bodies
+    )
     assert [r.status for r in session.query(MessageDelivery).all()] == ["FAILED"]
 
 

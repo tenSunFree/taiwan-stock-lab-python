@@ -3244,7 +3244,7 @@ def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
     assert render_stock_chart_png(view).startswith(b"\x89PNG")
 
 
-# --- Flex carousel delivery (flex-v2) + text fallback (text-v16) ------------
+# --- Flex carousel delivery (flex-v3) + text fallback (text-v16) ------------
 
 
 def _flex_run(
@@ -3356,14 +3356,16 @@ def _report_stock():
 HERO_URL = "https://storage.googleapis.com/b/charts/2026/08/07/6150_20260807_abcd.png"
 
 
-def test_message_versions_are_flex_v2_and_text_v16():
+def test_message_versions_are_flex_v3_and_text_v16():
     from app.jobs.daily_ranking import MESSAGE_VERSION, TEXT_MESSAGE_VERSION
 
-    assert MESSAGE_VERSION == "flex-v2"
+    assert MESSAGE_VERSION == "flex-v3"
     assert TEXT_MESSAGE_VERSION == "text-v16"
 
 
-def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_path):
+def test_qualified_stocks_are_delivered_as_headline_then_one_flex_carousel(
+    monkeypatch, tmp_path
+):
     from app.db.models import MessageDelivery
 
     bodies = []
@@ -3376,8 +3378,12 @@ def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_pa
     )
 
     assert result == 0
-    assert len(bodies) == 1
-    message = bodies[0]["messages"][0]
+    # the headline goes first, as its own text message, then the carousel
+    assert len(bodies) == 2
+    assert bodies[0]["messages"] == [
+        {"type": "text", "text": "每日漲停股量化觀察 08/07｜1 檔"}
+    ]
+    message = bodies[1]["messages"][0]
     assert message["type"] == "flex"
     assert message["altText"] == "每日漲停股量化觀察 08/07｜1 檔"
     assert message["contents"]["type"] == "carousel"
@@ -3385,7 +3391,8 @@ def test_qualified_stocks_are_delivered_as_one_flex_carousel(monkeypatch, tmp_pa
     assert bubble["hero"]["url"] == HERO_URL
     assert bubble["hero"]["action"] == {"type": "uri", "uri": HERO_URL}
     assert [r.message_version for r in session.query(MessageDelivery).all()] == [
-        "flex-v2:p01-of-01"
+        "flex-v3:p01-of-02",
+        "flex-v3:p02-of-02",
     ]
 
 
@@ -3395,7 +3402,7 @@ def test_without_image_hosting_the_card_is_sent_without_a_hero(monkeypatch, tmp_
         monkeypatch, tmp_path, _recording_handler(bodies), stocks=[_report_stock()]
     )
     assert result == 0
-    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    bubble = bodies[1]["messages"][0]["contents"]["contents"][0]
     assert bubble["type"] == "bubble"
     assert "hero" not in bubble
 
@@ -3423,7 +3430,8 @@ def test_rerun_is_skipped_even_when_the_chart_is_missing_on_the_rerun(
         session=session,
     )
     assert (first, second) == (0, 0)
-    assert len(bodies) == 1
+    # only the first run sent anything: the headline text + the carousel
+    assert len(bodies) == 2
 
 
 def test_flex_build_failure_falls_back_to_the_text_report(
@@ -3518,5 +3526,5 @@ def test_a_chart_failure_for_every_stock_still_sends_the_flex_card(
         run_kwargs={"chart_uploader": BrokenUploader()},
     )
     assert result == 0
-    bubble = bodies[0]["messages"][0]["contents"]["contents"][0]
+    bubble = bodies[1]["messages"][0]["contents"]["contents"][0]
     assert "hero" not in bubble

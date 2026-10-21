@@ -14,7 +14,12 @@ names prefixed 【測試】) through the PRODUCTION path:
       -> ChartImageUploader -> REAL GCS (production uploader, CHART_GCS_BUCKET)
       -> anonymous GET of every hero URL
       -> build_flex_carousels          (production Flex builder)
-      -> LineMessagingClient.push_flex -> ONLY LINE_TARGET_ID
+      -> LineMessagingClient.push_messages -> ONLY LINE_TARGET_ID
+         (the first request carries the headline text
+         "每日漲停股量化觀察 MM/DD｜N 檔" followed by the first carousel: the
+         VISIBLE message order matches production, but production sends each
+         of them as its own DB-backed delivery part / HTTP request, which
+         this tool intentionally does not reproduce)
 
 What it deliberately is NOT:
   * not a market-data run: the stocks are fake, so it says nothing about
@@ -51,13 +56,21 @@ from typing import Callable, Sequence
 
 import httpx
 
-from app.clients.line_client import LineMessagingClient, LinePushError
+from app.clients.line_client import (
+    LineMessagingClient,
+    LinePushError,
+    build_flex_message,
+)
 from app.domain.chart_data import build_stock_chart_data
 from app.domain.feature_builder import HistoricalPricePoint
 from app.domain.signal_status import SignalStatus
 from app.jobs.test_line_push import load_env_file
 from app.reports.chart_images import prepare_chart_heroes
-from app.reports.flex_builder import FlexBuildError, build_flex_carousels
+from app.reports.flex_builder import (
+    FlexBuildError,
+    build_alt_text,
+    build_flex_carousels,
+)
 from app.reports.text_renderer import ReportStockView
 from app.storage.chart_image_uploader import ChartImageUploader, build_uploader_from_env
 from app.storage.smoke import Check, format_report
@@ -310,20 +323,26 @@ def run_e2e(
         checks.append(Check("LINE push", True, "skipped (--no-send)"))
         return checks, heroes
 
+    headline = {
+        "type": "text",
+        "text": build_alt_text(trading_date, len(stocks)),
+    }
     for number, carousel in enumerate(carousels, start=1):
+        # the headline rides in front of the FIRST carousel only
+        messages = [
+            build_flex_message(alt_text=carousel.alt_text, contents=carousel.contents)
+        ]
+        if number == 1:
+            messages.insert(0, headline)
         try:
-            result = client.push_flex(
-                target_id=target_id,
-                alt_text=carousel.alt_text,
-                contents=carousel.contents,
-            )
+            result = client.push_messages(target_id=target_id, messages=messages)
         except LinePushError as exc:
-            return fail(f"LINE push flex #{number}", str(exc))
+            return fail(f"LINE push #{number}", str(exc))
         if not result.success:
-            return fail(f"LINE push flex #{number}", f"HTTP {result.status_code}")
+            return fail(f"LINE push #{number}", f"HTTP {result.status_code}")
         checks.append(
             Check(
-                f"LINE push flex #{number} (type flex)",
+                f"LINE push #{number} ({'headline + ' if number == 1 else ''}flex)",
                 True,
                 f"HTTP {result.status_code}, request_id={result.request_id}",
             )
@@ -387,7 +406,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         for stock_id, url in heroes.items():
             print(f"  {stock_id}: {url}")
     if ok and client is not None:
-        print("\nNow check the message on your phone (see the checklist in the docs).")
+        print(
+            "\nNow check the messages on your phone "
+            "(README: 'Real-device check of the Flex carousel')."
+        )
     return 0 if ok else 1
 
 
