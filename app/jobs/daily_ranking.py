@@ -236,7 +236,7 @@ from app.domain.technical_signal_builder import (
 )
 from app.domain.valuation_filter import filter_candidates_by_pe
 from app.reports.chart_images import prepare_chart_heroes
-from app.reports.flex_builder import build_flex_carousels
+from app.reports.flex_builder import build_alt_text, build_flex_carousels
 from app.reports.flex_preview import run_flex_preview
 from app.reports.report_builder import build_report_stocks
 from app.reports.text_renderer import (
@@ -531,7 +531,12 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # always printing "注意／處置／全額交割狀態未確認" — a stock whose 注意/處置
 # status was confirmed was shown as less certain than the text report says.
 # Visible wording change -> new version (flex-v1 rows can never collide).
-MESSAGE_VERSION = "flex-v2"
+#
+# flex-v3: the carousel is now preceded by a one-line text message
+# ("每日漲停股量化觀察 MM/DD｜N 檔") so the headline shows above the cards.
+# That adds a delivery part, so part numbers shift (p01 is the headline, the
+# carousel(s) follow) -> new version.
+MESSAGE_VERSION = "flex-v3"
 TEXT_MESSAGE_VERSION = "text-v16"
 
 # CRITICAL for delivery idempotency: the same
@@ -1417,7 +1422,8 @@ def build_outbound_messages(
 ) -> tuple[list[OutboundMessage], str]:
     """The messages to deliver and the message_version they go out under.
 
-    Qualified stocks -> a Flex carousel (flex-v2). Anything that stops the
+    Qualified stocks -> a one-line headline text, then the Flex carousel(s)
+    (flex-v3). Anything that stops the
     carousel from being built -> the plain-text report (text-v16). A
     stock-level chart problem never gets here: prepare_chart_heroes only
     drops that stock's hero image. No qualified stock -> the text
@@ -1452,7 +1458,8 @@ def build_outbound_messages(
             len(report_stocks),
         )
         return text_messages, TEXT_MESSAGE_VERSION
-    return flex_messages, MESSAGE_VERSION
+    headline = OutboundMessage.text(build_alt_text(target_date, len(report_stocks)))
+    return [headline, *flex_messages], MESSAGE_VERSION
 
 
 def run(

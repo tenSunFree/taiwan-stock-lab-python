@@ -36,8 +36,8 @@ class FakeClient:
         self.error = error
         self.success = success
 
-    def push_flex(self, *, target_id, alt_text, contents):
-        self.calls.append((target_id, alt_text, contents))
+    def push_messages(self, *, target_id, messages):
+        self.calls.append((target_id, messages))
         if self.error:
             raise self.error
         return SimpleNamespace(
@@ -88,15 +88,19 @@ def test_fixture_is_deterministic():
     assert first == second
 
 
-def test_happy_path_pushes_one_flex_carousel_to_the_target_only():
+def test_happy_path_pushes_headline_and_one_flex_carousel_to_target_only():
     client = FakeClient()
     checks, heroes = run(client=client)
 
     assert all(c.passed for c in checks), e2e.format_report(checks)
     assert len(heroes) == 3
     assert len(client.calls) == 1
-    target, alt_text, contents = client.calls[0]
+    target, messages = client.calls[0]
     assert target == "U-test"
+    # the headline text first, then the carousel, in ONE request
+    assert [m["type"] for m in messages] == ["text", "flex"]
+    assert messages[0]["text"] == "每日漲停股量化觀察 10/15｜3 檔"
+    contents = messages[1]["contents"]
     assert contents["type"] == "carousel"
     assert len(contents["contents"]) == 3
     assert all(b["hero"]["url"] in heroes.values() for b in contents["contents"])

@@ -596,17 +596,30 @@ available.
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `text-v15`) — bumped whenever the
+  `MESSAGE_VERSION` (currently `flex-v3` for the Flex carousel; the
+  plain-text fallback report is `text-v16`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
   idempotency-keyed without conflating the two
+- As of `flex-v3` the carousel is preceded by a one-line plain-text
+  headline (`每日漲停股量化觀察 MM/DD｜N 檔`, N = the total number of
+  stocks shown), sent as its own delivery part: a one-carousel day is
+  `p01-of-02` (headline) + `p02-of-02` (cards), and a 13-stock day is
+  `p01-of-03` (headline) + two carousels. If any part fails the run
+  fails and later parts are not attempted; a rerun that rebuilds the
+  same `flex-v3` parts skips the ones already sent and resumes from the
+  failed one. If a later rerun falls back to the plain-text report
+  instead (`text-v16`), that is a different message version and
+  therefore a separate delivery identity, not a resume
 - Two intentionally separate idempotency mechanisms:
   a SHA-256 **database idempotency key** (trading date + strategy
   version + delivery target/scope + message version) for
-  duplicate-delivery detection, and a UUID **`X-Line-Retry-Key`** per
-  HTTP send attempt for safely retrying a single in-flight call
-  without LINE processing it twice
+  duplicate-delivery detection, and one UUID **`X-Line-Retry-Key`** per
+  logical delivery part, generated when its row is first reserved and
+  persisted with it, so every HTTP retry of that part — and a rerun that
+  picks up the same reserved row after a crash — reuses the same key
+  (LINE honors a retry key only for a limited time window)
 - Push and Broadcast share one retry/409/4xx/5xx implementation in the
   LINE client, and one reserve→send→mark-success/failed orchestration
   in `DeliveryService`, so a future change to that logic can't
@@ -706,6 +719,16 @@ fallback), never touches the delivery database, and can never broadcast.
 It validates rendering and hosting, not stock selection, P/E filtering,
 risk policy or scoring. Each run leaves a few small `E2E00N_*.png`
 objects under `charts/`; remove them manually as an admin.
+
+On the phone, confirm in order:
+
+1. A text message `每日漲停股量化觀察 MM/DD｜3 檔` arrives first, then the
+   carousel (the chat-list preview of the carousel shows the same text).
+2. The carousel scrolls sideways through three cards.
+3. Each card shows its K-line image; the three test stocks cover the
+   `低檔首板` badge, the `漲多過熱` badge and no badge.
+4. The regulatory rows read as "not confirmed" / confirmed as expected,
+   and no card shows buy/sell wording.
 
 ## Roadmap
 
