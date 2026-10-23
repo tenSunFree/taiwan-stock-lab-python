@@ -13,7 +13,7 @@ verified-on-the-wire quirk:
           params. Values are already strings (e.g. "季別": "2"), so
           nothing needs coercing before eps_mapper sees it.
 
-    TPEx  https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci
+    TPEx  https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci.csv
           -> CSV text, not JSON. No auth, no query params. Real TPEx
           exports from this host are UTF-8 WITH a leading BOM
           (U+FEFF); httpx's response.text does NOT strip it, so an
@@ -21,6 +21,11 @@ verified-on-the-wire quirk:
           header (出表日期 -> \ufeff出表日期) and make every row look
           like that field is missing to eps_mapper — a real,
           easy-to-miss bug class, not a hypothetical one.
+
+    The path MUST end in `.csv` (the dataset's download URL). The
+    extension-less path was previously configured here and was seen
+    returning HTTP 404 in the daily workflow, which left
+    eps_growth_sustained = None for every TPEx candidate.
 
     NOT independently confirmed at the time of writing: whether
     mopsfin.twse.com.tw currently redirects http -> https on this
@@ -65,7 +70,7 @@ class FinancialStatementClient(MarketDataClient):
     def __init__(self, repository, **kwargs) -> None:
         super().__init__(repository, **kwargs)
         self.twse_url = "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci"
-        self.tpex_url = "https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci"
+        self.tpex_url = "https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci.csv"
 
     def fetch_twse_financial_statement(
         self, *, ingestion_run_id: str, target_date: dt.date
