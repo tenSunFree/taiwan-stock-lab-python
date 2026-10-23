@@ -173,7 +173,7 @@ def test_fetch_tpex_financial_statement_uses_correct_endpoint():
 
     assert captured["method"] == "GET"
     assert captured["host"] == "mopsfin.twse.com.tw"
-    assert captured["path"] == "/opendata/t187ap06_O_ci"
+    assert captured["path"] == "/opendata/t187ap06_O_ci.csv"
 
 
 def test_fetch_tpex_financial_statement_saves_raw_csv_text_bom_included():
