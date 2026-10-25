@@ -231,6 +231,13 @@ available.
   TWSE/TPEx price/valuation/regulatory snapshots), not per-candidate —
   neither endpoint has FinMind's per-stock rate limit, so there's no
   reason to repeat the call for every candidate
+- The TPEx dataset is only served at its `.csv` download path
+  (`https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci.csv`); the
+  extension-less path returns HTTP 404. Because a fetch failure is
+  fail-soft (see below), such a regression does not fail the run — it
+  only shows up as `eps_growth_sustained = None` for every TPEx
+  candidate plus a "TPEx t187ap06_O_ci fetch/parse failed" log line,
+  so check that line after any change to this endpoint
 - TWSE/TPEx report cumulative (year-to-date) EPS per quarter, not
   standalone per-quarter figures — verified directly against real
   台泥/1101 data. A dedicated converter reconstructs genuine
