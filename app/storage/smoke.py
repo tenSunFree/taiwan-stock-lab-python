@@ -30,7 +30,6 @@ old LINE cards would lose their hero images.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import sys
 from dataclasses import dataclass
 from io import BytesIO
