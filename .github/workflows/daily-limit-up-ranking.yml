@@ -223,6 +223,8 @@ jobs:
       # Must come BEFORE google-github-actions/auth: auth writes its
       # credentials file into $GITHUB_WORKSPACE, which checkout creates.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
