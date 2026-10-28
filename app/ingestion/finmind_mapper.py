@@ -63,6 +63,12 @@ from app.domain.feature_builder import HistoricalPricePoint
 
 from app.domain.models import DailyPrice, Market, SecurityType, StockMaster
 
+from app.domain.institutional_detail import (
+    CATEGORY_DEALER,
+    CATEGORY_FOREIGN,
+    CATEGORY_TRUST,
+    InstitutionalCategoryPoint,
+)
 from app.domain.institutional_flow_builder import InstitutionalFlowPoint
 
 from app.domain.monthly_revenue_builder import MonthlyRevenuePoint
@@ -369,6 +375,85 @@ def build_institutional_flow_points(
         for trading_date, net_shares in sorted(net_shares_by_date.items())
         if trading_date not in invalid_dates
     ]
+
+
+# FinMind TaiwanStockInstitutionalInvestorsBuySell `name` -> report category.
+# 自營商 deliberately includes BOTH 自行買賣 and 避險, so 合計 equals the
+# all-rows aggregate build_institutional_flow_points already produces.
+_INSTITUTIONAL_NAME_TO_CATEGORY: dict[str, str] = {
+    "Foreign_Investor": CATEGORY_FOREIGN,
+    "Foreign_Dealer_Self": CATEGORY_FOREIGN,
+    "Investment_Trust": CATEGORY_TRUST,
+    "Dealer_self": CATEGORY_DEALER,
+    "Dealer_Hedging": CATEGORY_DEALER,
+}
+# A date is only usable when every one of these rows is present. Relax this
+# (not the fail-closed behaviour) if real data legitimately omits one.
+_REQUIRED_INSTITUTIONAL_NAMES = frozenset(_INSTITUTIONAL_NAME_TO_CATEGORY)
+
+
+def build_institutional_category_points(
+    rows: list[dict[str, Any]], *, expected_stock_id: str
+) -> list[InstitutionalCategoryPoint]:
+    """
+    Same FinMind rows as build_institutional_flow_points, but keeping
+    外資 / 投信 / 自營商 apart (net shares = buy - sell).
+
+    FAIL-CLOSED per date, like its sibling: a date is dropped (never
+    zero-filled) when any row has invalid buy/sell, a duplicate or
+    UNKNOWN `name` appears (unknown names would make 合計 disagree with
+    the existing aggregate), or any required `name` row is missing.
+    """
+    expected_stock_id = expected_stock_id.strip()
+    if not expected_stock_id:
+        raise ValueError("expected_stock_id must not be empty")
+
+    net_by_date: dict[dt.date, dict[str, int]] = {}
+    invalid_dates: set[dt.date] = set()
+
+    for row in rows:
+        if str(row.get("stock_id") or "").strip() != expected_stock_id:
+            continue
+        try:
+            trading_date = dt.date.fromisoformat(str(row.get("date") or "").strip())
+        except ValueError:
+            continue
+
+        name = str(row.get("name") or "").strip()
+        if name not in _INSTITUTIONAL_NAME_TO_CATEGORY:
+            invalid_dates.add(trading_date)
+            continue
+
+        buy = _to_int(row.get("buy"), zero_is_missing=False)
+        sell = _to_int(row.get("sell"), zero_is_missing=False)
+        if buy is None or sell is None:
+            invalid_dates.add(trading_date)
+            continue
+
+        names = net_by_date.setdefault(trading_date, {})
+        if name in names:
+            invalid_dates.add(trading_date)
+            continue
+        names[name] = buy - sell
+
+    points: list[InstitutionalCategoryPoint] = []
+    for trading_date, names in sorted(net_by_date.items()):
+        if trading_date in invalid_dates:
+            continue
+        if set(names) != _REQUIRED_INSTITUTIONAL_NAMES:
+            continue
+        totals = {CATEGORY_FOREIGN: 0, CATEGORY_TRUST: 0, CATEGORY_DEALER: 0}
+        for name, net in names.items():
+            totals[_INSTITUTIONAL_NAME_TO_CATEGORY[name]] += net
+        points.append(
+            InstitutionalCategoryPoint(
+                trading_date=trading_date,
+                foreign_net_shares=totals[CATEGORY_FOREIGN],
+                investment_trust_net_shares=totals[CATEGORY_TRUST],
+                dealer_net_shares=totals[CATEGORY_DEALER],
+            )
+        )
+    return points
 
 
 def build_monthly_revenue_points(

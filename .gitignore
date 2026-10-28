@@ -229,3 +229,4 @@ __marimo__/
 chart_preview/
 # REPORT_DRY_RUN Flex preview output (PNG + JSON), see README
 flex_preview/
+out/

@@ -17,13 +17,15 @@ Bubble layout (per stock):
     hero    4:3 image, aspectMode "fit", URI action -> the HTTPS original
             (only when a valid hero URL exists)
     body    name+code / close｜change / 綜合｜rank / 量比｜5D / 低檔首板 /
-            漲多過熱 / 資料完整度 / [K-line note] / risks
+            漲多過熱 / 法人籌碼 (10 sessions, + 📊 明細 link) /
+            資料完整度 / [K-line note] / risks
     footer  disclaimer (+ the 低檔首板 approximation note)
 
 Idempotency fingerprint:
     DeliveryRepository hashes a string per message to catch "same key,
     different content". For Flex that string is `fingerprint`, built from
-    the text rows that carry meaning. It deliberately EXCLUDES the hero
+    the text rows that carry meaning PLUS each stock's full 10-session
+    institutional table (dates and all 30 values). It deliberately EXCLUDES the hero
     URLs and the K-line status note: whether a chart could be drawn or
     uploaded is a property of one particular run (a transient GCS error
     on a rerun must not turn into DeliveryContentConflict for data that
@@ -44,6 +46,12 @@ import json
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from app.domain.institutional_detail import (
+    CATEGORIES,
+    CATEGORY_LABELS,
+    InstitutionalDetail10D,
+    format_lots,
+)
 from app.domain.signal_status import SignalStatus
 from app.reports.text_renderer import (
     DISCLAIMER,
@@ -95,6 +103,11 @@ _COLOR_FLAT = "#666666"
 _COLOR_TEXT = "#333333"
 _COLOR_MUTED = "#888888"
 _COLOR_RISK = "#B26A00"
+_COLOR_LINK = "#1565C0"
+
+DETAIL_BUTTON_LABEL = "📊 明細"
+# A one-day "streak" says nothing; only runs of 2+ sessions are labelled.
+MIN_STREAK_LABEL_DAYS = 2
 
 
 class FlexBuildError(Exception):
@@ -112,9 +125,14 @@ class FlexCarousel:
 
 @dataclass(frozen=True)
 class _Row:
-    kind: str  # title | price | normal | risk
+    # title | price | normal | risk | inst_title | inst_line | inst_total |
+    # inst_meta | inst_missing
+    kind: str
     text: str
     color: str | None = None
+    # inst_line / inst_total only: (label, value, streak) shown in columns.
+    # `text` is the same content joined for the idempotency fingerprint.
+    parts: tuple[str, ...] = ()
 
 
 def status_label(status: SignalStatus) -> str:
@@ -138,6 +156,48 @@ def _risk_labels(stock: ReportStockView) -> list[str]:
         if label and label not in labels:
             labels.append(label)
     return labels
+
+
+def _institutional_rows(detail: InstitutionalDetail10D | None) -> list[_Row]:
+    """法人籌碼 block rows. Every number comes from the ONE detail object the
+    明細 image also draws; nothing is recomputed here. None -> an explicit
+    資料不足 row (never a zero, never a stale figure)."""
+    if detail is None:
+        return [_Row("inst_missing", "⚪ 法人籌碼｜資料不足")]
+
+    rows = [_Row("inst_title", "法人籌碼｜近10交易日")]
+    for category in CATEGORIES:
+        total = detail.category_total(category)
+        streak = detail.streak(category)
+        streak_text = (
+            streak.label if streak and streak.days >= MIN_STREAK_LABEL_DAYS else ""
+        )
+        value_text = f"{format_lots(total)}張"
+        label = CATEGORY_LABELS[category]
+        rows.append(
+            _Row(
+                "inst_line",
+                f"{label} {value_text}" + (f"｜{streak_text}" if streak_text else ""),
+                _price_color(total),
+                (label, value_text, streak_text),
+            )
+        )
+    grand = detail.grand_total
+    grand_text = f"{format_lots(grand)}張"
+    rows.append(
+        _Row(
+            "inst_total",
+            f"合計 {grand_text}",
+            _price_color(grand),
+            ("合計", grand_text, ""),
+        )
+    )
+    days = f"合計買超 {detail.total_buy_days} 日／賣超 {detail.total_sell_days} 日"
+    if detail.total_flat_days:
+        days += f"／持平 {detail.total_flat_days} 日"
+    rows.append(_Row("inst_meta", days))
+    rows.append(_Row("inst_meta", f"資料截至 {detail.as_of_date:%m/%d}"))
+    return rows
 
 
 def _summary_rows(stock: ReportStockView, *, total_shown: int) -> list[_Row]:
@@ -167,6 +227,7 @@ def _summary_rows(stock: ReportStockView, *, total_shown: int) -> list[_Row]:
             "normal",
             f"漲多過熱：{status_label(stock.momentum_overheated_status)}",
         ),
+        *_institutional_rows(stock.institutional_detail_10d),
         _Row("normal", f"資料完整度：{stock.data_completeness:.0%}"),
     ]
     unconfirmed = [
@@ -191,6 +252,10 @@ def _valid_hero_url(url: str | None) -> bool:
     return bool(url) and url.startswith("https://") and len(url) <= MAX_ACTION_URI_CHARS
 
 
+# The 明細 link has exactly the same constraints as the hero action URI.
+_valid_detail_url = _valid_hero_url
+
+
 def _text_component(row: _Row) -> dict:
     component: dict = {
         "type": "text",
@@ -209,15 +274,121 @@ def _text_component(row: _Row) -> dict:
     return component
 
 
+def _institutional_component(row: _Row, *, detail_url: str | None) -> dict:
+    """Layout for one 法人籌碼 row. `detail_url` only matters for the title
+    row: valid -> a tappable 📊 明細 on the right (URI action to the hosted
+    image); None / invalid -> the title alone, rest of the block unchanged."""
+    if row.kind == "inst_title":
+        header: list[dict] = [
+            {
+                "type": "text",
+                "text": row.text,
+                "size": "sm",
+                "weight": "bold",
+                "color": _COLOR_TEXT,
+                "flex": 1,
+                "gravity": "center",
+            }
+        ]
+        if _valid_detail_url(detail_url):
+            header.append(
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "flex": 0,
+                    "paddingAll": "xs",
+                    "action": {"type": "uri", "label": "明細", "uri": detail_url},
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": DETAIL_BUTTON_LABEL,
+                            "size": "sm",
+                            "weight": "bold",
+                            "color": _COLOR_LINK,
+                            "align": "end",
+                        }
+                    ],
+                }
+            )
+        return {
+            "type": "box",
+            "layout": "horizontal",
+            "margin": "md",
+            "contents": header,
+        }
+
+    if row.kind in ("inst_line", "inst_total"):
+        label, value, streak = row.parts
+        bold = row.kind == "inst_total"
+        columns = [
+            {
+                "type": "text",
+                "text": label,
+                "size": "sm",
+                "flex": 2,
+                "color": _COLOR_TEXT,
+                **({"weight": "bold"} if bold else {}),
+            },
+            {
+                "type": "text",
+                "text": value,
+                "size": "sm",
+                "flex": 5,
+                "align": "end",
+                "weight": "bold",
+                "color": row.color or _COLOR_TEXT,
+            },
+            {
+                "type": "text",
+                "text": streak or " ",
+                "size": "xs",
+                "flex": 3,
+                "align": "end",
+                "gravity": "center",
+                "color": _COLOR_MUTED,
+            },
+        ]
+        return {"type": "box", "layout": "horizontal", "contents": columns}
+
+    if row.kind == "inst_meta":
+        return {
+            "type": "text",
+            "text": row.text,
+            "wrap": True,
+            "size": "xs",
+            "color": _COLOR_MUTED,
+        }
+
+    # inst_missing
+    return {
+        "type": "text",
+        "text": row.text,
+        "wrap": True,
+        "size": "sm",
+        "color": _COLOR_MUTED,
+        "margin": "md",
+    }
+
+
 def build_stock_bubble(
-    stock: ReportStockView, *, total_shown: int, hero_url: str | None
+    stock: ReportStockView,
+    *,
+    total_shown: int,
+    hero_url: str | None,
+    detail_url: str | None = None,
 ) -> dict:
-    """One bubble. `hero_url` None / invalid -> no hero + a K-line note."""
+    """One bubble. `hero_url` None / invalid -> no hero + a K-line note.
+    `detail_url` None / invalid -> the 法人籌碼 block has no 📊 明細 button."""
     rows = _summary_rows(stock, total_shown=total_shown)
 
     contents: list[dict] = []
     has_hero = _valid_hero_url(hero_url)
     for row in rows:
+        if row.kind.startswith("inst_"):
+            if row.kind == "inst_total":
+                contents.append({"type": "separator", "margin": "sm"})
+            contents.append(_institutional_component(row, detail_url=detail_url))
+            continue
         if row.kind == "risk":
             if not has_hero:
                 contents.append(
@@ -280,6 +451,21 @@ def build_alt_text(trading_date: dt.date, count: int) -> str:
     return f"每日漲停股量化觀察 {trading_date:%m/%d}｜{count} 檔"
 
 
+def _institutional_fingerprint(detail: InstitutionalDetail10D | None) -> list | None:
+    """The full 10 x 3 table behind the 明細 image, not just the summary.
+
+    The summary rows (totals, streaks, buy/sell day counts) can stay equal
+    while individual days differ — e.g. FinMind revises two days in
+    opposite directions. The image would change, so the fingerprint must
+    too. The hosted URL is still excluded (see module docstring)."""
+    if detail is None:
+        return None
+    return [
+        [day.trading_date.isoformat(), day.foreign, day.trust, day.dealer]
+        for day in detail.days
+    ]
+
+
 def _fingerprint(
     *, alt_text: str, stocks: Sequence[ReportStockView], total_shown: int
 ) -> str:
@@ -289,6 +475,9 @@ def _fingerprint(
         "bubbles": [
             {
                 "id": stock.stock_id,
+                "institutional_detail": _institutional_fingerprint(
+                    stock.institutional_detail_10d
+                ),
                 "rows": [
                     [row.kind, row.text]
                     for row in _summary_rows(stock, total_shown=total_shown)
@@ -308,6 +497,7 @@ def build_flex_carousels(
     *,
     trading_date: dt.date,
     hero_urls: Mapping[str, str] | None = None,
+    detail_urls: Mapping[str, str] | None = None,
 ) -> list[FlexCarousel]:
     """Carousel message(s) for today's stocks, in rank order.
 
@@ -319,6 +509,7 @@ def build_flex_carousels(
     if not stocks:
         raise FlexBuildError("no stocks to build a carousel from")
     hero_urls = hero_urls or {}
+    detail_urls = detail_urls or {}
     total_shown = len(stocks)
 
     carousels: list[FlexCarousel] = []
@@ -334,6 +525,7 @@ def build_flex_carousels(
                     stock,
                     total_shown=total_shown,
                     hero_url=hero_urls.get(stock.stock_id),
+                    detail_url=detail_urls.get(stock.stock_id),
                 )
                 for stock in chunk
             ],

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+from app.charts.institutional_detail_renderer import render_institutional_detail_png
 from app.charts.stock_chart_renderer import render_stock_chart_png
 from app.reports.flex_builder import (
     MAX_BUBBLES_PER_CAROUSEL,
@@ -101,6 +102,7 @@ def write_flex_preview(
     trading_date: dt.date,
     output_dir: Path,
     render: Callable[[ReportStockView], bytes] = render_stock_chart_png,
+    detail_render: Callable[[ReportStockView], bytes] = render_institutional_detail_png,
 ) -> FlexPreview:
     """Write PNGs + carousel JSON into `output_dir` and describe them.
 
@@ -134,8 +136,31 @@ def write_flex_preview(
         png_paths[stock.stock_id] = output_dir / filename
         hero_urls[stock.stock_id] = PLACEHOLDER_HERO_BASE + filename
 
+    # 📊 明細 images: written next to the chart PNGs (open them to check the
+    # image itself); the card links to a placeholder URL, like the heroes.
+    detail_urls: dict[str, str] = {}
+    for stock in stocks:
+        if stock.institutional_detail_10d is None:
+            continue
+        filename = _png_filename(stock.stock_id, trading_date).replace(
+            ".png", "_institutional.png"
+        )
+        try:
+            (output_dir / filename).write_bytes(detail_render(stock))
+        except Exception:  # noqa: BLE001 - one image must not stop the preview
+            logger.exception(
+                "institutional_detail_render_failed stock_id=%s report_date=%s",
+                stock.stock_id,
+                trading_date,
+            )
+            continue
+        detail_urls[stock.stock_id] = PLACEHOLDER_HERO_BASE + filename
+
     carousels = build_flex_carousels(
-        stocks, trading_date=trading_date, hero_urls=hero_urls
+        stocks,
+        trading_date=trading_date,
+        hero_urls=hero_urls,
+        detail_urls=detail_urls,
     )
 
     previews: list[CarouselPreview] = []

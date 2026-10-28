@@ -129,6 +129,7 @@ def test_body_matches_the_spec_layout():
         "量比 14.13×｜5D +13.7%",
         "低檔首板：❌ 否",
         "漲多過熱：❌ 否",
+        "⚪ 法人籌碼｜資料不足",
         "資料完整度：90%",
         "⚠️ 追價風險／開板風險",
     ]
@@ -395,3 +396,162 @@ def test_flex_builder_does_not_re_derive_a_signal():
     code = source.split('"""', 2)[-1]
     for token in ("0.30", "range_position", "RANGE_POSITION", "HIGH_FIVE_DAY_RETURN >"):
         assert token not in code
+
+
+# ---- 法人籌碼 (10-session detail) ------------------------------------------
+
+from app.domain.institutional_detail import (  # noqa: E402
+    InstitutionalDayLots,
+    InstitutionalDetail10D,
+)
+
+DETAIL_URL = (
+    "https://storage.googleapis.com/b/institutional/2026/10/21/"
+    "6150_20261021_abcd1234abcd1234.png"
+)
+
+
+def make_detail(rows=None) -> InstitutionalDetail10D:
+    # (外資, 投信, 自營商), oldest -> newest. Newest runs: 外資 連3買,
+    # 投信 連4買, 自營商 連3賣.
+    rows = rows or [
+        (1000, 50, 100),
+        (1000, 50, 100),
+        (-500, 50, 100),
+        (900, 80, -20),
+        (900, 70, 40),
+        (1000, -90, 40),
+        (-100, 100, 40),
+        (1300, 110, -10),
+        (1100, 120, -20),
+        (1000, 130, -30),
+    ]
+    start = dt.date(2026, 10, 7)
+    return InstitutionalDetail10D(
+        days=tuple(
+            InstitutionalDayLots(start + dt.timedelta(days=i), f, t, d)
+            for i, (f, t, d) in enumerate(rows)
+        )
+    )
+
+
+def inst_stock(**overrides):
+    return make_stock(institutional_detail_10d=make_detail(), **overrides)
+
+
+def test_card_without_detail_says_insufficient_and_has_no_button():
+    bubble = build_stock_bubble(
+        make_stock(), total_shown=1, hero_url=URL, detail_url=DETAIL_URL
+    )
+    assert "⚪ 法人籌碼｜資料不足" in body_texts(bubble)
+    assert "📊 明細" not in body_texts(bubble)
+    assert DETAIL_URL not in json.dumps(bubble)
+
+
+def test_summary_numbers_come_from_the_detail_object():
+    stock = inst_stock()
+    detail = stock.institutional_detail_10d
+    bubble = build_stock_bubble(stock, total_shown=1, hero_url=None)
+    body = body_texts(bubble)
+    assert "法人籌碼｜近10交易日" in body
+    # three category columns + the grand total, each from detail totals
+    assert f"{detail.category_total('foreign'):+,}張" in body
+    assert f"{detail.category_total('trust'):+,}張" in body
+    assert f"{detail.category_total('dealer'):+,}張" in body
+    assert f"{detail.grand_total:+,}張" in body
+    assert (
+        f"合計買超 {detail.total_buy_days} 日／賣超 {detail.total_sell_days} 日" in body
+    )
+    assert f"資料截至 {detail.as_of_date:%m/%d}" in body
+
+
+def test_streak_labels_match_the_detail_and_skip_one_day_runs():
+    body = body_texts(build_stock_bubble(inst_stock(), total_shown=1, hero_url=None))
+    assert "連3買" in body and "連4買" in body and "連3賣" in body
+    one_day = make_detail([(1000, 1000, -1000)] * 9 + [(-1000, 1000, 1000)])
+    body = body_texts(
+        build_stock_bubble(
+            make_stock(institutional_detail_10d=one_day), total_shown=1, hero_url=None
+        )
+    )
+    # 外資 / 自營商 end on a single-session reversal -> no "連1…" label at all
+    assert "連1買" not in body and "連1賣" not in body
+    assert "連10買" in body  # 投信 bought all ten sessions
+
+
+def test_detail_button_is_a_uri_action_to_the_hosted_image():
+    bubble = build_stock_bubble(
+        inst_stock(), total_shown=1, hero_url=None, detail_url=DETAIL_URL
+    )
+    assert "📊 明細" in body_texts(bubble)
+    boxes = [
+        node
+        for node in _walk(bubble["body"])
+        if isinstance(node, dict) and node.get("action", {}).get("uri") == DETAIL_URL
+    ]
+    assert len(boxes) == 1
+    assert boxes[0]["action"]["type"] == "uri"
+
+
+def _walk(node):
+    yield node
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item)
+
+
+@pytest.mark.parametrize(
+    "bad_url", [None, "", "http://example.com/a.png", "https://x/" + "a" * 1000]
+)
+def test_invalid_or_missing_detail_url_hides_only_the_button(bad_url):
+    bubble = build_stock_bubble(
+        inst_stock(), total_shown=1, hero_url=None, detail_url=bad_url
+    )
+    body = body_texts(bubble)
+    assert "📊 明細" not in body
+    assert "法人籌碼｜近10交易日" in body  # summary survives
+
+
+def test_fingerprint_covers_institutional_numbers_but_not_the_url():
+    base = inst_stock()
+    changed = make_stock(
+        institutional_detail_10d=make_detail([(5, 5, 5)] * 10),
+    )
+    fp = lambda stock, urls=None: build_flex_carousels(  # noqa: E731
+        [stock], trading_date=DAY, detail_urls=urls
+    )[0].fingerprint
+    assert fp(base) != fp(changed)
+    assert fp(base) == fp(base, {base.stock_id: DETAIL_URL})
+
+
+def test_twelve_bubbles_with_detail_stay_under_line_size_limit():
+    stocks = [inst_stock(rank=i + 1, stock_id=f"{1000 + i}") for i in range(12)]
+    carousels = build_flex_carousels(
+        stocks,
+        trading_date=DAY,
+        hero_urls={s.stock_id: URL for s in stocks},
+        detail_urls={s.stock_id: DETAIL_URL for s in stocks},
+    )
+    size = len(json.dumps(carousels[0].contents, ensure_ascii=False).encode("utf-8"))
+    assert size < flex_builder.MAX_FLEX_BYTES
+
+
+def test_fingerprint_changes_when_two_days_are_revised_in_opposite_directions():
+    # Same totals, same streaks, same buy/sell day counts, same summary
+    # rows — but two daily values moved, so the 明細 image would differ.
+    rows = [(1000, 50, 100)] * 10
+    revised = list(rows)
+    revised[2] = (1500, 50, 100)
+    revised[3] = (500, 50, 100)
+    a = make_stock(institutional_detail_10d=make_detail(rows))
+    b = make_stock(institutional_detail_10d=make_detail(revised))
+    assert (
+        a.institutional_detail_10d.grand_total == b.institutional_detail_10d.grand_total
+    )
+    fp = lambda stock: build_flex_carousels(  # noqa: E731
+        [stock], trading_date=DAY
+    )[0].fingerprint
+    assert fp(a) != fp(b)

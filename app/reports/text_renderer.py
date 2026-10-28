@@ -68,6 +68,7 @@ from app.domain.absolute_signal import (
 )
 from app.domain.chart_data import StockChartData
 from app.domain.eps_growth_builder import combine_fundamental_growth_signal
+from app.domain.institutional_detail import InstitutionalDetail10D
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.momentum_signal import (
     WEAK_MOMENTUM_SCORE_THRESHOLD,
@@ -396,6 +397,11 @@ class ReportStockView:
     # institutional_net_buy_ratio_5d itself holds — see that
     # function's own comments for why.
     institutional_data_cutoff: InstitutionalDataCutoff | None = None
+
+    # From StockFeatures.institutional_detail_10d: the one object the Flex
+    # 法人籌碼 summary, the 📊 明細 image's chart and its table all read.
+    # DISPLAY-ONLY; None -> the card says "法人籌碼｜資料不足".
+    institutional_detail_10d: InstitutionalDetail10D | None = None
 
     # relative_sample_size[factor] / relative_rank[factor]: carried
     # straight through from ScoredStock (see that dataclass's own
