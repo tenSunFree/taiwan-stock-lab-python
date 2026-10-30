@@ -603,19 +603,29 @@ available.
   version (no wall-clock timestamp embedded in it), which is what
   makes database-level idempotency actually hold across reruns
 - The report FORMAT itself is separately versioned via
-  `MESSAGE_VERSION` (currently `flex-v3` for the Flex carousel; the
+  `MESSAGE_VERSION` (currently `flex-v4` for the Flex carousel; the
   plain-text fallback report is `text-v16`) — bumped whenever the
   rendered template's shape or line semantics change, independent of
   `STRATEGY_VERSION`'s scoring-logic versioning, so a format-only
   change and a scoring-only change can each be tracked and
   idempotency-keyed without conflating the two
-- As of `flex-v3` the carousel is preceded by a one-line plain-text
+- As of `flex-v4` every card carries a **法人籌碼｜近10交易日** block
+  (外資／投信／自營商 10-session net buy/sell in 張, streaks, 合計買超／賣超
+  day counts, data cut-off date) and a tappable **📊 明細** URI action that
+  opens a pre-rendered portrait PNG hosted next to the K-line charts
+  (`institutional/YYYY/MM/DD/{stock_id}_{YYYYMMDD}_{hash}.png`, immutable).
+  It is DISPLAY-ONLY: scoring, `FACTOR_WEIGHTS` and the existing 3-day /
+  5-day institutional signals are untouched. If the 10 sessions cannot be
+  fully confirmed the card says `⚪ 法人籌碼｜資料不足` and hides the button;
+  a failed image upload drops only the button. Dry-run previews
+  (`REPORT_DRY_RUN`) also write `*_institutional.png` next to the charts.
+- As of `flex-v3` (still true in `flex-v4`) the carousel is preceded by a one-line plain-text
   headline (`每日漲停股量化觀察 MM/DD｜N 檔`, N = the total number of
   stocks shown), sent as its own delivery part: a one-carousel day is
   `p01-of-02` (headline) + `p02-of-02` (cards), and a 13-stock day is
   `p01-of-03` (headline) + two carousels. If any part fails the run
   fails and later parts are not attempted; a rerun that rebuilds the
-  same `flex-v3` parts skips the ones already sent and resumes from the
+  same `flex-v4` parts skips the ones already sent and resumes from the
   failed one. If a later rerun falls back to the plain-text report
   instead (`text-v16`), that is a different message version and
   therefore a separate delivery identity, not a resume

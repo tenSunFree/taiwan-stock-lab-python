@@ -217,6 +217,7 @@ from app.db.eps_observation_repository import EpsObservationRepository
 from app.db.models import EpsCumulativeObservation, IngestionRun, MessageDelivery
 from app.delivery.service import DeliveryService, OutboundMessage
 from app.domain.eps_growth_builder import build_eps_growth_sustained_signal
+from app.domain.institutional_detail import build_institutional_detail
 from app.domain.institutional_flow_builder import (
     build_institutional_net_buy_positive,
     build_institutional_net_buy_ratio,
@@ -235,7 +236,10 @@ from app.domain.technical_signal_builder import (
     build_low_with_rising_signal,
 )
 from app.domain.valuation_filter import filter_candidates_by_pe
-from app.reports.chart_images import prepare_chart_heroes
+from app.reports.chart_images import (
+    prepare_chart_heroes,
+    prepare_institutional_detail_links,
+)
 from app.reports.flex_builder import build_alt_text, build_flex_carousels
 from app.reports.flex_preview import run_flex_preview
 from app.reports.report_builder import build_report_stocks
@@ -255,6 +259,7 @@ from app.ingestion.financial_statement_client import (
 )
 from app.ingestion.finmind_mapper import (
     build_historical_price_points,
+    build_institutional_category_points,
     build_institutional_flow_points,
     build_monthly_revenue_points,
     build_stock_master,
@@ -536,7 +541,12 @@ STRATEGY_VERSION = "rule-v1.2.0"
 # ("每日漲停股量化觀察 MM/DD｜N 檔") so the headline shows above the cards.
 # That adds a delivery part, so part numbers shift (p01 is the headline, the
 # carousel(s) follow) -> new version.
-MESSAGE_VERSION = "flex-v3"
+#
+# flex-v4: every bubble gains the 法人籌碼 block (10-session 外資／投信／自營商
+# summary, or "資料不足") and, when the detail image is hosted, a 📊 明細 URI
+# action. Visible content change -> new version, so a same-day rerun after
+# deploy cannot collide with flex-v3 delivery records.
+MESSAGE_VERSION = "flex-v4"
 TEXT_MESSAGE_VERSION = "text-v16"
 
 # CRITICAL for delivery idempotency: the same
@@ -888,6 +898,7 @@ def build_stock_features(
     institutional_success_count = 0
     institutional_none_count = 0
     institutional_failure_count = 0
+    institutional_detail_count = 0
     revenue_success_count = 0
     revenue_none_count = 0
     revenue_failure_count = 0
@@ -1028,6 +1039,11 @@ def build_stock_features(
         # the ratio's failure handling below rather than needing its
         # own separate counters.
         institutional_net_buy_3d_positive = None
+        # DISPLAY-ONLY 10-session 外資/投信/自營商 detail (see
+        # app.domain.institutional_detail). Built from the SAME rows and
+        # volume_by_date as above, but in its own try/except further down
+        # (after the scoring block) so neither path can hide the other.
+        institutional_detail_10d = None
         # Populated below from whatever institutional_rows we manage
         # to fetch and parse, regardless of whether the ratio/3d-
         # positive calculations themselves ultimately succeed —
@@ -1037,6 +1053,10 @@ def build_stock_features(
         # data was actually obtained this run, even on total fetch
         # failure (empty list, same as "no flow data confirmed").
         flow_points: list = []
+        # The raw FinMind rows, kept outside the try below so the 10-session
+        # detail (its own try/except further down) can still run when the
+        # scoring path above raised, and vice versa.
+        institutional_rows: list = []
 
         try:
             institutional_payload = finmind_client.fetch_stock_institutional_investors(
@@ -1083,6 +1103,28 @@ def build_stock_features(
                 "institutional_net_buy_ratio_5d remains None",
                 stock_id,
             )
+
+        # --- 10-session 外資/投信/自營商 detail: DISPLAY-ONLY, fully decoupled ---
+        # Same rows, independent failure domain: an exception in the
+        # ratio / 3-day signal path above does not hide the detail, and an
+        # exception here never touches scoring (the reverse of the above).
+        if institutional_rows:
+            try:
+                institutional_detail_10d = build_institutional_detail(
+                    target_date=target_date,
+                    category_points=build_institutional_category_points(
+                        institutional_rows, expected_stock_id=stock_id
+                    ),
+                    volume_by_date=volume_by_date,
+                )
+            except Exception:  # noqa: BLE001 - display-only
+                institutional_detail_10d = None
+                logger.exception(
+                    "institutional_detail_failed stock_id=%s; 法人籌碼 shows 資料不足",
+                    stock_id,
+                )
+            if institutional_detail_10d is not None:
+                institutional_detail_count += 1
 
         # Resolved unconditionally from volume_by_date (always
         # populated from block 1 above, independent of this block's
@@ -1297,6 +1339,7 @@ def build_stock_features(
             institutional_net_buy_ratio_5d=institutional_net_buy_ratio_5d,
             institutional_net_buy_3d_positive=institutional_net_buy_3d_positive,
             institutional_data_cutoff=institutional_data_cutoff,
+            institutional_detail_10d=institutional_detail_10d,
             chart_data=chart_data,
             technical_low_with_rising_signal=technical_low_with_rising_signal,
             technical_low_first_limit_up_signal=technical_low_first_limit_up_signal,
@@ -1353,6 +1396,11 @@ def build_stock_features(
         institutional_success_count,
         institutional_none_count,
         institutional_failure_count,
+    )
+    logger.info(
+        "Institutional-detail (10 sessions): candidates=%d available=%d",
+        len(candidates),
+        institutional_detail_count,
     )
     logger.info(
         "Monthly-revenue enrichment: candidates=%d success=%d none=%d failed=%d",
@@ -1423,7 +1471,7 @@ def build_outbound_messages(
     """The messages to deliver and the message_version they go out under.
 
     Qualified stocks -> a one-line headline text, then the Flex carousel(s)
-    (flex-v3). Anything that stops the
+    (flex-v4). Anything that stops the
     carousel from being built -> the plain-text report (text-v16). A
     stock-level chart problem never gets here: prepare_chart_heroes only
     drops that stock's hero image. No qualified stock -> the text
@@ -1440,8 +1488,14 @@ def build_outbound_messages(
         hero_urls = prepare_chart_heroes(
             report_stocks, trading_date=target_date, uploader=uploader
         )
+        detail_urls = prepare_institutional_detail_links(
+            report_stocks, trading_date=target_date, uploader=uploader
+        )
         carousels = build_flex_carousels(
-            report_stocks, trading_date=target_date, hero_urls=hero_urls
+            report_stocks,
+            trading_date=target_date,
+            hero_urls=hero_urls,
+            detail_urls=detail_urls,
         )
         flex_messages = [
             OutboundMessage.flex(

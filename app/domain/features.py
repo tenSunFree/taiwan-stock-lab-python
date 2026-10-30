@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.domain.chart_data import StockChartData
+from app.domain.institutional_detail import InstitutionalDetail10D
 from app.domain.institutional_flow_builder import InstitutionalDataCutoff
 from app.domain.technical_signal_builder import LowFirstLimitUpSignal
 
@@ -194,6 +195,12 @@ class StockFeatures:
     # working unchanged. Wiring this into daily_ranking.py is step 7's
     # job; intentionally left untouched here.
     institutional_data_cutoff: InstitutionalDataCutoff | None = None
+
+    # DISPLAY-ONLY 10-session 外資/投信/自營商 detail behind the card's
+    # 法人籌碼 block and its 📊 明細 image (see
+    # app.domain.institutional_detail). Never read by scoring. None means
+    # the 10 sessions could not be fully confirmed -> "資料不足".
+    institutional_detail_10d: InstitutionalDetail10D | None = None
 
     # Drawable K-line series for the LINE chart/Flex card (see
     # app.domain.chart_data): up to 120 sessions of FinMind history

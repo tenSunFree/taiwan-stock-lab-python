@@ -3244,7 +3244,7 @@ def test_pipeline_features_flow_through_report_builder_into_a_rendered_chart():
     assert render_stock_chart_png(view).startswith(b"\x89PNG")
 
 
-# --- Flex carousel delivery (flex-v3) + text fallback (text-v16) ------------
+# --- Flex carousel delivery (flex-v4) + text fallback (text-v16) ------------
 
 
 def _flex_run(
@@ -3359,7 +3359,7 @@ HERO_URL = "https://storage.googleapis.com/b/charts/2026/08/07/6150_20260807_abc
 def test_message_versions_are_flex_v3_and_text_v16():
     from app.jobs.daily_ranking import MESSAGE_VERSION, TEXT_MESSAGE_VERSION
 
-    assert MESSAGE_VERSION == "flex-v3"
+    assert MESSAGE_VERSION == "flex-v4"
     assert TEXT_MESSAGE_VERSION == "text-v16"
 
 
@@ -3391,8 +3391,8 @@ def test_qualified_stocks_are_delivered_as_headline_then_one_flex_carousel(
     assert bubble["hero"]["url"] == HERO_URL
     assert bubble["hero"]["action"] == {"type": "uri", "uri": HERO_URL}
     assert [r.message_version for r in session.query(MessageDelivery).all()] == [
-        "flex-v3:p01-of-02",
-        "flex-v3:p02-of-02",
+        "flex-v4:p01-of-02",
+        "flex-v4:p02-of-02",
     ]
 
 
@@ -3528,3 +3528,116 @@ def test_a_chart_failure_for_every_stock_still_sends_the_flex_card(
     assert result == 0
     bubble = bodies[1]["messages"][0]["contents"]["contents"][0]
     assert "hero" not in bubble
+
+
+# --- 10-session institutional detail (display-only) wiring -------------------
+
+_DETAIL_NAMES = [
+    "Foreign_Investor",
+    "Foreign_Dealer_Self",
+    "Investment_Trust",
+    "Dealer_self",
+    "Dealer_Hedging",
+]
+
+
+def _make_named_institutional_rows(
+    count: int = 10, *, start=dt.date(2026, 6, 11), buy=1000, sell=200, stock_id="1101"
+):
+    return [
+        {
+            "date": (start + dt.timedelta(days=i)).isoformat(),
+            "stock_id": stock_id,
+            "name": name,
+            "buy": buy,
+            "sell": sell,
+        }
+        for i in range(count)
+        for name in _DETAIL_NAMES
+    ]
+
+
+def _features_with_institutional_rows(rows):
+    from app.jobs.daily_ranking import build_stock_features
+
+    client = FakeHistoryFinMindClient(
+        rows_by_stock={"1101": _make_history_rows(20, volume="1000000")},
+        institutional_rows_by_stock={"1101": rows},
+    )
+    [feature] = build_stock_features(
+        candidates=[
+            _make_candidate(
+                "1101", close="44.65", turnover="100000000", volume=3_000_000
+            )
+        ],
+        target_date=TARGET_DATE,
+        finmind_client=client,
+        ingestion_run_id="run-1",
+        risk_policy=RiskPolicy(),
+    )
+    return feature
+
+
+def test_build_stock_features_carries_the_10_session_institutional_detail():
+    feature = _features_with_institutional_rows(_make_named_institutional_rows())
+
+    detail = feature.institutional_detail_10d
+    assert detail is not None
+    assert len(detail.days) == 10
+    assert detail.as_of_date == dt.date(2026, 6, 20)
+    # each day: 外資 2 rows x 800 = 1,600 sh -> 2 lots; 投信 800 -> 1; 自營商 1,600 -> 2
+    assert (detail.days[0].foreign, detail.days[0].trust, detail.days[0].dealer) == (
+        2,
+        1,
+        2,
+    )
+    assert detail.grand_total == 50
+    # the scoring / 3-day signals are computed exactly as before
+    assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.institutional_net_buy_3d_positive is True
+
+
+def test_build_stock_features_detail_is_none_for_rows_without_investor_names():
+    # The pre-existing fixtures carry no `name`; the aggregate signals keep
+    # working while the detail fails closed to "資料不足".
+    feature = _features_with_institutional_rows(
+        _make_institutional_rows(10, start=dt.date(2026, 6, 11))
+    )
+    assert feature.institutional_detail_10d is None
+    assert feature.institutional_net_buy_ratio_5d is not None
+
+
+def test_build_stock_features_detail_is_none_when_a_session_is_missing():
+    rows = [
+        r
+        for r in _make_named_institutional_rows()
+        if r["date"] != "2026-06-15"  # one whole day absent -> no zero fill
+    ]
+    feature = _features_with_institutional_rows(rows)
+    assert feature.institutional_detail_10d is None
+
+
+def test_detail_failure_never_touches_scoring_inputs(monkeypatch):
+    import app.jobs.daily_ranking as job
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("mapper bug")
+
+    monkeypatch.setattr(job, "build_institutional_category_points", boom)
+    feature = _features_with_institutional_rows(_make_named_institutional_rows())
+    assert feature.institutional_detail_10d is None
+    assert feature.institutional_net_buy_ratio_5d is not None
+    assert feature.institutional_net_buy_3d_positive is True
+
+
+def test_scoring_path_failure_does_not_hide_the_detail(monkeypatch):
+    import app.jobs.daily_ranking as job
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("aggregate builder bug")
+
+    monkeypatch.setattr(job, "build_institutional_flow_points", boom)
+    feature = _features_with_institutional_rows(_make_named_institutional_rows())
+    assert feature.institutional_net_buy_ratio_5d is None  # old path degraded
+    assert feature.institutional_detail_10d is not None  # new path unaffected
+    assert feature.institutional_detail_10d.grand_total == 50

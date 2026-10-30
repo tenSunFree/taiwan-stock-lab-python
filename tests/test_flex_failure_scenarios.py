@@ -113,7 +113,7 @@ def test_an_invalid_bucket_name_disables_images_but_not_the_card(monkeypatch, ca
             target_date=__import__("datetime").date(2026, 8, 7),
             chart_uploader=None,
         )
-    assert version == "flex-v3"
+    assert version == "flex-v4"
     assert messages[0].payload == {
         "type": "text",
         "text": "每日漲停股量化觀察 08/07｜1 檔",
@@ -208,9 +208,9 @@ def test_second_carousel_failing_is_resumed_without_resending_the_first(
 
     rows = {r.message_version: r.status for r in session.query(MessageDelivery).all()}
     assert rows == {
-        "flex-v3:p01-of-03": "SUCCESS",
-        "flex-v3:p02-of-03": "SUCCESS",
-        "flex-v3:p03-of-03": "FAILED",
+        "flex-v4:p01-of-03": "SUCCESS",
+        "flex-v4:p02-of-03": "SUCCESS",
+        "flex-v4:p03-of-03": "FAILED",
     }
 
     resent: list[int] = []
@@ -248,7 +248,7 @@ def test_line_5xx_fails_the_run_and_does_not_fall_back_to_text(
 
     assert result == 1
     assert "line_send_failed report_date=2026-08-07" in caplog.text
-    assert "message_version=flex-v3" in caplog.text
+    assert "message_version=flex-v4" in caplog.text
     # the headline is the first part and LINE refuses it: every attempt is that
     # same headline, the cards are never sent, and nothing falls back to the
     # text report

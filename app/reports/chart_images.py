@@ -25,6 +25,7 @@ import datetime as dt
 import logging
 from typing import Callable, Sequence
 
+from app.charts.institutional_detail_renderer import render_institutional_detail_png
 from app.charts.stock_chart_renderer import render_stock_chart_png
 from app.reports.text_renderer import ReportStockView
 from app.storage.chart_image_uploader import (
@@ -81,3 +82,58 @@ def prepare_chart_heroes(
 
         heroes[stock.stock_id] = uploaded.url
     return heroes
+
+
+def prepare_institutional_detail_links(
+    stocks: Sequence[ReportStockView],
+    *,
+    trading_date: dt.date,
+    uploader: ChartImageUploader | None,
+    render: Callable[[ReportStockView], bytes] = render_institutional_detail_png,
+) -> dict[str, str]:
+    """stock_id -> hosted 明細 image URL, for the stocks whose image made it.
+
+    Same failure policy as prepare_chart_heroes: NEVER raises for one
+    stock. A stock without a detail (insufficient data), whose image
+    cannot be drawn or whose upload fails is simply absent, and the Flex
+    card then omits the 📊 明細 button while keeping everything else.
+
+    Logging categories (greppable):
+        institutional_detail_render_failed
+        image_upload_failed (kind=institutional_detail, from the uploader)
+    """
+    if uploader is None:
+        return {}
+
+    links: dict[str, str] = {}
+    for stock in stocks:
+        if stock.institutional_detail_10d is None:
+            continue  # "法人籌碼｜資料不足" card, nothing to log
+
+        try:
+            png = render(stock)
+        except Exception:  # noqa: BLE001 - ChartRenderError and anything unexpected
+            logger.exception(
+                "institutional_detail_render_failed stock_id=%s report_date=%s",
+                stock.stock_id,
+                trading_date,
+            )
+            continue
+
+        try:
+            uploaded = uploader.upload_institutional_detail(
+                stock_id=stock.stock_id, trading_date=trading_date, png_bytes=png
+            )
+        except ChartImageUploadError:
+            continue  # already logged by the uploader
+        except Exception:  # noqa: BLE001 - never let one stock break the push
+            logger.exception(
+                "image_upload_failed kind=institutional_detail stock_id=%s "
+                "report_date=%s",
+                stock.stock_id,
+                trading_date,
+            )
+            continue
+
+        links[stock.stock_id] = uploaded.url
+    return links

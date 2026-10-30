@@ -281,6 +281,7 @@ def build_report_stocks(
                 risk_missing_inputs=scored.risk_missing_inputs,
                 # --- Absolute Signal / Relative Score separation ---
                 institutional_data_cutoff=features.institutional_data_cutoff,
+                institutional_detail_10d=features.institutional_detail_10d,
                 relative_sample_size=dict(scored.relative_sample_size),
                 relative_rank=dict(scored.relative_rank),
                 # --- K-line chart / Flex: one report model, three renderers ---

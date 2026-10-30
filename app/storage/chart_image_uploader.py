@@ -67,6 +67,10 @@ from PIL import Image, UnidentifiedImageError
 logger = logging.getLogger("chart_image_uploader")
 
 OBJECT_PREFIX = "charts"
+# 10-session institutional detail image (opened by a URI action, NOT shown
+# in a Flex image component, so LINE's 1024x1024 Flex limit does not apply;
+# our policy still caps it, see DETAIL_MAX_IMAGE_HEIGHT).
+DETAIL_OBJECT_PREFIX = "institutional"
 CONTENT_TYPE = "image/png"
 # Immutable name -> safe to cache for a year.
 CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -75,6 +79,7 @@ HASH_LENGTH = 16
 MAX_URL_LENGTH = 2000
 MAX_IMAGE_WIDTH = 1024
 MAX_IMAGE_HEIGHT = 1024
+DETAIL_MAX_IMAGE_HEIGHT = 2048
 LINE_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 # OUR policy (not a LINE limit): keep hero images small.
 APP_MAX_IMAGE_BYTES = 1024 * 1024
@@ -113,7 +118,9 @@ def validate_bucket_name(name: str) -> bool:
     return False
 
 
-def validate_png(png_bytes: bytes) -> tuple[int, int]:
+def validate_png(
+    png_bytes: bytes, *, max_height: int = MAX_IMAGE_HEIGHT
+) -> tuple[int, int]:
     """Return (width, height) of a PNG that LINE and our policy accept.
 
     Raises ChartImageUploadError with a reason that says WHICH rule failed.
@@ -143,9 +150,9 @@ def validate_png(png_bytes: bytes) -> tuple[int, int]:
         raise ChartImageUploadError(f"image format is {fmt}, expected PNG")
     if frames > 1:
         raise ChartImageUploadError("animated PNG is not allowed")
-    if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+    if width > MAX_IMAGE_WIDTH or height > max_height:
         raise ChartImageUploadError(
-            f"image is {width}x{height}, over LINE's {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT} limit"
+            f"image is {width}x{height}, over the {MAX_IMAGE_WIDTH}x{max_height} limit"
         )
     return width, height
 
@@ -251,6 +258,23 @@ def build_object_name(stock_id: str, trading_date: dt.date, png_bytes: bytes) ->
     )
 
 
+def build_detail_object_name(
+    stock_id: str, trading_date: dt.date, png_bytes: bytes
+) -> str:
+    """institutional/YYYY/MM/DD/{stock_id}_{YYYYMMDD}_{hash16}.png
+
+    Immutable by construction, exactly like build_object_name: the hash of
+    the bytes is part of the name, so a link in an old card can only ever
+    show the image that card was sent with."""
+    if not _STOCK_ID_RE.fullmatch(stock_id):
+        raise ChartImageUploadError(f"invalid stock_id for object name: {stock_id!r}")
+    digest = hashlib.sha256(png_bytes).hexdigest()[:HASH_LENGTH]
+    return (
+        f"{DETAIL_OBJECT_PREFIX}/{trading_date:%Y/%m/%d}/"
+        f"{stock_id}_{trading_date:%Y%m%d}_{digest}.png"
+    )
+
+
 def build_public_url(base_url: str, object_name: str) -> str:
     return f"{base_url.rstrip('/')}/{quote(object_name, safe='/')}"
 
@@ -296,11 +320,42 @@ class ChartImageUploader:
             )
             raise
 
-    def _upload(
-        self, stock_id: str, trading_date: dt.date, png_bytes: bytes
+    def upload_institutional_detail(
+        self, *, stock_id: str, trading_date: dt.date, png_bytes: bytes
     ) -> UploadedChartImage:
-        validate_png(png_bytes)
-        object_name = build_object_name(stock_id, trading_date, png_bytes)
+        """Host the 10-session institutional detail PNG (taller than a hero
+        image) and return its immutable public URL. Same failure contract
+        as upload_chart: ChartImageUploadError after one logged
+        `image_upload_failed ... kind=institutional_detail` line."""
+        try:
+            return self._upload(
+                stock_id,
+                trading_date,
+                png_bytes,
+                name_builder=build_detail_object_name,
+                max_height=DETAIL_MAX_IMAGE_HEIGHT,
+            )
+        except ChartImageUploadError as exc:
+            logger.error(
+                "image_upload_failed kind=institutional_detail stock_id=%s "
+                "trading_date=%s reason=%s",
+                stock_id,
+                trading_date,
+                exc,
+            )
+            raise
+
+    def _upload(
+        self,
+        stock_id: str,
+        trading_date: dt.date,
+        png_bytes: bytes,
+        *,
+        name_builder: Callable[[str, dt.date, bytes], str] = build_object_name,
+        max_height: int = MAX_IMAGE_HEIGHT,
+    ) -> UploadedChartImage:
+        validate_png(png_bytes, max_height=max_height)
+        object_name = name_builder(stock_id, trading_date, png_bytes)
         url = build_public_url(self._base_url, object_name)
         if len(url) > MAX_URL_LENGTH:
             raise ChartImageUploadError(
