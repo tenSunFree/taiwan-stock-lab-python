@@ -270,6 +270,50 @@ available.
   market's candidates with `eps_growth_sustained = None` for the run,
   never silently treated as "confirmed not sustained"
 
+### News Events (official announcements)
+
+Groundwork for a "近期焦點" (recent developments) line on each card.
+**Not yet wired into `daily_ranking.py`**: nothing in this section
+affects scoring, ranking, the report text, the Flex cards, or delivery.
+News is only ever framed as recent developments, never as an explanation
+of why a stock hit limit-up.
+
+- TWSE `t187ap04_L` and TPEx `mopsfin_t187ap04_O` 每日重大訊息 open data
+  are fetched by `AnnouncementClient`, a `MarketDataClient` subclass, so
+  it inherits raw-snapshot-before-parse and the bounded retry policy
+  (timeouts and 5xx retried, 4xx never). Run `python -m app.jobs.news_spike`
+  to check both endpoints and their column names against live data; each
+  market is reported independently, so one failing never hides the other
+- `RawArticle` keeps `published_at` and `fetched_at` as separate,
+  timezone-aware fields. Only `published_at` decides 盤中/盤後 (13:30
+  Taipei cut-off); `fetched_at` is when this pipeline happened to see it
+- The open data carries no per-announcement URL, so `original_url` is
+  `None` for official announcements and `source_url` records the data
+  source instead. A source-page link is never presented as the article
+  itself; consumers use `RawArticle.link` to get the honest label
+- A payload missing required columns raises `AnnouncementFormatError`
+  (every row may be misread); an individual row with no stock code, no
+  title, or an unparseable date/time is dropped and counted. An empty
+  time is never read as 00:00:00, which would turn missing data into a
+  fake 盤中 announcement
+- `article_id` is `sha256(market | stock_id | published_at | title)`.
+  Official announcements are de-duplicated by `article_id` only (they
+  share one `source_url`, which must never merge distinct announcements);
+  media articles would additionally be de-duplicated by canonical URL
+- `app.news.preprocess`: `published_at` window filter, exact de-duplication,
+  title normalization, and similarity clustering into **candidate** groups.
+  No LLM is involved here; candidate groups are only suggestions for a
+  later confirmation step, and wrongly merging two different events is
+  considered worse than leaving duplicates un-merged
+- `raw_articles` table with idempotent `NewsRepository.save_new()`:
+  re-fetching never duplicates a row or rewrites the original
+  `fetched_at`. Created through the same `checkfirst=True` bootstrap as
+  the other tables (`ensure_news_tables()`); nothing calls it from the
+  daily job yet
+- `config/news-v1.yaml` holds the planned window lengths and ranking
+  weights. Like `strategy-v1.yaml`'s penalty table, no loader reads it
+  yet
+
 ### Risk Policy
 
 - Official attention/disposition/managed status is tri-state
@@ -749,6 +793,16 @@ On the phone, confirm in order:
 
 ## Roadmap
 
+- **News events (in progress)** — official-announcement ingestion,
+  storage and preprocessing exist (see Features → News Events). Still to
+  come, in this order: LLM-assisted same-event grouping, category and
+  neutral summary (strict schema validation, falling back to the original
+  title on any failure), explainable event ranking with a stored score
+  breakdown, a per-run snapshot, and finally a "近期焦點" block on the
+  Flex cards. A "更多新聞" button that replies on tap needs an HTTPS
+  webhook receiver, which this batch-only project does not have yet (the
+  same prerequisite as Phase 6 below); the alternative is a pre-rendered
+  page linked by URI, like the 📊 明細 button
 - **Phase 6** — Multi-recipient subscriber management: today's
   Broadcast mode sends to every current friend of the Official
   Account, which is intentionally simple for a small family/friend
@@ -914,6 +968,7 @@ pip install -r requirements.txt
 pytest -v                          # run the full test suite
 pytest -x --tb=short               # fail fast, short traceback (mirrors CI)
 python -m app.jobs.daily_ranking   # run the pipeline locally
+python -m app.jobs.news_spike      # check TWSE/TPEx announcement endpoints against live data (no DB, no LINE)
 ```
 
 ### Configuration
@@ -924,6 +979,10 @@ When tuning thresholds after backtesting, create a new
 `strategy_version` (e.g. `rule-v1.2.0`) rather than overwriting the
 existing file, so historical ranking results keep a stable reference
 baseline.
+
+News-module settings (planned window lengths and ranking weights) live
+separately in `config/news-v1.yaml` and follow the same rule: tune by
+creating a new version, not by overwriting. No code reads that file yet.
 
 Environment variables consumed by the job (see
 `.github/workflows/daily-limit-up-ranking.yml`):
@@ -1159,6 +1218,22 @@ pytest -v
   correct light and that `total_score` is provably unaffected by
   which Absolute Signal ends up rendered
 
+- News-module tests (`test_announcement_mapper.py`,
+  `test_announcement_client.py`, `test_news_models.py`,
+  `test_news_preprocess.py`, `test_news_repository.py`,
+  `test_news_spike.py`) covering ROC date/time parsing (an empty time is
+  `None`, never midnight), header cleanup (stray spaces and BOM),
+  loud failure on a missing required column vs. counted per-row drops,
+  the 13:30 盤後 boundary, rejection of naive datetimes and empty URLs,
+  window filtering on `published_at` rather than `fetched_at`,
+  de-duplication that never merges distinct announcements sharing one
+  source URL, clustering that never crosses stock codes, raw snapshotting
+  and 4xx-not-retried behavior through the real `MarketDataClient` base
+  with `httpx.MockTransport`, a spike run where one market fails while
+  the other is still reported, and an idempotent SQLite repository
+  round-trip that preserves `original_url = None`. No test touches the
+  network
+
 See the badge at the top of this file for current test status.
 
 ---
@@ -1293,6 +1368,10 @@ app/ingestion/        Data source integration
                             dataset's own batch report date
   eps_period_converter.py    Converts cumulative (year-to-date) EPS into
                             genuine standalone per-quarter EPS
+  announcement_client.py    TWSE / TPEx 每日重大訊息 fetch client (a
+                            MarketDataClient subclass, source name "mops")
+  announcement_mapper.py    Announcement rows -> RawArticle; loud on a
+                            missing column, per-row drop counting
 
 app/reports/           Report rendering
   report_builder.py         ScoredStock + StockFeatures -> ReportStockView
@@ -1358,6 +1437,14 @@ app/reports/           Report rendering
                             the institutional T-1 cutoff line
                             (_render_institutional_cutoff_line)
 
+app/news/              News-event domain (pure logic, no I/O)
+  models.py                RawArticle / StockEvent / RankingBreakdown,
+                           ContentLevel, SummaryType, and the 13:30
+                           盤後 rule driven by published_at only
+  preprocess.py            Window filter, exact de-duplication, title
+                           normalization, similarity clustering into
+                           candidate groups
+
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
   idempotency.py              Idempotency key + retry key derivation
@@ -1390,9 +1477,13 @@ app/db/                SQLAlchemy ORM models
                             "insert, catch the UNIQUE-constraint conflict,
                             return the existing row" pattern as
                             delivery_repository.py
+  news_models.py             raw_articles table (+ ensure_news_tables())
+  news_repository.py         Idempotent raw-article save / window load
 
 app/jobs/              Scheduled job entry points
   daily_ranking.py            Full pipeline orchestration
+  news_spike.py               Manual check of the announcement endpoints
+                              against live data (no DB, no LINE)
 ```
 
 ---
@@ -1471,6 +1562,7 @@ app/jobs/              Scheduled job entry points
 taiwan-stock-lab-python
 ├─ app
 │  ├─ domain              # Pure business logic (see Architecture above)
+│  ├─ news                 # News-event domain models and preprocessing
 │  ├─ ingestion             # Market data providers and raw snapshot clients
 │  ├─ reports                # Report rendering
 │  ├─ clients                # External API clients (LINE, idempotency)
@@ -1478,7 +1570,8 @@ taiwan-stock-lab-python
 │  ├─ db                       # SQLAlchemy ORM models
 │  └─ jobs                     # Scheduled job entry points
 ├─ config
-│  └─ strategy-v1.yaml     # Versioned candidate/risk/factor-weight configuration
+│  ├─ strategy-v1.yaml     # Versioned candidate/risk/factor-weight configuration
+│  └─ news-v1.yaml          # News-module windows and ranking weights (not yet read by code)
 ├─ tests                    # Mirrors app/, one module per domain component
 ├─ .github
 │  └─ workflows
