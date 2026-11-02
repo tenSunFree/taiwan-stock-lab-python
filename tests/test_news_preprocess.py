@@ -76,3 +76,15 @@ def test_cluster_groups_similar_same_stock_only():
         [a, b, c, other], stock_names={"2352": "佳世達", "2330": "台積電"}
     )
     assert sorted(len(g) for g in groups) == [1, 1, 2]
+
+
+def test_dedup_media_url_is_scoped_to_each_stock():
+    url = "https://news.com/shared-article"
+    for_2352 = art("A", aid="1", stock="2352", original_url=url)
+    for_2330 = art("A", aid="2", stock="2330", original_url=url)
+    again_2352 = art("A copy", aid="3", stock="2352", original_url=url)
+    kept = dedup_exact([for_2352, for_2330, again_2352])
+    assert sorted((a.stock_id, a.article_id) for a in kept) == [
+        ("2330", "2"),
+        ("2352", "1"),
+    ]

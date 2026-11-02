@@ -72,19 +72,20 @@ def dedup_exact(articles: Iterable[RawArticle]) -> list[RawArticle]:
     """
     Official open data has no per-item URL, so it dedups by article_id
     only (a shared source_url must never merge distinct announcements).
-    Media news dedups by article_id OR canonical original_url.
+    Media news dedups by article_id OR (stock_id, canonical original_url):
+    one article about two stocks must stay a candidate for each stock.
     """
     seen_ids: set[str] = set()
-    seen_urls: set[str] = set()
+    seen_urls: set[tuple[str, str]] = set()
     out: list[RawArticle] = []
     for a in sorted(articles, key=lambda x: x.published_at):
         if a.article_id in seen_ids:
             continue
         if a.original_url:
-            cu = canonical_url(a.original_url)
-            if cu in seen_urls:
+            key = (a.stock_id, canonical_url(a.original_url))
+            if key in seen_urls:
                 continue
-            seen_urls.add(cu)
+            seen_urls.add(key)
         seen_ids.add(a.article_id)
         out.append(a)
     return out

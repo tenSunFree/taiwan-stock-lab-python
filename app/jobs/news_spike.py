@@ -41,8 +41,13 @@ def run(client: AnnouncementClient, now: dt.datetime) -> int:
             continue
         rows = payload.raw_payload
         print("rows:", len(rows) if isinstance(rows, list) else type(rows).__name__)
-        if isinstance(rows, list) and rows:
-            print("columns:", list(rows[0].keys()))
+        first_row = (
+            next((r for r in rows if isinstance(r, dict)), None)
+            if isinstance(rows, list)
+            else None
+        )
+        if first_row is not None:
+            print("columns:", list(first_row.keys()))
         try:
             result = build_announcement_articles(rows, market=market, fetched_at=now)
         except Exception as exc:

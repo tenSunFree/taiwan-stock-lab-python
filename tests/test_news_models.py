@@ -7,6 +7,8 @@ from app.news.models import (
     ContentLevel,
     RankingBreakdown,
     RawArticle,
+    StockEvent,
+    SummaryType,
     is_after_hours,
 )
 
@@ -63,3 +65,39 @@ def test_model_validation():
 
 def test_ranking_breakdown_total():
     assert RankingBreakdown(30, 20, 10, 15).total == 75
+
+
+def test_link_label_is_official_only_for_official_articles():
+    official = art("o", official=True)
+    media_without_url = art("m", official=False)
+    assert official.link[0] == "查看官方來源 ↗"
+    assert media_without_url.link == ("查看來源 ↗", "https://src")
+
+
+def _event(*articles):
+    return StockEvent(
+        event_id="e1",
+        stock_id="2352",
+        category="公告",
+        summary="s",
+        summary_type=SummaryType.ORIGINAL_TITLE,
+        published_at=NOW,
+        relevance_score=1.0,
+        ranking_breakdown=None,
+        articles=tuple(articles),
+    )
+
+
+def test_stock_event_requires_at_least_one_article():
+    with pytest.raises(ValueError):
+        _event()
+
+
+def test_primary_article_prefers_official_then_earliest():
+    early_media = art("m", when=dt.datetime(2026, 10, 28, 9, 0, tzinfo=TAIPEI_TZ))
+    late_official = art(
+        "o",
+        official=True,
+        when=dt.datetime(2026, 10, 29, 9, 0, tzinfo=TAIPEI_TZ),
+    )
+    assert _event(early_media, late_official).primary_article is late_official

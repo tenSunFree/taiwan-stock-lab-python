@@ -17,7 +17,7 @@ original_url vs source_url:
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 TAIPEI_TZ = dt.timezone(dt.timedelta(hours=8))
@@ -74,7 +74,10 @@ class RawArticle:
         """(LINE label, url). Never pretends a source page is the article."""
         if self.original_url:
             return "查看原文 ↗", self.original_url
-        return "查看官方來源 ↗", self.source_url
+        # Only official open data may be labelled as the official source;
+        # a media article that merely lacks a URL gets a neutral label.
+        label = "查看官方來源 ↗" if self.is_official else "查看來源 ↗"
+        return label, self.source_url
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,11 @@ class StockEvent:
     published_at: dt.datetime
     relevance_score: float
     ranking_breakdown: RankingBreakdown | None
-    articles: tuple[RawArticle, ...] = field(default_factory=tuple)
+    articles: tuple[RawArticle, ...]
+
+    def __post_init__(self) -> None:
+        if not self.articles:
+            raise ValueError("StockEvent requires at least one article")
 
     @property
     def ranking_score(self) -> float:
@@ -113,6 +120,4 @@ class StockEvent:
     @property
     def primary_article(self) -> RawArticle:
         """Official first, then earliest — LINE V1 shows one source."""
-        return sorted(self.articles, key=lambda a: (not a.is_official, a.published_at))[
-            0
-        ]
+        return min(self.articles, key=lambda a: (not a.is_official, a.published_at))

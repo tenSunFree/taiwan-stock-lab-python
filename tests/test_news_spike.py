@@ -38,3 +38,18 @@ def test_spike_survives_one_source_failing(capsys):
     assert run(client, NOW) == 1  # TPEx failed, TWSE still reported
     out = capsys.readouterr().out
     assert "mapped: 1" in out and "FETCH FAILED" in out
+
+
+def test_spike_does_not_crash_when_first_row_is_not_an_object(capsys):
+    def handler(request):
+        if "twse" in str(request.url):
+            return httpx.Response(200, json=["junk", make_row()])
+        return httpx.Response(200, json=[make_row()])
+
+    client = AnnouncementClient(
+        MemoryRepository(),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert run(client, NOW) == 0  # both markets reported
+    out = capsys.readouterr().out
+    assert out.count("columns:") == 2 and "dropped: 1" in out
