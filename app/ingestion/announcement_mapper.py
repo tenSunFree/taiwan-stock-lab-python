@@ -73,11 +73,39 @@ def make_article_id(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# TPEx uses English keys for these two columns (confirmed with real data);
+# the rest of its columns are Chinese like TWSE.
+COLUMN_ALIASES = {
+    "SecuritiesCompanyCode": "公司代號",
+    "CompanyName": "公司名稱",
+}
+
+_CJK = re.compile(r"[\u3000-\u303f\u3400-\u9fff\uff00-\uffef]")
+
+
+def tidy_title(text: str) -> str:
+    """Join hard line breaks in a 主旨. The source wraps long titles mid-
+    sentence ('…更名\n為「…」'): drop the break next to CJK text, otherwise
+    use one space. Applied before article_id so the id is stable."""
+    parts = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+    if not parts:
+        return ""
+    out = parts[0]
+    for nxt in parts[1:]:
+        glue = "" if _CJK.match(nxt[0]) or _CJK.match(out[-1]) else " "
+        out += glue + nxt
+    return re.sub(r"[ \t]{2,}", " ", out)
+
+
 def _clean(row: dict[str, Any]) -> dict[str, str]:
-    return {
+    cleaned = {
         str(k).replace("\ufeff", "").strip(): ("" if v is None else str(v)).strip()
         for k, v in row.items()
     }
+    for alias, canonical in COLUMN_ALIASES.items():
+        if canonical not in cleaned and alias in cleaned:
+            cleaned[canonical] = cleaned[alias]
+    return cleaned
 
 
 def build_announcement_articles(
@@ -107,7 +135,7 @@ def build_announcement_articles(
     names: dict[str, str] = {}
     dropped = len(rows) - len(cleaned)
     for row in cleaned:
-        stock_id, title = row.get("公司代號", ""), row.get("主旨", "")
+        stock_id, title = row.get("公司代號", ""), tidy_title(row.get("主旨", ""))
         if not stock_id or not title:
             dropped += 1
             continue

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 TAIPEI_TZ = dt.timezone(dt.timedelta(hours=8))
+MARKET_OPEN = dt.time(9, 0)  # before this => 盤前
 MARKET_CLOSE = dt.time(13, 30)  # published at/after this => 盤後
 
 ALLOWED_CATEGORIES = frozenset({"公告", "財報", "法說", "產業", "法人"})
@@ -35,6 +36,21 @@ class ContentLevel(str, Enum):
 class SummaryType(str, Enum):
     AI_SUMMARY = "AI_SUMMARY"
     ORIGINAL_TITLE = "ORIGINAL_TITLE"
+
+
+class MarketSession(str, Enum):
+    PRE_MARKET = "盤前"  # < 09:00 (also weekends/holidays are not modelled)
+    INTRADAY = "盤中"  # 09:00 <= t < 13:30
+    AFTER_HOURS = "盤後"  # >= 13:30
+
+
+def market_session(published_at: dt.datetime) -> MarketSession:
+    t = published_at.astimezone(TAIPEI_TZ).time()
+    if t < MARKET_OPEN:
+        return MarketSession.PRE_MARKET
+    if t < MARKET_CLOSE:
+        return MarketSession.INTRADAY
+    return MarketSession.AFTER_HOURS
 
 
 def is_after_hours(published_at: dt.datetime) -> bool:
@@ -68,6 +84,10 @@ class RawArticle:
     @property
     def is_after_hours(self) -> bool:
         return is_after_hours(self.published_at)
+
+    @property
+    def session(self) -> MarketSession:
+        return market_session(self.published_at)
 
     @property
     def link(self) -> tuple[str, str]:

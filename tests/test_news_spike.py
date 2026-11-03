@@ -53,3 +53,17 @@ def test_spike_does_not_crash_when_first_row_is_not_an_object(capsys):
     assert run(client, NOW) == 0  # both markets reported
     out = capsys.readouterr().out
     assert out.count("columns:") == 2 and "dropped: 1" in out
+
+
+def test_spike_labels_pre_market_announcement(capsys):
+    early = make_row(發言時間="070003")
+
+    def handler(request):
+        return httpx.Response(200, json=[early])
+
+    client = AnnouncementClient(
+        MemoryRepository(),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert run(client, NOW) == 0
+    assert "盤前" in capsys.readouterr().out

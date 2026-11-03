@@ -7,6 +7,7 @@ from app.ingestion.announcement_mapper import (
     build_announcement_articles,
     parse_date,
     parse_time,
+    tidy_title,
 )
 from app.news.models import TAIPEI_TZ, ContentLevel
 
@@ -109,3 +110,50 @@ def test_mapper_non_list_and_empty():
 def test_mapper_rejects_unknown_market():
     with pytest.raises(ValueError):
         build_announcement_articles([make_row()], market="NYSE", fetched_at=NOW)
+
+
+TPEX_ROW = {
+    "Date": "1151101",
+    "發言日期": "1151101",
+    "發言時間": "070003",
+    "SecuritiesCompanyCode": "6949",
+    "CompanyName": "某公司",
+    "主旨": "公告本公司股票面額變更",
+    "符合條款": "第51款",
+    "事實發生日": "1151101",
+    "說明": "",
+}
+
+
+def test_mapper_accepts_tpex_english_column_names():
+    res = build_announcement_articles([TPEX_ROW], market="TPEX", fetched_at=NOW)
+    assert res.dropped == 0 and len(res.articles) == 1
+    a = res.articles[0]
+    assert (a.stock_id, a.market) == ("6949", "TPEX")
+    assert res.stock_names == {"6949": "某公司"}
+    assert a.session.value == "盤前"
+
+
+def test_canonical_column_wins_over_alias():
+    row = make_row(SecuritiesCompanyCode="9999")
+    res = build_announcement_articles([row], market="TWSE", fetched_at=NOW)
+    assert res.articles[0].stock_id == "2352"
+
+
+def test_title_line_breaks_are_joined():
+    assert tidy_title("更名\n為「世紀能源」") == "更名為「世紀能源」"
+    assert tidy_title("依臺證上一字第1121801204\r\n號函辦理") == (
+        "依臺證上一字第1121801204號函辦理"
+    )
+    assert tidy_title("see\nnote") == "see note"
+    assert tidy_title(" \n ") == ""
+
+
+def test_mapper_title_tidied_before_id():
+    a = build_announcement_articles(
+        [make_row(**{"主旨 ": "更名\n為新名"})], market="TWSE", fetched_at=NOW
+    ).articles[0]
+    b = build_announcement_articles(
+        [make_row(**{"主旨 ": "更名為新名"})], market="TWSE", fetched_at=NOW
+    ).articles[0]
+    assert a.title == "更名為新名" and a.article_id == b.article_id

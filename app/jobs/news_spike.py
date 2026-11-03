@@ -56,8 +56,10 @@ def run(client: AnnouncementClient, now: dt.datetime) -> int:
             continue
         print(f"mapped: {len(result.articles)}  dropped: {result.dropped}")
         for a in result.articles[:3]:
-            tag = "盤後" if a.is_after_hours else "盤中"
-            print(f"  {a.stock_id} {a.published_at.isoformat()} {tag} {a.title[:40]}")
+            print(
+                f"  {a.stock_id} {a.published_at.isoformat()} "
+                f"{a.session.value} {a.title[:40]}"
+            )
     return rc
 
 

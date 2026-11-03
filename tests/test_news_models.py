@@ -5,11 +5,13 @@ import pytest
 from app.news.models import (
     TAIPEI_TZ,
     ContentLevel,
+    MarketSession,
     RankingBreakdown,
     RawArticle,
     StockEvent,
     SummaryType,
     is_after_hours,
+    market_session,
 )
 
 NOW = dt.datetime(2026, 10, 31, 20, 0, tzinfo=TAIPEI_TZ)
@@ -38,6 +40,19 @@ def test_after_hours_boundary():
     d = dt.datetime(2026, 10, 30, tzinfo=TAIPEI_TZ)
     assert not is_after_hours(d.replace(hour=13, minute=29))
     assert is_after_hours(d.replace(hour=13, minute=30))
+
+
+def test_market_session_boundaries():
+    d = dt.datetime(2026, 10, 30, tzinfo=TAIPEI_TZ)
+    cases = [
+        ((8, 59), MarketSession.PRE_MARKET),
+        ((9, 0), MarketSession.INTRADAY),
+        ((13, 29), MarketSession.INTRADAY),
+        ((13, 30), MarketSession.AFTER_HOURS),
+    ]
+    for (h, m), expected in cases:
+        assert market_session(d.replace(hour=h, minute=m)) == expected
+    assert [s.value for s in MarketSession] == ["盤前", "盤中", "盤後"]
 
 
 def test_model_validation():
