@@ -1,0 +1,32 @@
+# News Event Module V1 — all values are V1 heuristics (spec §25/§26),
+# NOT research conclusions. Tune by creating news-v1.1 etc.
+news_version: news-v1.0.0
+
+windows:
+  main_card_trading_days: 3      # try 3 trading days first
+  main_card_max_trading_days: 5  # widen to 5 if nothing found
+  detail_calendar_days: 7
+
+preprocess:
+  title_similarity_threshold: 0.60   # candidate grouping only; LLM confirms
+
+ranking:
+  importance:
+    financial_report: 30
+    major_order: 30
+    company_announcement: 25
+    earnings_call: 20
+    industry: 10
+  bonuses:
+    direct_company: 20
+    official_source: 10
+  recency:
+    same_day: 15
+    previous_trading_day: 10
+    two_trading_days: 5
+
+llm:
+  provider: gemini
+  model: ""            # set via NEWS_LLM_MODEL env, never hard-coded
+  summary_target_chars: [20, 40]
+  summary_max_chars: 60
