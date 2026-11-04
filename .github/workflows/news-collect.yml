@@ -1,0 +1,129 @@
+name: news-collect
+
+# Stores the day's TWSE/TPEx 每日重大訊息 into raw_articles.
+#
+# No assumption is made about how many historical days the open-data
+# endpoints return: each run stores whatever batch it sees, so the rolling
+# window builds up from repeated runs. The job is idempotent (rows keyed by
+# article_id, existing rows untouched, first-seen fetched_at kept), so
+# running several times a day is cheap and safe. It never touches the
+# ranking pipeline or LINE.
+#
+# Runs every day (announcements also appear on weekends/holidays). Times
+# are Taipei: 09:17 / 15:17 / 21:17.
+on:
+  schedule:
+    - cron: "17 9,15,21 * * *"
+      timezone: "Asia/Taipei"
+
+  workflow_dispatch:
+
+# Nothing granted at the workflow level; the job requests only what it needs.
+permissions: {}
+
+# Never two collectors at once. queue: max lets every pending run wait
+# instead of a later trigger replacing an earlier pending one (same as
+# daily-limit-up-ranking.yml).
+concurrency:
+  group: news-collect
+  cancel-in-progress: false
+  queue: max
+
+env:
+  GCP_PROJECT_ID: travel-audio-guide-508205
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/1088235476550/locations/global/workloadIdentityPools/github/providers/taiwan-stock-lab
+  GCP_SERVICE_ACCOUNT: github-taiwan-stock-lab@travel-audio-guide-508205.iam.gserviceaccount.com
+  CLOUD_SQL_INSTANCE_CONNECTION_NAME: travel-audio-guide-508205:asia-east1:travel-db
+  # Same pinned Cloud SQL Auth Proxy + checksum as daily-limit-up-ranking.yml.
+  # Bump both workflows together.
+  CLOUD_SQL_PROXY_VERSION: v2.25.4
+  CLOUD_SQL_PROXY_SHA256: b780c0d2c445ffd5d2fdba0925f2722c19fcd0d2c27c538e85713732698561f2
+
+jobs:
+  collect:
+    name: Collect announcements
+    # Holds production credentials: never runs outside main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read   # actions/checkout
+      id-token: write  # GitHub OIDC token for Workload Identity Federation
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Download Cloud SQL Auth Proxy (checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cloud-sql-proxy \
+            "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          echo "${CLOUD_SQL_PROXY_SHA256}  cloud-sql-proxy" | sha256sum --check --strict
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --version
+
+      - name: Start Cloud SQL Auth Proxy on 127.0.0.1:5432
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup ./cloud-sql-proxy \
+            --address 127.0.0.1 \
+            --port 5432 \
+            "${CLOUD_SQL_INSTANCE_CONNECTION_NAME}" \
+            > "${RUNNER_TEMP}/cloud-sql-proxy.log" 2>&1 &
+          echo "PROXY_PID=$!" >> "$GITHUB_ENV"
+
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+              echo "Cloud SQL Auth Proxy is listening on 127.0.0.1:5432"
+              exit 0
+            fi
+            if ! kill -0 "$!" 2>/dev/null; then
+              echo "::error::Cloud SQL Auth Proxy exited early"
+              cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::Cloud SQL Auth Proxy did not start listening within 30s"
+          cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+          exit 1
+
+      - name: Collect announcements into raw_articles
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.jobs.news_collect
+
+      - name: Show Cloud SQL Auth Proxy log
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP}/cloud-sql-proxy.log" ]]; then
+            cat "${RUNNER_TEMP}/cloud-sql-proxy.log"
+          fi
+
+      - name: Stop Cloud SQL Auth Proxy
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${PROXY_PID:-}" ]]; then
+            kill "${PROXY_PID}" 2>/dev/null || true
+          fi
