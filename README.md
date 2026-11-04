@@ -284,6 +284,14 @@ of why a stock hit limit-up.
   (timeouts and 5xx retried, 4xx never). Run `python -m app.jobs.news_spike`
   to check both endpoints and their column names against live data; each
   market is reported independently, so one failing never hides the other
+- No assumption is made about how many historical days the open-data
+  endpoints return; each run stores whatever batch it sees, so the
+  multi-day window builds up from repeated runs. The `news-collect` workflow
+  runs `python -m app.jobs.news_collect` three times a day (09:17 / 15:17 /
+  21:17 Taipei, including weekends). It is idempotent (rows keyed by
+  `article_id`, existing rows untouched), handles TWSE and TPEx
+  independently, and exits 1 if either source failed. It does not touch
+  ranking or LINE.
 - `RawArticle` keeps `published_at` and `fetched_at` as separate,
   timezone-aware fields. Only `published_at` decides 盤中/盤後 (13:30
   Taipei cut-off); `fetched_at` is when this pipeline happened to see it
@@ -308,8 +316,8 @@ of why a stock hit limit-up.
 - `raw_articles` table with idempotent `NewsRepository.save_new()`:
   re-fetching never duplicates a row or rewrites the original
   `fetched_at`. Created through the same `checkfirst=True` bootstrap as
-  the other tables (`ensure_news_tables()`); nothing calls it from the
-  daily job yet
+  the other tables (`ensure_news_tables()`), which `app.jobs.news_collect`
+  calls before storing; the daily ranking job does not use it yet
 - `config/news-v1.yaml` holds the planned window lengths and ranking
   weights. Like `strategy-v1.yaml`'s penalty table, no loader reads it
   yet
@@ -969,6 +977,7 @@ pytest -v                          # run the full test suite
 pytest -x --tb=short               # fail fast, short traceback (mirrors CI)
 python -m app.jobs.daily_ranking   # run the pipeline locally
 python -m app.jobs.news_spike      # check TWSE/TPEx announcement endpoints against live data (no DB, no LINE)
+python -m app.jobs.news_collect    # store today's announcements in raw_articles (needs DATABASE_URL)
 ```
 
 ### Configuration
@@ -1484,6 +1493,8 @@ app/jobs/              Scheduled job entry points
   daily_ranking.py            Full pipeline orchestration
   news_spike.py               Manual check of the announcement endpoints
                               against live data (no DB, no LINE)
+  news_collect.py             Idempotent daily store of TWSE/TPEx
+                              announcements into raw_articles
 ```
 
 ---
