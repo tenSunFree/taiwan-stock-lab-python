@@ -22,6 +22,7 @@ import datetime as dt
 import logging
 import os
 import sys
+from collections import Counter
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -30,7 +31,10 @@ from sqlalchemy.orm import Session
 from app.db.news_models import ensure_news_tables
 from app.db.news_repository import NewsRepository
 from app.ingestion.announcement_client import AnnouncementClient
-from app.ingestion.announcement_mapper import build_announcement_articles
+from app.ingestion.announcement_mapper import (
+    build_announcement_articles,
+    parse_date,
+)
 from app.ingestion.market_data_client import RawSourcePayload, new_ingestion_run_id
 from app.news.models import TAIPEI_TZ
 
@@ -46,6 +50,31 @@ class MemoryRepository:
 
     def save(self, payload: RawSourcePayload) -> None:
         self.saved.append(payload)
+
+
+REPORT_DATE_KEYS = ("出表日期", "Date")  # TWSE / TPEx name for the dataset date
+
+
+def _format_counts(counts: Counter) -> str:
+    return ",".join(f"{d.isoformat()}:{n}" for d, n in sorted(counts.items())) or "-"
+
+
+def _report_date_counts(rows: object) -> Counter:
+    """Distribution of the dataset's own 出表日期 (TPEx: Date). Logged only,
+    to learn how fresh each endpoint's batch is; never used for storage."""
+    counts: Counter = Counter()
+    if not isinstance(rows, list):
+        return counts
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key, value in row.items():
+            if str(key).replace("\ufeff", "").strip() in REPORT_DATE_KEYS:
+                d = parse_date(str(value))
+                if d is not None:
+                    counts[d] += 1
+                break
+    return counts
 
 
 def run(client: AnnouncementClient, engine: Engine, now: dt.datetime) -> int:
@@ -66,12 +95,19 @@ def run(client: AnnouncementClient, engine: Engine, now: dt.datetime) -> int:
             logger.exception("news_collect_failed market=%s", market)
             rc = 1
             continue
+        published = Counter(
+            a.published_at.astimezone(TAIPEI_TZ).date() for a in result.articles
+        )
         logger.info(
-            "news_collect_ok market=%s mapped=%d dropped=%d inserted=%d",
+            "news_collect_ok market=%s raw=%d mapped=%d dropped=%d inserted=%d "
+            "published_dates=%s report_dates=%s",
             market,
+            len(payload.raw_payload) if isinstance(payload.raw_payload, list) else 0,
             len(result.articles),
             result.dropped,
             inserted,
+            _format_counts(published),
+            _format_counts(_report_date_counts(payload.raw_payload)),
         )
     return rc
 
