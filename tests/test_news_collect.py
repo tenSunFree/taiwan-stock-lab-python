@@ -135,3 +135,12 @@ def test_both_markets_share_one_run_id_and_taipei_date():
     assert len(saved) == 2
     assert len({p.ingestion_run_id for p in saved}) == 1
     assert {p.target_date for p in saved} == {dt.date(2026, 11, 3)}
+
+
+def test_log_reports_published_and_report_date_distribution(caplog):
+    with caplog.at_level(logging.INFO):
+        assert run(make_client(ok_handler), make_engine(), NOW) == 0
+    # rows were published 11/02 but the dataset itself is dated 11/03
+    assert "published_dates=2026-11-02:1" in caplog.text
+    assert "report_dates=2026-11-03:1" in caplog.text
+    assert "raw=1 mapped=1" in caplog.text
