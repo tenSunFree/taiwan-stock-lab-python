@@ -308,6 +308,18 @@ of why a stock hit limit-up.
   Official announcements are de-duplicated by `article_id` only (they
   share one `source_url`, which must never merge distinct announcements);
   media articles would additionally be de-duplicated by canonical URL
+- `app.news.classify` labels each announcement title with an event type
+  (財報, 股利盈餘, 增資減資發債, 人事異動, 資金貸與背書保證, ...) using
+  ordered keyword rules written against real TWSE/TPEx titles, and flags
+  notices a parent files on behalf of a subsidiary. The type is a coarse,
+  title-only label, not an event identity or a materiality score, and a
+  title that is ambiguous stays 其他 rather than being guessed. Most days a
+  company files several announcements that are different events rather
+  than duplicates, so type-aware grouping is planned; today
+  `preprocess.cluster_candidates` still groups by title similarity only,
+  which would merge e.g. 總經理異動 with 副總經理異動. 股價異常公告 (a
+  stock reaching the 注意交易資訊 criteria) is typed separately because it
+  follows price action rather than explaining it
 - `app.news.preprocess`: `published_at` window filter, exact de-duplication,
   title normalization, and similarity clustering into **candidate** groups.
   No LLM is involved here; candidate groups are only suggestions for a
@@ -1230,7 +1242,7 @@ pytest -v
 - News-module tests (`test_announcement_mapper.py`,
   `test_announcement_client.py`, `test_news_models.py`,
   `test_news_preprocess.py`, `test_news_repository.py`,
-  `test_news_spike.py`) covering ROC date/time parsing (an empty time is
+  `test_news_classify.py`, `test_news_spike.py`) covering ROC date/time parsing (an empty time is
   `None`, never midnight), header cleanup (stray spaces and BOM),
   loud failure on a missing required column vs. counted per-row drops,
   the 13:30 盤後 boundary, rejection of naive datetimes and empty URLs,
@@ -1453,6 +1465,9 @@ app/news/              News-event domain (pure logic, no I/O)
   preprocess.py            Window filter, exact de-duplication, title
                            normalization, similarity clustering into
                            candidate groups
+  classify.py              Rule-based event typing of announcement
+                           titles (財報, 股利, 人事異動, ...) and the
+                           "filed on behalf of a subsidiary" flag
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
