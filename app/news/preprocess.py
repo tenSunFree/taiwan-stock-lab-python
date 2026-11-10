@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import unicodedata
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -65,6 +66,84 @@ def filter_window(
         a
         for a in articles
         if start <= a.published_at.astimezone(TAIPEI_TZ).date() <= end
+    ]
+
+
+@dataclass(frozen=True)
+class RepeatedNotice:
+    """One official notice and its unchanged re-publications in this input.
+
+    `article` is the earliest entry in the INPUT, which is not necessarily
+    the first-ever announcement: see `collapse_repeats` on window scope.
+    """
+
+    article: RawArticle
+    first_published_at: dt.datetime
+    last_published_at: dt.datetime
+    occurrences: int
+    article_ids: tuple[str, ...]
+
+
+def _normalized_notice_text(value: str | None) -> str:
+    """NFKC and whitespace only. Unlike normalize_title() (fuzzy clustering),
+    an exact-notice identity must keep punctuation that may carry meaning."""
+    return " ".join(unicodedata.normalize("NFKC", value or "").split())
+
+
+def _repeat_identity(article: RawArticle) -> tuple[str, str, str, str] | None:
+    """Identity only for official TWSE/TPEx notices that have a 說明."""
+    if not article.is_official or article.market not in {"TWSE", "TPEX"}:
+        return None
+    title = _normalized_notice_text(article.title)
+    description = _normalized_notice_text(article.description)
+    if not title or not description:
+        return None
+    return article.market, article.stock_id, title, description
+
+
+def collapse_repeats(articles: Iterable[RawArticle]) -> list[RepeatedNotice]:
+    """
+    Merge official announcements the source re-publishes unchanged, e.g. a
+    company rename must be announced every day for three months.
+
+    Identity: (market, stock_id, NFKC+whitespace title, NFKC+whitespace
+    說明). The title alone is NOT enough: the same title can carry different
+    transactions (處分有價證券 on three days, each a different trade).
+    Media articles and announcements without a 說明 are never merged:
+    without it two same-titled notices cannot be told apart, and wrongly
+    merging two different events is worse than leaving a duplicate.
+    Repeated article_ids are ignored so duplicate input cannot inflate
+    `occurrences`. Result is ordered by first publication.
+
+    This is window-local: it only sees what is passed in. A notice that
+    recurs for months looks "new" in every window whose input starts after
+    its first day. To judge whether a notice is new, collapse over a longer
+    history and compare first_published_at with the window start.
+    """
+    groups: dict[tuple[str, str, str, str], list[RawArticle]] = {}
+    batches: list[list[RawArticle]] = []
+    seen_ids: set[str] = set()
+    for a in sorted(articles, key=lambda x: (x.published_at, x.article_id)):
+        if a.article_id in seen_ids:
+            continue
+        seen_ids.add(a.article_id)
+        identity = _repeat_identity(a)
+        if identity is None:
+            batches.append([a])
+            continue
+        if identity not in groups:
+            groups[identity] = []
+            batches.append(groups[identity])
+        groups[identity].append(a)
+    return [
+        RepeatedNotice(
+            article=g[0],
+            first_published_at=g[0].published_at,
+            last_published_at=g[-1].published_at,
+            occurrences=len(g),
+            article_ids=tuple(x.article_id for x in g),
+        )
+        for g in batches
     ]
 
 
