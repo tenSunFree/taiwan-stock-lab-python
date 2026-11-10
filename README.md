@@ -321,7 +321,18 @@ of why a stock hit limit-up.
   stock reaching the 注意交易資訊 criteria) is typed separately because it
   follows price action rather than explaining it
 - `app.news.preprocess`: `published_at` window filter, exact de-duplication,
-  title normalization, and similarity clustering into **candidate** groups.
+  `collapse_repeats`, title normalization, and similarity clustering into
+  **candidate** groups. `collapse_repeats` merges a notice the source
+  re-publishes unchanged (a company rename must be announced daily for
+  three months) and keeps the first occurrence with its first/last date and
+  count. The key is market, stock, title **and** 說明: the title alone would
+  merge different events that share a title (e.g. 處分有價證券 on separate
+  days, each a different trade), and an announcement without 說明 is never
+  merged. Only official TWSE/TPEx notices are merged and the comparison keeps
+  punctuation (NFKC and whitespace only). It is window-local: a notice that
+  recurs for months looks new in every window that starts after its first
+  day, so judge "new" by collapsing over a longer history and comparing
+  `first_published_at` with the window start.
   No LLM is involved here; candidate groups are only suggestions for a
   later confirmation step, and wrongly merging two different events is
   considered worse than leaving duplicates un-merged
