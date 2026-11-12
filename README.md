@@ -336,6 +336,13 @@ of why a stock hit limit-up.
   No LLM is involved here; candidate groups are only suggestions for a
   later confirmation step, and wrongly merging two different events is
   considered worse than leaving duplicates un-merged
+- `app.news.select`: picks one representative official notice per stock.
+  Order: importance tier (V1 heuristic per event type; 財報 is MEDIUM),
+  per-type priority, newer FIRST publication, then article_id. Routine
+  subsidiary notices drop one tier (not 重大事件/重大契約/財務警示);
+  注意交易資訊 is never a candidate; `since` ignores notices first
+  announced before the window. The tiers are not read from
+  `config/news-v1.yaml` yet.
 - `raw_articles` table with idempotent `NewsRepository.save_new()`:
   re-fetching never duplicates a row or rewrites the original
   `fetched_at`. Created through the same `checkfirst=True` bootstrap as
