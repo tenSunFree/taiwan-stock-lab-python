@@ -234,3 +234,6 @@ out/
 # Default ignored files
 /shelf/
 /workspace.xml
+
+# Local news validation reports (CSV and Markdown)
+news_validation/

@@ -343,6 +343,13 @@ of why a stock hit limit-up.
   注意交易資訊 is never a candidate; `since` ignores notices first
   announced before the window. The tiers are not read from
   `config/news-v1.yaml` yet.
+- `python -m app.jobs.news_validate --start YYYY-MM-DD --end YYYY-MM-DD`:
+  read-only check of the pipeline on stored announcements (Taipei dates).
+  Runs `collapse_repeats` / `classify_title` / `pick_representatives` and
+  writes `notices.csv`, `samples.csv` (資產交易 / 其他 / every picked 其他 / picked stocks, with
+  empty `expected_type` and `review_note` columns for manual review) and
+  `report.md`. It prepares the sample; precision and missed-event counts
+  need the manual columns. Needs `DATABASE_URL`.
 - `raw_articles` table with idempotent `NewsRepository.save_new()`:
   re-fetching never duplicates a row or rewrites the original
   `fetched_at`. Created through the same `checkfirst=True` bootstrap as
