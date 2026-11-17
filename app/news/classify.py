@@ -145,13 +145,6 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
         EventType.COMMITTEE,
         (_p(r"委員會"), _p(r"設置|設立|成立|更名|改名|改制|轉型|調整為")),
     ),
-    # Members of a committee (lists, appointments, by-elections): a personnel
-    # item, not a new committee.  '委員(?!會)' keeps 聯邦委員會 etc. out.
-    # '審計委員會委任會計師' matches neither this nor COMMITTEE: it stays 其他.
-    (
-        EventType.PERSONNEL_OTHER,
-        (_p(r"委員會.{0,10}(?:委員(?!會)|成員|人員異動|異動)" r"|(?:委員|成員)名單"),),
-    ),
     (
         EventType.EXECUTIVE_CHANGE,
         (
@@ -160,6 +153,14 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
             ),
             _p(r"異動|委任|任命|解任|辭任|新任|選任|卸任|退休|追認|改派|設置"),
         ),
+    ),
+    # After EXECUTIVE_CHANGE on purpose: '總經理暨…委員會委員異動' is an
+    # executive change.  Members of a committee (lists, appointments, by-elections): a personnel
+    # item, not a new committee.  '委員(?!會)' keeps 聯邦委員會 etc. out.
+    # '審計委員會委任會計師' matches neither this nor COMMITTEE: it stays 其他.
+    (
+        EventType.PERSONNEL_OTHER,
+        (_p(r"委員會.{0,10}(?:委員(?!會)|成員|人員異動|異動)" r"|(?:委員|成員)名單"),),
     ),
     # Avoid '委任' alone: contracts and service providers may be appointed.
     (
@@ -199,7 +200,7 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
                 r"(?:租賃|租約).{0,30}(?:資產|不動產|處分|終止)|"
                 r"理財商品|授信資產.{0,6}(?:轉讓|處分)|"
                 r"(?:購買|購入|購置|訂購|承購).{0,40}"
-                r"(?:貨櫃|設備|土地|用地|不動產|房屋|廠房|建物|貨輪|船|股份|股權|資產)"
+                r"(?:貨櫃|設備|土地|用地|不動產|房屋|廠房|建物|貨輪|船|股份(?!有限公司)|股權|資產)"
             ),
         ),
     ),

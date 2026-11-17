@@ -355,3 +355,18 @@ def test_validation_run_regressions(title, expected):
 )
 def test_second_review_regressions(title, expected):
     assert classify_title(title) is expected
+
+
+# From the CodeRabbit review of the validation-run fixes.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("公告本公司總經理暨永續發展委員會委員異動", T.EXECUTIVE_CHANGE),
+        ("公告本公司第二屆提名委員會委員", T.PERSONNEL_OTHER),
+        # '股份有限公司' in a counterparty name is not purchased shares
+        ("公告本公司簽訂購買甲股份有限公司雲端服務之重大合約", T.CONTRACT),
+        ("公告本公司購買乙公司股份", T.ASSET_TRANSACTION),
+    ],
+)
+def test_coderabbit_review_regressions(title, expected):
+    assert classify_title(title) is expected
