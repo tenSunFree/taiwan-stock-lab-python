@@ -141,7 +141,7 @@ def test_own_filings_about_a_subsidiary_are_not_subsidiary_notices(title):
             T.ORGANISATION_AND_INVESTMENT,
         ),
         ("本公司擬對子公司辦理現金增資", T.ORGANISATION_AND_INVESTMENT),
-        ("本公司董事會通過第三季合併營運報告事項", T.OTHER),
+        ("本公司董事會通過第三季合併營運報告事項", T.FINANCIAL_REPORT),
         ("代子公司X公告董事會決議辦理現金增資發行新股", T.CAPITAL_AND_DEBT),
         ("本公司115年10月份合併營收", T.MONTHLY_FIGURES),
         ("公告本公司股份合併案之合併基準日", T.ORGANISATION_AND_INVESTMENT),
@@ -149,7 +149,7 @@ def test_own_filings_about_a_subsidiary_are_not_subsidiary_notices(title):
         ("本公司與合作夥伴簽訂工程承攬契約", T.CONTRACT),
         ("公告本公司董事會通過變更營業地址", T.OTHER),
         ("代孫公司X公告員工認股權憑證轉換普通股之增資基準日", T.EMPLOYEE_EQUITY),
-        ("公告本公司補充說明資金貸與資訊", T.LOAN_GUARANTEE),
+        ("公告本公司補充說明資金貸與資訊", T.SUPPLEMENT),
         ("(補充公告)公告本公司董事會決議興建觀音廠相關事宜公告", T.SUPPLEMENT),
         (
             "公告本公司股票面額由「新台幣10元」變更為「新台幣0.5元」",
@@ -258,4 +258,115 @@ def test_non_string_is_rejected_explicitly():
     ],
 )
 def test_production_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+# Real titles from the 2026-11-01..13 validation run (samples.csv / notices.csv).
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        # financial reports: 營運報告 and a title truncated by the source
+        ("發佈本公司115年第三季合併營運報告之相關內容", T.FINANCIAL_REPORT),
+        ("公告本公司董事會通過115年第三季合併財務報", T.FINANCIAL_REPORT),
+        # 國際財務報導準則 is not a financial report notice
+        ("公告本公司採用國際財務報導準則之會計政策變動", T.OTHER),
+        # supplements and corrections refer to an earlier announcement
+        ("補充113年12月20日代子公司凱基證券公告取得不動產使用權資產", T.SUPPLEMENT),
+        ("更正本公司115年9月關係人交易申報資訊", T.SUPPLEMENT),
+        ("更正115年第3季XBRL合併財務報告公告資訊", T.SUPPLEMENT),
+        ("公告更正115年8月至9月背書保證申報資訊", T.SUPPLEMENT),
+        (
+            "(補充115/8/5公告)本公司以租地委建方式於台北港南碼頭新建五期廠房",
+            T.SUPPLEMENT,
+        ),
+        (
+            "(更正主旨)本公司董事會通過擬與美國UPower Energy LLC簽署合作備忘錄",
+            T.SUPPLEMENT,
+        ),
+        # ...but a clarification stays a clarification
+        (
+            "澄清115年11月03日工商時報A13之新聞內容(補充說明)",
+            T.INCIDENT_OR_CLARIFICATION,
+        ),
+        # a word that merely contains 補充 is not a supplement
+        ("公告本公司董事會通過子公司上市所出具補充承諾案", T.OTHER),
+        # treasury stock
+        ("公告董事會決議買回本公司股份", T.TREASURY_STOCK),
+        ("本公司董事會通過自集中交易市場買回公司股份", T.TREASURY_STOCK),
+        ("本公司董事會決議註銷買回股份辦理減資事宜", T.TREASURY_STOCK),
+        # committees: restructuring vs membership
+        (
+            "公告本公司董事會通過「薪資報酬委員會」改制為「薪酬暨提名委員會」",
+            T.COMMITTEE,
+        ),
+        ("公告本公司董事會決議審計委員會調整為審計暨風險管理委員會", T.COMMITTEE),
+        ("公告本公司第二屆提名委員會委員", T.PERSONNEL_OTHER),
+        ("公告本公司董事會補選薪資報酬委員會委員", T.PERSONNEL_OTHER),
+        ("公告本公司薪資報酬委員會異動", T.PERSONNEL_OTHER),
+        ("公告本公司第三屆企業永續發展委員會人員異動案", T.PERSONNEL_OTHER),
+        (
+            "本公司新藥獲墨西哥衛生風險保護聯邦委員會核准使用於成人真性紅血球增多症",
+            T.OTHER,
+        ),
+        ("公告本公司獨立董事對審計委員會及董事會議決事項表示反對意見", T.OTHER),
+        # investor forums
+        (
+            "公告本公司參加J.P. Morgan 和Morgan Stanley和BofA舉辦之投資論壇",
+            T.INVITED_INVESTOR_EVENT,
+        ),
+        ("本公司參加康和證券舉辦之投資論壇", T.INVITED_INVESTOR_EVENT),
+        # asset transactions
+        ("公告本公司購買新造貨櫃", T.ASSET_TRANSACTION),
+        ("本公司訂購機器設備公告", T.ASSET_TRANSACTION),
+        ("本公司董事會決議購入台中市營建用地", T.ASSET_TRANSACTION),
+        ("公告本公司董事會決議購置彰濱東三路12號廠房案", T.ASSET_TRANSACTION),
+        ("代孫公司濟南聯合製罐有限公司公告取得理財商品", T.ASSET_TRANSACTION),
+        ("代子公司台玻成都玻璃有限公司公告處分理財商品", T.ASSET_TRANSACTION),
+        ("公告授信資產之轉讓", T.ASSET_TRANSACTION),
+        # security incident wording
+        ("公告本公司電商網站資通安全事件及因應措施", T.INCIDENT_OR_CLARIFICATION),
+    ],
+)
+def test_validation_run_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+# Reproduced from a second review of the validation-run fixes.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("公告本公司選任審計委員會委員", T.PERSONNEL_OTHER),
+        ("公告本公司董事會委任第二屆提名委員會委員", T.PERSONNEL_OTHER),
+        ("公告本公司董事會補行委任薪資報酬委員會成員", T.PERSONNEL_OTHER),
+        ("公告本公司董事會決議設置提名委員會暨委任第一屆提名委員會委員", T.COMMITTEE),
+        ("公告本公司審計委員會委任會計師", T.OTHER),
+        ("公告本公司參加AI產業論壇", T.OTHER),
+        ("公告本公司授信資產管理政策調整", T.OTHER),
+        ("公告授信資產之債權處分", T.ASSET_TRANSACTION),
+        ("公告本公司取得工程承攬契約", T.CONTRACT),
+        (
+            "本公司代子公司國泰人壽公告以自地委建方式與關係人交易簽訂工程承攬契約書",
+            T.CONTRACT,
+        ),
+        ("公告本公司取得廠務工程", T.ASSET_TRANSACTION),
+        # a correction of an attention notice stays excluded, it is not a candidate
+        ("更正公告本公司股票列為注意交易資訊", T.MARKET_ATTENTION),
+    ],
+)
+def test_second_review_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+# From the CodeRabbit review of the validation-run fixes.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("公告本公司總經理暨永續發展委員會委員異動", T.EXECUTIVE_CHANGE),
+        ("公告本公司第二屆提名委員會委員", T.PERSONNEL_OTHER),
+        # '股份有限公司' in a counterparty name is not purchased shares
+        ("公告本公司簽訂購買甲股份有限公司雲端服務之重大合約", T.CONTRACT),
+        ("公告本公司購買乙公司股份", T.ASSET_TRANSACTION),
+    ],
+)
+def test_coderabbit_review_regressions(title, expected):
     assert classify_title(title) is expected

@@ -319,7 +319,10 @@ of why a stock hit limit-up.
   `preprocess.cluster_candidates` still groups by title similarity only,
   which would merge e.g. 總經理異動 with 副總經理異動. 股價異常公告 (a
   stock reaching the 注意交易資訊 criteria) is typed separately because it
-  follows price action rather than explaining it
+  follows price action rather than explaining it. A title that starts with
+  補充 or 更正 (or carries one in parentheses) is typed 補充公告 before any
+  other rule, because it refers to an earlier announcement and is not a
+  new event of that type
 - `app.news.preprocess`: `published_at` window filter, exact de-duplication,
   `collapse_repeats`, title normalization, and similarity clustering into
   **candidate** groups. `collapse_repeats` merges a notice the source

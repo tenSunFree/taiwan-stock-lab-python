@@ -55,14 +55,35 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
     # Avoid classifying a security-incident disclosure as generic finance.
     (
         EventType.INCIDENT_OR_CLARIFICATION,
-        (_p(r"澄清|資安事件|資訊安全事件|資料外洩|個資外洩|火災|爆炸|重大事故"),),
+        (
+            _p(
+                r"澄清|資安事件|資通安全事件|資訊安全事件|資料外洩|個資外洩|火災|爆炸|重大事故"
+            ),
+        ),
     ),
     # '集中交易' and '櫃檯買賣' alone are NOT evidence of abnormal trading.
     (
         EventType.MARKET_ATTENTION,
         (_p(r"注意交易資訊|注意股票|異常交易|交易異常|股價異常|成交量異常"),),
     ),
-    (EventType.FINANCIAL_REPORT, (_p(r"財務報告|財務報表|財報"),)),
+    # A supplement or correction refers to an EARLIER announcement, so it is
+    # not a new event of the underlying type (e.g. a correction of last
+    # year's asset notice).  Checked before the type rules on purpose.
+    (
+        EventType.SUPPLEMENT,
+        (
+            _p(
+                r"(?:^|[(（])\s*(?:公告)?(?:本公司)?\s*(?:補充|更正)"
+                r"|補充公告|補充說明|補充資訊|更正公告|更正資訊"
+            ),
+        ),
+    ),
+    # '財務報$': the source sometimes truncates the title mid-word.
+    # '財務報導' (e.g. 國際財務報導準則) is deliberately NOT matched.
+    (
+        EventType.FINANCIAL_REPORT,
+        (_p(r"財務報告|財務報表|財報|財務報$|季.{0,10}營運報告"),),
+    ),
     (EventType.FINANCIAL_WARNING, (_p(r"累積虧損"),)),
     # Monthly results may include '合併'; that does not mean M&A.
     (
@@ -89,7 +110,7 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
     ),
     (EventType.LOAN_GUARANTEE, (_p(r"資金貸與|背書保證"),)),
     (EventType.EMPLOYEE_EQUITY, (_p(r"限制員工權利|員工認股權|員工認購權"),)),
-    (EventType.TREASURY_STOCK, (_p(r"庫藏股"),)),
+    (EventType.TREASURY_STOCK, (_p(r"庫藏股|買回.{0,6}股份"),)),
     (
         EventType.DIVIDEND,
         (
@@ -120,7 +141,10 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
     ),
     (EventType.NON_COMPETE, (_p(r"競業禁止|解除經理人競業|競業限制"),)),
     # '委員會委員異動' should be PERSONNEL_OTHER, not setting up a committee.
-    (EventType.COMMITTEE, (_p(r"委員會"), _p(r"設置|設立|成立|更名|改名|委任|選任"))),
+    (
+        EventType.COMMITTEE,
+        (_p(r"委員會"), _p(r"設置|設立|成立|更名|改名|改制|轉型|調整為")),
+    ),
     (
         EventType.EXECUTIVE_CHANGE,
         (
@@ -129,6 +153,14 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
             ),
             _p(r"異動|委任|任命|解任|辭任|新任|選任|卸任|退休|追認|改派|設置"),
         ),
+    ),
+    # After EXECUTIVE_CHANGE on purpose: '總經理暨…委員會委員異動' is an
+    # executive change.  Members of a committee (lists, appointments, by-elections): a personnel
+    # item, not a new committee.  '委員(?!會)' keeps 聯邦委員會 etc. out.
+    # '審計委員會委任會計師' matches neither this nor COMMITTEE: it stays 其他.
+    (
+        EventType.PERSONNEL_OTHER,
+        (_p(r"委員會.{0,10}(?:委員(?!會)|成員|人員異動|異動)" r"|(?:委員|成員)名單"),),
     ),
     # Avoid '委任' alone: contracts and service providers may be appointed.
     (
@@ -145,10 +177,17 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
     ),
     (
         EventType.INVITED_INVESTOR_EVENT,
-        (_p(r"受邀參加|(?:參加|參與).{0,100}(?:法人說明會|法說會|投資人說明會)"),),
+        (
+            _p(
+                r"受邀參加|(?:參加|參與).{0,100}(?:法人說明會|法說會|投資人說明會|投資.{0,6}論壇)"
+            ),
+        ),
     ),
     (EventType.BRIEFING, (_p(r"法人說明會|法說會|記者會"),)),
     (EventType.SHAREHOLDER_MEETING, (_p(r"股東常會|股東臨時會|股東會"),)),
+    # A construction contract (承攬契約) is a contract even when the title also
+    # says 取得 or 工程; the 說明 of these notices carries 契約種類:工程承攬契約.
+    (EventType.CONTRACT, (_p(r"承攬(?:契約|合約)"),)),
     # Assets before generic contracts, e.g. acquiring property via contract.
     (
         EventType.ASSET_TRANSACTION,
@@ -158,7 +197,10 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
                 r"(?:取得|處分).{0,80}(?:資產|不動產|有價證券|設備|股權|土地|工程|廠房|房屋)|"
                 r"投資.{0,30}有價證券|"
                 r"(?:不動產|使用權資產|有價證券|機器設備).{0,40}(?:取得|處分|交易)|"
-                r"(?:租賃|租約).{0,30}(?:資產|不動產|處分|終止)"
+                r"(?:租賃|租約).{0,30}(?:資產|不動產|處分|終止)|"
+                r"理財商品|授信資產.{0,6}(?:轉讓|處分)|"
+                r"(?:購買|購入|購置|訂購|承購).{0,40}"
+                r"(?:貨櫃|設備|土地|用地|不動產|房屋|廠房|建物|貨輪|船|股份(?!有限公司)|股權|資產)"
             ),
         ),
     ),
@@ -166,12 +208,6 @@ _RULES: tuple[tuple[EventType, tuple[re.Pattern[str], ...]], ...] = (
     (
         EventType.BOARD_RESOLUTION_SUMMARY,
         (_p(r"重要決議|主要議案|董事會決議事項|重大決議事項|各項議案"),),
-    ),
-    # Supplementary status is a modifier: only label it here when the
-    # underlying event was not determined from the title.
-    (
-        EventType.SUPPLEMENT,
-        (_p(r"補充公告|補充說明|補充資訊|更正公告|更正資訊|^\W*補充"),),
     ),
 )
 
