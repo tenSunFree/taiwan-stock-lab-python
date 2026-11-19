@@ -346,6 +346,19 @@ of why a stock hit limit-up.
   注意交易資訊 is never a candidate; `since` ignores notices first
   announced before the window. The tiers are not read from
   `config/news-v1.yaml` yet.
+- `app.news.service.select_news`: the "recent focus" pick for the stocks of
+  one report (pure logic, not wired into the report yet). Window: the last
+  3 trading days before the report day, widened to 5 per stock only when it
+  has nothing suitable; only MEDIUM and HIGH notices count. Only rows first
+  fetched by a fixed cutoff (17:00 Taipei on the report day) are used, so a
+  later collection run is kept out of the result, provided every row up to
+  the cutoff is already committed when the report is first built
+  (`fetched_at` is the start time of a collection run); the storage-backed
+  caller has to guarantee that. Notices published on the report day are
+  never used. `history_start()` is a bounded look-back (90 days before the
+  widest window): a notice first announced earlier, with no copy in
+  between, still looks new. Statuses: HAS_EVENT, NO_SUITABLE_EVENT; a
+  source-failure status needs collection-run records and is not built yet.
 - `python -m app.jobs.news_validate --start YYYY-MM-DD --end YYYY-MM-DD`:
   read-only check of the pipeline on stored announcements (Taipei dates).
   Runs `collapse_repeats` / `classify_title` / `pick_representatives` and
