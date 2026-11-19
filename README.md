@@ -351,9 +351,13 @@ of why a stock hit limit-up.
   3 trading days before the report day, widened to 5 per stock only when it
   has nothing suitable; only MEDIUM and HIGH notices count. Only rows first
   fetched by a fixed cutoff (17:00 Taipei on the report day) are used, so a
-  later collection run cannot change a report already built for that day.
-  Load history with `history_start()` so a notice re-published for months
-  is not mistaken for news. Statuses: HAS_EVENT, NO_SUITABLE_EVENT; a
+  later collection run is kept out of the result, provided every row up to
+  the cutoff is already committed when the report is first built
+  (`fetched_at` is the start time of a collection run); the storage-backed
+  caller has to guarantee that. Notices published on the report day are
+  never used. `history_start()` is a bounded look-back (90 days before the
+  widest window): a notice first announced earlier, with no copy in
+  between, still looks new. Statuses: HAS_EVENT, NO_SUITABLE_EVENT; a
   source-failure status needs collection-run records and is not built yet.
 - `python -m app.jobs.news_validate --start YYYY-MM-DD --end YYYY-MM-DD`:
   read-only check of the pipeline on stored announcements (Taipei dates).

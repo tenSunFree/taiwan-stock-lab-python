@@ -207,3 +207,40 @@ def test_invalid_arguments_are_rejected():
         run([], base_days=5, max_days=3)
     with pytest.raises(ValueError):
         run([], fetched_before=dt.datetime(2026, 11, 18, 17, 0))
+
+
+def test_notice_published_on_the_report_day_is_never_used():
+    # published 10:00 on the report day and fetched 11:00 the same day
+    pub = at(18, 10)
+    same_day = art(REPORT, pub=pub)
+    same_day = RawArticle(**{**same_day.__dict__, "fetched_at": at(18, 11)})
+    snap = run([same_day])
+    assert snap.results["2330"].status is NewsStatus.NO_SUITABLE_EVENT
+    assert snap.latest_published_date is None
+
+
+def test_saturday_notice_is_still_allowed_in_a_monday_report():
+    sat = art(REPORT, pub=at(14, 10))
+    sat = RawArticle(**{**sat.__dict__, "fetched_at": at(16, 9, 17)})
+    snap = run([sat], report_date=dt.date(2026, 11, 16))
+    assert snap.results["2330"].status is NewsStatus.HAS_EVENT
+
+
+def test_window_wider_than_the_supported_bound_is_rejected_not_crashing_later():
+    with pytest.raises(ValueError):
+        run([], base_days=3, max_days=270)
+    run([], base_days=3, max_days=60)  # the bound itself works
+
+
+def test_wider_window_is_not_built_when_every_stock_is_resolved():
+    calls = []
+
+    def counting(day):
+        calls.append(day)
+        return day.weekday() < 5
+
+    run([art(REPORT, pub=at(17))], is_trading_day=counting)
+    narrow = len(calls)
+    calls.clear()
+    run([], is_trading_day=counting)  # nothing found -> wider pass is built
+    assert len(calls) > narrow

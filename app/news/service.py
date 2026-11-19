@@ -11,13 +11,22 @@ Rules (V1):
   * Only notices of at least `min_tier` (default MEDIUM) count; a stock
     whose best notice is LOW has no suitable event.
   * Only rows first fetched at or before a FIXED cutoff
-    (`snapshot_fetch_cutoff`) are used.  A later collection run, or a late
-    back-fill, therefore cannot change a report that was already built or
-    sent for the same day; delivery refuses changed content under the same
-    message version.
-  * A notice the source keeps re-publishing is judged by its first date.
-    Pass history from `history_start()` so that date is the real one; with
-    only the window as input it would look new.
+    (`snapshot_fetch_cutoff`) are used, and only notices published before
+    the report day.  This keeps a later collection run or back-fill out of
+    the result, but only if every row with fetched_at <= cutoff is already
+    committed when the report is first built: fetched_at is the START time
+    of a collection run, not the moment its rows became visible, so a run
+    that starts at 16:59 and commits at 17:01 would be missed by a build at
+    17:01 and admitted by a rebuild.  The storage-backed caller must close
+    that gap (e.g. require the collection run to have finished before the
+    cutoff, or persist the selection on the first build); this module does
+    not and cannot.  Delivery refuses changed content under the same
+    message version, so the gap matters.
+  * A notice the source keeps re-publishing is judged by the EARLIEST copy
+    in the rows supplied.  `history_start()` is a bounded look-back
+    (default 90 days before the widest window): a notice first announced
+    earlier than that, with no copy in between, looks new.  A caller that
+    must recognise older re-publications has to supply the earlier copy.
 """
 
 from __future__ import annotations
@@ -33,6 +42,9 @@ from app.news.select import Candidate, Tier, pick_representatives
 
 SNAPSHOT_CUTOFF_TIME = dt.time(17, 0)
 HISTORY_DAYS = 90
+# trading_days_window_start looks back at most 366 calendar days; 60 trading
+# days (about 85 calendar days) is far inside that for any real calendar.
+MAX_SUPPORTED_DAYS = 60
 
 
 class NewsStatus(str, Enum):
@@ -83,8 +95,10 @@ def history_start(
     max_days: int = 5,
     history_days: int = HISTORY_DAYS,
 ) -> dt.date:
-    """Earliest published date the caller should load, so notices that
-    began before the window are recognised as re-publications."""
+    """Earliest published date the caller should load (a bounded look-back:
+    `history_days` before the widest window), so most notices that began
+    before the window are recognised as re-publications.  One whose
+    earlier copies are all older than this is not."""
     last_day = previous_trading_day(report_date, is_trading_day)
     window_start = trading_days_window_start(last_day, max_days, is_trading_day)
     return window_start - dt.timedelta(days=history_days)
@@ -101,17 +115,23 @@ def select_news(
     base_days: int = 3,
     max_days: int = 5,
 ) -> NewsSnapshot:
-    if not 1 <= base_days <= max_days:
-        raise ValueError("need 1 <= base_days <= max_days")
+    if not 1 <= base_days <= max_days <= MAX_SUPPORTED_DAYS:
+        raise ValueError(f"need 1 <= base_days <= max_days <= {MAX_SUPPORTED_DAYS}")
     cutoff = fetched_before or snapshot_fetch_cutoff(report_date)
     if cutoff.tzinfo is None:
         raise ValueError("fetched_before must be timezone-aware")
     wanted = set(stock_ids)
 
+    # The report day itself is never part of the window: nothing published
+    # on it may be used, even if it was fetched before the cutoff.  A Saturday
+    # notice in a Monday report is still allowed.
+    report_day_start = dt.datetime.combine(report_date, dt.time.min, tzinfo=TAIPEI_TZ)
     usable = [
         a
         for a in articles
-        if a.stock_id in wanted and a.fetched_at <= cutoff and a.published_at <= cutoff
+        if a.stock_id in wanted
+        and a.fetched_at <= cutoff
+        and a.published_at < report_day_start
     ]
     latest = max(
         (a.published_at.astimezone(TAIPEI_TZ).date() for a in usable), default=None
@@ -121,6 +141,8 @@ def select_news(
     last_day = previous_trading_day(report_date, is_trading_day)
     results: dict[str, NewsResult] = {}
     for days in sorted({base_days, max_days}):
+        if wanted <= results.keys():
+            break  # every stock is resolved: do not build the wider window
         start = trading_days_window_start(last_day, days, is_trading_day)
         since = dt.datetime.combine(start, dt.time.min, tzinfo=TAIPEI_TZ)
         for stock, cand in pick_representatives(notices, since=since).items():
