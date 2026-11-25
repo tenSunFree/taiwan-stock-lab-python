@@ -74,9 +74,7 @@ def test_select_top_n_excludes_low_completeness():
     scored = score_candidates(features)
 
     # manually push one stock's completeness down to simulate severely incomplete data
-    low_completeness = scored[
-        0
-    ].__class__(
+    low_completeness = scored[0].__class__(
         stock_id="LOWQ",
         total_score=99.0,  # score is high, but data completeness is too low to enter the ranking
         data_completeness=0.5,

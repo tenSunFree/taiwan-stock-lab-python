@@ -551,7 +551,7 @@ def test_fingerprint_changes_when_two_days_are_revised_in_opposite_directions():
     assert (
         a.institutional_detail_10d.grand_total == b.institutional_detail_10d.grand_total
     )
-    fp = lambda stock: build_flex_carousels(  # noqa: E731
-        [stock], trading_date=DAY
-    )[0].fingerprint
+    fp = lambda stock: build_flex_carousels([stock], trading_date=DAY)[  # noqa: E731
+        0
+    ].fingerprint
     assert fp(a) != fp(b)

@@ -144,3 +144,109 @@ def test_log_reports_published_and_report_date_distribution(caplog):
     assert "published_dates=2026-11-02:1" in caplog.text
     assert "report_dates=2026-11-03:1" in caplog.text
     assert "raw=1 mapped=1" in caplog.text
+
+
+def runs(engine):
+    from app.db.news_models import NewsCollectionRunRow
+
+    with Session(engine) as s:
+        return {r.market: r for r in s.scalars(select(NewsCollectionRunRow))}
+
+
+def fixed_clock(*times):
+    it = iter(times)
+    return lambda: next(it)
+
+
+def test_each_source_records_its_run():
+    engine = make_engine()
+    t1 = NOW + dt.timedelta(seconds=5)
+    t2 = NOW + dt.timedelta(seconds=9)
+    assert run(make_client(ok_handler), engine, NOW, clock=fixed_clock(t1, t2)) == 0
+    rec = runs(engine)
+    assert set(rec) == {"TWSE", "TPEX"}
+    twse = rec["TWSE"]
+    assert twse.success is True and twse.error is None
+    assert (twse.raw_rows, twse.mapped_rows, twse.inserted_rows) == (1, 1, 1)
+    assert twse.first_published_date == twse.last_published_date == dt.date(2026, 11, 2)
+    assert twse.started_at.replace(tzinfo=None) == NOW.replace(tzinfo=None)
+    assert twse.finished_at.replace(tzinfo=None) == t1.replace(tzinfo=None)
+    assert rec["TPEX"].finished_at.replace(tzinfo=None) == t2.replace(tzinfo=None)
+    assert twse.run_id == rec["TPEX"].run_id
+
+
+def test_finished_at_is_taken_after_the_articles_are_committed():
+    engine = make_engine()
+    seen = []
+
+    def clock():
+        seen.append(count(engine))
+        return NOW + dt.timedelta(seconds=len(seen))
+
+    assert run(make_client(ok_handler), engine, NOW, clock=clock) == 0
+    assert seen == [1, 2]  # each clock read already sees that source's row
+
+
+def test_failed_source_is_recorded_as_failed_without_counts_for_it():
+    def handler(request):
+        if "twse" in str(request.url):
+            return httpx.Response(200, json=[TWSE_ROW])
+        return httpx.Response(404)
+
+    engine = make_engine()
+    assert run(make_client(handler), engine, NOW) == 1
+    rec = runs(engine)
+    assert rec["TWSE"].success is True
+    tpex = rec["TPEX"]
+    assert tpex.success is False
+    assert tpex.error == "HTTPStatusError"
+    assert tpex.mapped_rows is None and tpex.inserted_rows is None
+    assert tpex.first_published_date is None
+
+
+def test_bad_columns_are_recorded_as_a_failed_run():
+    def handler(request):
+        return httpx.Response(200, json=[{"foo": "bar"}])
+
+    engine = make_engine()
+    assert run(make_client(handler), engine, NOW) == 1
+    assert all(r.success is False and r.error for r in runs(engine).values())
+
+
+def test_empty_batch_is_a_successful_run_with_no_dates():
+    engine = make_engine()
+    assert run(make_client(lambda r: httpx.Response(200, json=[])), engine, NOW) == 0
+    twse = runs(engine)["TWSE"]
+    assert twse.success is True
+    assert (twse.raw_rows, twse.mapped_rows, twse.inserted_rows) == (0, 0, 0)
+    assert twse.first_published_date is None and twse.last_published_date is None
+
+
+def test_failure_to_write_the_record_returns_1_but_keeps_the_articles(monkeypatch):
+    from app.db.news_repository import CollectionRunRepository
+
+    def boom(self, record):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(CollectionRunRepository, "record", boom)
+    engine = make_engine()
+    assert run(make_client(ok_handler), engine, NOW) == 1
+    assert count(engine) == 2 and runs(engine) == {}
+
+
+def test_every_run_adds_new_records():
+    engine = make_engine()
+    assert run(make_client(ok_handler), engine, NOW) == 0
+    assert run(make_client(ok_handler), engine, NOW + dt.timedelta(hours=6)) == 0
+    from app.db.news_models import NewsCollectionRunRow
+
+    with Session(engine) as s:
+        assert s.scalar(select(func.count()).select_from(NewsCollectionRunRow)) == 4
+
+
+def test_clock_behind_now_never_makes_finished_before_started():
+    engine = make_engine()
+    behind = NOW - dt.timedelta(minutes=1)
+    assert run(make_client(ok_handler), engine, NOW, clock=lambda: behind) == 0
+    twse = runs(engine)["TWSE"]
+    assert twse.finished_at >= twse.started_at
