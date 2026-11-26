@@ -386,11 +386,13 @@ of why a stock hit limit-up.
   runs never overlapping (the workflow's concurrency group). If a record
   cannot be written, `news_collect` exits 1
 - `app.news.loader.load_news_snapshot(session, stock_ids, report_date=...,
-  is_trading_day=...)`: reads stored announcements for `select_news`
+  now=..., is_trading_day=...)`: reads stored announcements for `select_news`
   through those run records. Per market only rows fetched up to the latest
   successful run that finished by the 17:00 cutoff are used, so a run that
-  straddles the cutoff is never half-visible and a rebuild gives the same
-  rows. If a market has no such run, or its latest one started before that
+  straddles the cutoff is never half-visible. A run's record is committed a
+  moment after its `finished_at` is read, so a load earlier than the cutoff
+  plus 5 minutes (`RECORD_COMMIT_GRACE`, judged by the caller's `now`) is
+  `DATA_UNAVAILABLE`; after that a rebuild gives the same rows. If a market has no such run, or its latest one started before that
   market's floor on the report day (TWSE 09:00, TPEx 15:00: the previous
   day's notices first appear in the 09:17 and 15:17 runs), every stock is
   `DATA_UNAVAILABLE` and `unavailable_reason` says why; V1 is all-or-nothing

@@ -155,7 +155,8 @@ class CollectionRunRepository:
     ) -> list[CollectionRun]:
         """Successful runs whose records say they finished at or before
         `cutoff`, oldest first.  Every row such a run inserted was already
-        committed at the cutoff."""
+        committed at the cutoff.  The record itself may commit a moment after
+        its finished_at (see app.news.loader.RECORD_COMMIT_GRACE)."""
         if cutoff.tzinfo is None:
             raise ValueError("cutoff must be timezone-aware")
         stmt = select(NewsCollectionRunRow).where(

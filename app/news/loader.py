@@ -10,8 +10,15 @@ records (app.news.runs):
   * For each market it takes the latest successful run that FINISHED by the
     17:00 cutoff; that run's start is the market's snapshot horizon, and only
     rows with fetched_at <= horizon are used.  A run that straddles the
-    cutoff (16:59 -> 17:01) is therefore never half-visible, and asking again
-    later gives the same rows.
+    cutoff (16:59 -> 17:01) is therefore never half-visible.
+  * A run's `finished_at` is read from the clock just BEFORE its record is
+    committed, so for a moment a run with finished_at <= cutoff can have no
+    visible record yet.  A load in that moment would use an older horizon
+    and a later one a newer horizon.  To keep a snapshot from changing after
+    its cutoff, the caller passes `now` and a load earlier than
+    cutoff + RECORD_COMMIT_GRACE is DATA_UNAVAILABLE.  The grace is an
+    assumption about how long one tiny INSERT can take, not a lock; the
+    evening report starts well after it.
   * If a market has no such run, or its latest one started before
     `min_run_start` on the report day, every stock is DATA_UNAVAILABLE.
     The floors are per market and encode what the collector showed: the
@@ -46,6 +53,9 @@ from app.news.service import (
     snapshot_fetch_cutoff,
 )
 
+# How long after the cutoff a run record may still be waiting to commit.
+RECORD_COMMIT_GRACE = dt.timedelta(minutes=5)
+
 MIN_RUN_START_BY_MARKET: dict[str, dt.time] = {
     "TWSE": dt.time(9, 0),
     "TPEX": dt.time(15, 0),
@@ -66,6 +76,7 @@ def load_news_snapshot(
     stock_ids: Iterable[str],
     *,
     report_date: dt.date,
+    now: dt.datetime,
     is_trading_day: Callable[[dt.date], bool],
     min_run_start: Mapping[str, dt.time] = MIN_RUN_START_BY_MARKET,
     min_tier: Tier = Tier.MEDIUM,
@@ -73,10 +84,23 @@ def load_news_snapshot(
     max_days: int = 5,
 ) -> NewsSnapshot:
     check_window_days(base_days, max_days)  # before any query or early return
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    missing = MIN_RUN_START_BY_MARKET.keys() - min_run_start.keys()
+    if missing:  # an omitted market would silently skip its availability check
+        raise ValueError(f"min_run_start must cover {sorted(missing)}")
     wanted = set(stock_ids)
     cutoff = snapshot_fetch_cutoff(report_date)
     if not wanted:  # nothing to ask about: no query, no availability verdict
         return NewsSnapshot({}, report_date, cutoff, None)
+    if now < cutoff + RECORD_COMMIT_GRACE:
+        return _unavailable(
+            wanted,
+            report_date,
+            cutoff,
+            f"too early: runs finished by {cutoff:%H:%M} may not be recorded"
+            f" before {cutoff + RECORD_COMMIT_GRACE:%H:%M}",
+        )
 
     runs = CollectionRunRepository(session)
     horizons: dict[str, dt.datetime] = {}

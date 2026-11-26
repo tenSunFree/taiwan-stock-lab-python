@@ -68,6 +68,7 @@ def both(session, start, **kw):
 
 
 def load(session, stocks=("2330",), **kw):
+    kw.setdefault("now", t(18, 18, 0))
     return load_news_snapshot(
         session, stocks, report_date=REPORT_DAY, is_trading_day=weekdays, **kw
     )
@@ -131,7 +132,11 @@ def test_rows_of_a_run_with_no_record_join_the_next_cutoff_that_covers_them(sess
     NewsRepository(session).save_new([article(pub=t(14, 10), fetched=t(17, 15, 17))])
     # Tuesday's own report cannot use them (stale horizon is unavailable)
     tue = load_news_snapshot(
-        session, ["2330"], report_date=dt.date(2026, 11, 17), is_trading_day=weekdays
+        session,
+        ["2330"],
+        report_date=dt.date(2026, 11, 17),
+        now=t(17, 18, 0),
+        is_trading_day=weekdays,
     )
     assert tue.results["2330"].status is NewsStatus.DATA_UNAVAILABLE
     # Wednesday, after a later successful 15:17 run, admits them
@@ -182,3 +187,25 @@ def test_other_markets_are_ignored(session):
     both(session, t(18, 15, 17))
     NewsRepository(session).save_new([article(market="MEDIA")])
     assert load(session).results["2330"].status is NewsStatus.NO_SUITABLE_EVENT
+
+
+def test_a_load_too_soon_after_the_cutoff_is_unavailable(session):
+    both(session, t(18, 15, 17))
+    NewsRepository(session).save_new([article(fetched=t(18, 15, 17))])
+    early = load(session, now=t(18, 17, 4))
+    assert early.results["2330"].status is NewsStatus.DATA_UNAVAILABLE
+    assert "too early" in early.unavailable_reason
+    assert (
+        load(session, now=t(18, 17, 5)).results["2330"].status is NewsStatus.HAS_EVENT
+    )
+
+
+def test_naive_now_is_rejected(session):
+    with pytest.raises(ValueError):
+        load(session, now=dt.datetime(2026, 11, 18, 18, 0))
+
+
+@pytest.mark.parametrize("floors", [{}, {"TWSE": dt.time(9, 0)}])
+def test_overrides_must_cover_every_market(session, floors):
+    with pytest.raises(ValueError):
+        load(session, min_run_start=floors)
