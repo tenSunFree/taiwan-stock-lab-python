@@ -50,6 +50,8 @@ MAX_SUPPORTED_DAYS = 60
 class NewsStatus(str, Enum):
     HAS_EVENT = "HAS_EVENT"
     NO_SUITABLE_EVENT = "NO_SUITABLE_EVENT"
+    # Collection was not reliable enough to say either way (see app.news.loader)
+    DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,8 @@ class NewsSnapshot:
     # Newest published date among the rows used (Taipei). It is the newest
     # announcement we hold, NOT proof that the source is complete up to it.
     latest_published_date: dt.date | None
+    # Set when every result is DATA_UNAVAILABLE: why (for logs, not for LINE)
+    unavailable_reason: str | None = None
 
 
 def snapshot_fetch_cutoff(report_date: dt.date) -> dt.datetime:
@@ -104,6 +108,11 @@ def history_start(
     return window_start - dt.timedelta(days=history_days)
 
 
+def check_window_days(base_days: int, max_days: int) -> None:
+    if not 1 <= base_days <= max_days <= MAX_SUPPORTED_DAYS:
+        raise ValueError(f"need 1 <= base_days <= max_days <= {MAX_SUPPORTED_DAYS}")
+
+
 def select_news(
     articles: Iterable[RawArticle],
     stock_ids: Iterable[str],
@@ -115,8 +124,7 @@ def select_news(
     base_days: int = 3,
     max_days: int = 5,
 ) -> NewsSnapshot:
-    if not 1 <= base_days <= max_days <= MAX_SUPPORTED_DAYS:
-        raise ValueError(f"need 1 <= base_days <= max_days <= {MAX_SUPPORTED_DAYS}")
+    check_window_days(base_days, max_days)
     cutoff = fetched_before or snapshot_fetch_cutoff(report_date)
     if cutoff.tzinfo is None:
         raise ValueError("fetched_before must be timezone-aware")

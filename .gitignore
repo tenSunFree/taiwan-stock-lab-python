@@ -237,3 +237,4 @@ out/
 
 # Local news validation reports (CSV and Markdown)
 news_validation/
+news_validation*/

@@ -371,6 +371,33 @@ of why a stock hit limit-up.
   `fetched_at`. Created through the same `checkfirst=True` bootstrap as
   the other tables (`ensure_news_tables()`), which `app.jobs.news_collect`
   calls before storing; the daily ranking job does not use it yet
+- `news_collection_runs` table: one row per source per collection run
+  (`app.news.runs.CollectionRun`: started/finished time, success, raw /
+  mapped / inserted row counts, published date range, error class name).
+  `started_at` equals the `fetched_at` of the rows that run inserted;
+  `finished_at` is taken after the articles are committed, so
+  `CollectionRunRepository.successful_finished_by(cutoff)` returns exactly
+  the runs whose rows were all visible at the cutoff, and
+  `snapshot_horizon(cutoff, market=...)` gives the latest such run's
+  `started_at`: rows with `fetched_at` up to it are the snapshot. A failed
+  source is recorded as failed; a run that crashes before writing its
+  record leaves no row, and its rows join the snapshot of the next cutoff
+  that a later successful run finished before. This relies on collection
+  runs never overlapping (the workflow's concurrency group). If a record
+  cannot be written, `news_collect` exits 1
+- `app.news.loader.load_news_snapshot(session, stock_ids, report_date=...,
+  now=..., is_trading_day=...)`: reads stored announcements for `select_news`
+  through those run records. Per market only rows fetched up to the latest
+  successful run that finished by the 17:00 cutoff are used, so a run that
+  straddles the cutoff is never half-visible. A run's record is committed a
+  moment after its `finished_at` is read, so a load earlier than the cutoff
+  plus 5 minutes (`RECORD_COMMIT_GRACE`, judged by the caller's `now`) is
+  `DATA_UNAVAILABLE`; after that a rebuild gives the same rows. If a market has no such run, or its latest one started before that
+  market's floor on the report day (TWSE 09:00, TPEx 15:00: the previous
+  day's notices first appear in the 09:17 and 15:17 runs), every stock is
+  `DATA_UNAVAILABLE` and `unavailable_reason` says why; V1 is all-or-nothing
+  across markets. The floors are observed collector timings, adjustable. Not wired into
+  `daily_ranking` yet
 - `config/news-v1.yaml` holds the planned window lengths and ranking
   weights. Like `strategy-v1.yaml`'s penalty table, no loader reads it
   yet
@@ -1509,6 +1536,10 @@ app/news/              News-event domain (pure logic, no I/O)
   classify.py              Rule-based event typing of announcement
                            titles (財報, 股利, 人事異動, ...) and the
                            "filed on behalf of a subsidiary" flag
+  runs.py                  CollectionRun: one record per source per
+                           collection run
+  loader.py                Storage-backed snapshot: checks collection runs,
+                           then calls select_news
 
 app/clients/           External API clients
   line_client.py             LINE Messaging API push/broadcast client
@@ -1542,8 +1573,10 @@ app/db/                SQLAlchemy ORM models
                             "insert, catch the UNIQUE-constraint conflict,
                             return the existing row" pattern as
                             delivery_repository.py
-  news_models.py             raw_articles table (+ ensure_news_tables())
-  news_repository.py         Idempotent raw-article save / window load
+  news_models.py             raw_articles and news_collection_runs tables
+                             (+ ensure_news_tables())
+  news_repository.py         Idempotent raw-article save / window load,
+                             per-run collection records
 
 app/jobs/              Scheduled job entry points
   daily_ranking.py            Full pipeline orchestration

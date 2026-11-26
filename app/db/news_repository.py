@@ -16,8 +16,9 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from app.db.news_models import RawArticleRow
+from app.db.news_models import NewsCollectionRunRow, RawArticleRow
 from app.news.models import TAIPEI_TZ, ContentLevel, RawArticle
+from app.news.runs import CollectionRun
 
 # 13 columns per row; keeps one statement far below PostgreSQL's
 # 65,535 bind-parameter limit.
@@ -123,3 +124,71 @@ class NewsRepository:
             for r in rows
         ]
         return sorted(out, key=lambda a: a.published_at)
+
+
+class CollectionRunRepository:
+    """Per-run collection records (see app.news.runs)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def record(self, run: CollectionRun) -> None:
+        self.session.add(
+            NewsCollectionRunRow(
+                run_id=run.run_id,
+                market=run.market,
+                started_at=run.started_at.astimezone(TAIPEI_TZ),
+                finished_at=run.finished_at.astimezone(TAIPEI_TZ),
+                success=run.success,
+                raw_rows=run.raw_rows,
+                mapped_rows=run.mapped_rows,
+                inserted_rows=run.inserted_rows,
+                first_published_date=run.first_published_date,
+                last_published_date=run.last_published_date,
+                error=run.error,
+            )
+        )
+        self.session.commit()
+
+    def successful_finished_by(
+        self, cutoff: dt.datetime, *, market: str | None = None
+    ) -> list[CollectionRun]:
+        """Successful runs whose records say they finished at or before
+        `cutoff`, oldest first.  Every row such a run inserted was already
+        committed at the cutoff.  The record itself may commit a moment after
+        its finished_at (see app.news.loader.RECORD_COMMIT_GRACE)."""
+        if cutoff.tzinfo is None:
+            raise ValueError("cutoff must be timezone-aware")
+        stmt = select(NewsCollectionRunRow).where(
+            NewsCollectionRunRow.success.is_(True),
+            NewsCollectionRunRow.finished_at <= cutoff.astimezone(TAIPEI_TZ),
+        )
+        if market is not None:
+            stmt = stmt.where(NewsCollectionRunRow.market == market)
+        out = [
+            CollectionRun(
+                run_id=r.run_id,
+                market=r.market,
+                started_at=_aware(r.started_at),
+                finished_at=_aware(r.finished_at),
+                success=r.success,
+                raw_rows=r.raw_rows,
+                mapped_rows=r.mapped_rows,
+                inserted_rows=r.inserted_rows,
+                first_published_date=r.first_published_date,
+                last_published_date=r.last_published_date,
+                error=r.error,
+            )
+            for r in self.session.scalars(stmt)
+        ]
+        return sorted(out, key=lambda c: (c.finished_at, c.market))
+
+    def snapshot_horizon(
+        self, cutoff: dt.datetime, *, market: str
+    ) -> dt.datetime | None:
+        """`started_at` of the latest successful run of `market` that
+        finished by `cutoff`; rows with fetched_at <= this were all visible
+        at the cutoff.  None when no such run exists (the source's data is
+        unavailable for that cutoff).  See app.news.runs for why this holds."""
+        runs = self.successful_finished_by(cutoff, market=market)
+        return max((r.started_at for r in runs), default=None)
