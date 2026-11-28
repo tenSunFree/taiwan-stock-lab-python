@@ -317,12 +317,22 @@ of why a stock hit limit-up.
   company files several announcements that are different events rather
   than duplicates, so type-aware grouping is planned; today
   `preprocess.cluster_candidates` still groups by title similarity only,
-  which would merge e.g. 總經理異動 with 副總經理異動. 股價異常公告 (a
-  stock reaching the 注意交易資訊 criteria) is typed separately because it
-  follows price action rather than explaining it. A title that starts with
-  補充 or 更正 (or carries one in parentheses) is typed 補充公告 before any
-  other rule, because it refers to an earlier announcement and is not a
-  new event of that type
+  which would merge e.g. 總經理異動 with 副總經理異動 (the classifier
+  itself types the deputy titles 副總經理 / 副董事長 / 副執行長 as
+  人事異動_其他, not 人事異動_高層). 股價異常公告 (a stock reaching the
+  注意交易資訊 criteria) is typed separately because it follows price action
+  rather than explaining it. 交易方式或停止買賣 (變更交易方法, 全額交割,
+  停止買賣) is a regulatory status, typed separately and, unlike 股價異常公告,
+  kept as a candidate. 銀行授信, 訴訟與法律 and 新藥研發進展 are separate types
+  too, matched only on specific wording (a bare 法院 or 臨床 is not enough);
+  a transfer of 授信資產 is 資產交易, and 理財產品 counts as 資產交易 only
+  with an action word (取得, 處分, 贖回). A title that starts with 補充 or
+  更正 (or carries one in parentheses, or follows 代子公司…公告) is typed
+  補充公告 before the type rules, because it refers to an earlier
+  announcement and is not a new event of that type; 補充承諾, 補充資本 and
+  補充營運資金 are not corrections. Titles are HTML-unescaped and
+  NFKC-normalized before matching (the source sometimes sends
+  `&#12070;` for 子)
 - `app.news.preprocess`: `published_at` window filter, exact de-duplication,
   `collapse_repeats`, title normalization, and similarity clustering into
   **candidate** groups. `collapse_repeats` merges a notice the source
@@ -340,9 +350,11 @@ of why a stock hit limit-up.
   later confirmation step, and wrongly merging two different events is
   considered worse than leaving duplicates un-merged
 - `app.news.select`: picks one representative official notice per stock.
-  Order: importance tier (V1 heuristic per event type; 財報 is MEDIUM),
+  Order: importance tier (V1 heuristic per event type; 財報 is MEDIUM,
+  as are 交易方式或停止買賣, 銀行授信, 訴訟與法律 and 新藥研發進展),
   per-type priority, newer FIRST publication, then article_id. Routine
-  subsidiary notices drop one tier (not 重大事件/重大契約/財務警示);
+  subsidiary notices drop one tier (not 重大事件/重大契約/財務警示/
+  訴訟與法律/新藥研發進展);
   注意交易資訊 is never a candidate; `since` ignores notices first
   announced before the window. The tiers are not read from
   `config/news-v1.yaml` yet.
@@ -354,11 +366,13 @@ of why a stock hit limit-up.
   later collection run is kept out of the result, provided every row up to
   the cutoff is already committed when the report is first built
   (`fetched_at` is the start time of a collection run); the storage-backed
-  caller has to guarantee that. Notices published on the report day are
+  `app.news.loader` guarantees that from the collection-run records.
+  Notices published on the report day are
   never used. `history_start()` is a bounded look-back (90 days before the
   widest window): a notice first announced earlier, with no copy in
-  between, still looks new. Statuses: HAS_EVENT, NO_SUITABLE_EVENT; a
-  source-failure status needs collection-run records and is not built yet.
+  between, still looks new. Statuses: HAS_EVENT, NO_SUITABLE_EVENT, and
+  DATA_UNAVAILABLE (only set by `app.news.loader`, when collection was not
+  reliable enough to say either way).
 - `python -m app.jobs.news_validate --start YYYY-MM-DD --end YYYY-MM-DD`:
   read-only check of the pipeline on stored announcements (Taipei dates).
   Runs `collapse_repeats` / `classify_title` / `pick_representatives` and
