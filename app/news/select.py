@@ -42,6 +42,10 @@ BASE_TIER: dict[EventType, Tier] = {
     # Title-only: most are routine 取得機器設備 / 處分有價證券 / 使用權資產,
     # so not HIGH. Splitting out a genuinely large deal needs 說明 amounts.
     EventType.ASSET_TRANSACTION: Tier.MEDIUM,
+    EventType.TRADING_RESTRICTION: Tier.MEDIUM,
+    EventType.CREDIT_FACILITY: Tier.MEDIUM,
+    EventType.LEGAL_DISPUTE: Tier.MEDIUM,
+    EventType.DRUG_DEVELOPMENT: Tier.MEDIUM,
     EventType.FINANCIAL_REPORT: Tier.MEDIUM,
     EventType.DIVIDEND: Tier.MEDIUM,
     EventType.TREASURY_STOCK: Tier.MEDIUM,
@@ -72,6 +76,10 @@ SUBSIDIARY_NOT_DOWNGRADED: frozenset[EventType] = frozenset(
         EventType.INCIDENT_OR_CLARIFICATION,
         EventType.CONTRACT,
         EventType.FINANCIAL_WARNING,
+        # Subsidiary-level litigation or clinical milestones may affect the
+        # parent.  Treat as a focus, not as proof of parent-level materiality.
+        EventType.LEGAL_DISPUTE,
+        EventType.DRUG_DEVELOPMENT,
     }
 )
 
@@ -81,7 +89,11 @@ TYPE_PRIORITY: dict[EventType, int] = {
     EventType.CONTRACT: 40,
     EventType.FINANCIAL_WARNING: 30,
     EventType.CAPITAL_AND_DEBT: 20,
+    EventType.TRADING_RESTRICTION: 45,
+    EventType.LEGAL_DISPUTE: 25,
+    EventType.DRUG_DEVELOPMENT: 20,
     EventType.ASSET_TRANSACTION: 10,
+    EventType.CREDIT_FACILITY: 5,
     EventType.FINANCIAL_REPORT: 40,
     EventType.MONTHLY_FIGURES: 30,
     EventType.DIVIDEND: 20,
@@ -146,7 +158,7 @@ def pick_representatives(
     calling collapse_repeats(), otherwise future notices change the
     first/last dates and counts.
     """
-    if since is not None and since.tzinfo is None:
+    if since is not None and (since.tzinfo is None or since.utcoffset() is None):
         raise ValueError("since must be timezone-aware")
     best: dict[str, Candidate] = {}
     for notice in notices:

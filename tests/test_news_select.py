@@ -161,3 +161,67 @@ def test_high_tier_asset_wording_still_wins_if_contract_present():
         [notice("公告本公司處分有價證券", hour=16), notice(CONTRACT, hour=8)]
     )["2330"]
     assert best.event_type is EventType.CONTRACT
+
+
+def test_trading_status_is_visible_but_attention_is_still_excluded():
+    c = assess(notice("公告本公司上櫃有價證券繼續變更交易方法"))
+    assert c is not None
+    assert c.event_type is EventType.TRADING_RESTRICTION
+    assert c.tier is Tier.MEDIUM
+    assert assess(notice(ATTENTION)) is None
+
+
+def test_bank_credit_is_not_automatically_high():
+    c = assess(notice("本公司董事會決議通過新臺幣78億元銀行聯合授信案"))
+    assert c is not None
+    assert c.event_type is EventType.CREDIT_FACILITY
+    assert c.tier is Tier.MEDIUM
+
+
+def test_subsidiary_clinical_hold_is_not_downgraded_to_low():
+    c = assess(notice("代子公司FBD Biologics公告FDA通知新藥臨床試驗實施臨床暫停"))
+    assert c is not None
+    assert c.is_subsidiary
+    assert c.event_type is EventType.DRUG_DEVELOPMENT
+    assert c.tier is Tier.MEDIUM
+
+
+def test_all_event_types_have_a_base_tier():
+    from app.news.select import BASE_TIER, EXCLUDED
+
+    assert set(BASE_TIER) | set(EXCLUDED) == set(EventType)
+
+
+def test_same_medium_tier_uses_priority_before_time():
+    report = notice(REPORT, hour=8)
+    briefing = notice("公告本公司自行召開法人說明會", hour=16)
+    assert assess(report).tier is assess(briefing).tier is Tier.MEDIUM
+    assert pick_representatives([briefing, report])["2330"].notice is report
+
+
+def test_trading_restriction_has_priority_over_financial_report():
+    restriction = notice("公告本公司股票繼續變更交易方法", hour=8)
+    report = notice(REPORT, hour=16)
+    assert pick_representatives([report, restriction])["2330"].notice is restriction
+
+
+def test_policy_mappings_are_disjoint_and_have_no_excluded_priorities():
+    from app.news.select import (
+        BASE_TIER,
+        EXCLUDED,
+        SUBSIDIARY_NOT_DOWNGRADED,
+        TYPE_PRIORITY,
+    )
+
+    assert not (set(BASE_TIER) & EXCLUDED)
+    assert set(TYPE_PRIORITY) <= set(BASE_TIER)
+    assert SUBSIDIARY_NOT_DOWNGRADED <= set(BASE_TIER)
+
+
+def test_since_rejects_tzinfo_without_utc_offset():
+    class NoOffset(dt.tzinfo):
+        def utcoffset(self, value):
+            return None
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        pick_representatives([], since=dt.datetime(2026, 11, 9, tzinfo=NoOffset()))

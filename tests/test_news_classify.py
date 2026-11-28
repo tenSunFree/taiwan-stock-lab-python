@@ -306,7 +306,7 @@ def test_production_regressions(title, expected):
         ("公告本公司第三屆企業永續發展委員會人員異動案", T.PERSONNEL_OTHER),
         (
             "本公司新藥獲墨西哥衛生風險保護聯邦委員會核准使用於成人真性紅血球增多症",
-            T.OTHER,
+            T.DRUG_DEVELOPMENT,
         ),
         ("公告本公司獨立董事對審計委員會及董事會議決事項表示反對意見", T.OTHER),
         # investor forums
@@ -369,4 +369,114 @@ def test_second_review_regressions(title, expected):
     ],
 )
 def test_coderabbit_review_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+# From the out-of-sample run on 2026-11-16..11-20 (real titles).
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        # exchange-imposed trading status is a market notice, not an asset deal
+        ("公告本公司上櫃有價證券經櫃買中心通知列為變更交易方法", T.TRADING_RESTRICTION),
+        ("公告本公司股票繼續變更交易方法", T.TRADING_RESTRICTION),
+        ("公告本公司接獲櫃買中心通知股票停止買賣日期", T.TRADING_RESTRICTION),
+        ("公告本公司處分有價證券", T.ASSET_TRANSACTION),
+        # executive resignation / election
+        ("公告本公司總經理辭職", T.EXECUTIVE_CHANGE),
+        ("公告本公司董事長辭職", T.EXECUTIVE_CHANGE),
+        ("代子公司萬洲化學股份有限公司公告推選董事長", T.EXECUTIVE_CHANGE),
+        ("公告本公司發言人辭職案", T.PERSONNEL_OTHER),
+        ("公告本公司法人董事代表人辭職", T.PERSONNEL_OTHER),
+        ("代子公司維克樂科技股份有限公司公告法派董監事異動", T.PERSONNEL_OTHER),
+        ("永豐金控公告董事會決議通過子公司京城銀行總稽核異動", T.PERSONNEL_OTHER),
+        # investor events
+        (
+            "公告本公司受花旗證券邀請參加「Citi Nov Taiwan Corporate Day」",
+            T.INVITED_INVESTOR_EVENT,
+        ),
+        ("本公司將參加UBS舉辦之投資人會議", T.INVITED_INVESTOR_EVENT),
+        # incidents, contracts, capital
+        ("本公司部分資訊系統遭受駭客攻擊之說明", T.INCIDENT_OR_CLARIFICATION),
+        (
+            "說明本公司接獲疑似冒用名義寄發虛假訂單電子郵件之事件",
+            T.INCIDENT_OR_CLARIFICATION,
+        ),
+        ("本公司與台灣某科技股份有限公司竹科分公司簽署工程合約", T.CONTRACT),
+        ("公告本公司「虎尾IDC機房建築工程案」之得標廠商", T.CONTRACT),
+        ("代子公司上鋌營造股份有限公司公告董事會決議辦理發行新股", T.CAPITAL_AND_DEBT),
+        ("本公司董事會決議通過新臺幣78億元銀行聯合授信案", T.CREDIT_FACILITY),
+        ("代子公司國泰世華商業銀行公告聯合授信資產之轉讓", T.ASSET_TRANSACTION),
+        # corrections and renames
+        ("代子公司更正115年8月~10月份衍生性商品交易資訊", T.SUPPLEMENT),
+        ("公告本公司證券簡稱由「沛爾生醫*-創」變更為「沛爾*-創」", T.NAME_OR_PAR_VALUE),
+        ("代子公司隆揚電子公告取得理財產品", T.ASSET_TRANSACTION),
+        # must not over-reach
+        ("公告本公司與銀行簽訂聯合承銷合約", T.OTHER),
+        ("公告本公司董事會決議通過資本支出預算案", T.OTHER),
+    ],
+)
+def test_out_of_sample_round_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+# New labels are intentional product decisions: unlike MARKET_ATTENTION,
+# exchange trading restrictions are visible as a recent-focus candidate.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("公告本公司股票繼續維持全額交割", T.TRADING_RESTRICTION),
+        ("更正公告本公司股票繼續變更交易方法", T.SUPPLEMENT),
+        ("公告本公司上櫃有價證券繼續維持變更交易方法", T.TRADING_RESTRICTION),
+        ("公告本公司因股價異常列為注意交易資訊", T.MARKET_ATTENTION),
+        ("公告本公司獲銀行團聯合授信案", T.CREDIT_FACILITY),
+        ("公告本公司授信資產之轉讓", T.ASSET_TRANSACTION),
+        ("公告本公司增資發行新股", T.CAPITAL_AND_DEBT),
+        ("公告本公司與AOS等三家公司就美國專利訴訟案簽訂和解協議", T.LEGAL_DISPUTE),
+        ("本公司及子公司收到返還貨款、賠償倉儲費之民事起訴狀", T.LEGAL_DISPUTE),
+        ("公告本公司最高法院判決結果", T.LEGAL_DISPUTE),
+        ("本公司接獲法院公告", T.OTHER),
+        (
+            "代子公司FBD Biologics Limited公告，美國FDA通知新藥臨床試驗申請實施臨床暫停",
+            T.DRUG_DEVELOPMENT,
+        ),
+        ("本公司開發中新藥於美國啟動臨床二期試驗", T.DRUG_DEVELOPMENT),
+        ("本公司參加AI產業論壇", T.OTHER),
+        ("本公司受邀參加開源技術大會", T.OTHER),
+        ("代&#12070;公司隆揚電&#12070;公告取得理財產品", T.ASSET_TRANSACTION),
+    ],
+)
+def test_round4_policy_and_false_positive_regressions(title, expected):
+    assert classify_title(title) is expected
+
+
+def test_subsidiary_entity_decoding_and_announcing_typo():
+    assert is_subsidiary_notice("代&#12070;公司隆揚電&#12070;公告取得理財產品")
+    assert is_subsidiary_notice("代公告子公司共信寵物生醫股份有限公司申請藥證")
+
+
+# Synthetic boundary cases: not additional out-of-sample production evidence.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("公告本公司副總經理異動", T.PERSONNEL_OTHER),
+        ("公告本公司副董事長辭任", T.PERSONNEL_OTHER),
+        ("公告本公司推選副董事長", T.PERSONNEL_OTHER),
+        ("公告本公司副執行長異動", T.PERSONNEL_OTHER),
+        ("公告本公司總經理暨副總經理異動", T.EXECUTIVE_CHANGE),
+        ("公告本公司銀行聯合授信 資產之轉讓", T.ASSET_TRANSACTION),
+        ("公告本公司銀行授信案之授信資產轉讓", T.ASSET_TRANSACTION),
+        ("公告本公司處分聯合授信資產", T.ASSET_TRANSACTION),
+        ("公告本公司董事會通過銀行授信額度", T.CREDIT_FACILITY),
+        ("公告本公司理財產品管理政策調整", T.OTHER),
+        ("公告本公司贖回理財產品", T.ASSET_TRANSACTION),
+        ("公告本公司關係人交易管理政策", T.OTHER),
+        ("公告本公司取得乙公司股份", T.ASSET_TRANSACTION),
+        ("公告本公司代子公司甲公告更正115年9月營收", T.SUPPLEMENT),
+        ("公告本公司補充承諾案", T.OTHER),
+        ("代子公司甲公告董事會決議補充營運資金辦理現金增資", T.CAPITAL_AND_DEBT),
+        ("公告本公司受邀參加投資人關係管理課程", T.OTHER),
+        ("公告本公司受邀參加投資人會議", T.INVITED_INVESTOR_EVENT),
+    ],
+)
+def test_additional_boundary_regressions(title, expected):
     assert classify_title(title) is expected
